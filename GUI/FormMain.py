@@ -260,7 +260,7 @@ class FormMain(QtWidgets.QMainWindow):
         TradeData.order.order_quantity = random.randint(1, 50)
         TradeData.order.filled_quantity = random.randint(0, TradeData.order.order_quantity)
         TradeData.order.order_time = "12:00:00"
-        TradeData.order.status = "FILLED"
+        TradeData.order.order_status = "FILLED"
         # Order 데이터 생성
         # ------------------------
 
@@ -271,7 +271,7 @@ class FormMain(QtWidgets.QMainWindow):
         TradeData.strategy.ma_20 = round(random.uniform(100, 1000), 2)
         TradeData.strategy.rsi = round(random.uniform(0, 100), 2)
         TradeData.strategy.macd = round(random.uniform(-10, 10), 2)
-        TradeData.strategy.signal = random.choice(["BUY", "SELL", ""])
+        TradeData.strategy.signal = random.choice(["BUY", "SELL", "None"])
 
         # Strategy 데이터 생성
         # ------------------------
@@ -389,7 +389,7 @@ class FormMain(QtWidgets.QMainWindow):
         TradeData.order.order_quantity = 0
         TradeData.order.filled_quantity = 0
         TradeData.order.order_time = ""
-        TradeData.order.status = ""
+        TradeData.order.order_status = ""
         TradeData.order.df = TradeData.order.df.iloc[0:0]
 
         # --- Strategy 초기화 ---

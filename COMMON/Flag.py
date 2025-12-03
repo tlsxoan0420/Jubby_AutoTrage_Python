@@ -5,15 +5,15 @@ class TradeData:
     class Market:
         def __init__(self):
             # 각 컬럼에 대응하는 변수 초기화
-            self.last_price = 0         # 현재가
-            self.open_price = 0         # 시가
-            self.high_price = 0         # 고가
-            self.low_price = 0          # 저가
-            self.bid_price = 0          # 매수호가
-            self.ask_price = 0          # 매도호가
-            self.bid_size = 0           # 매수잔량
-            self.ask_size = 0           # 매도잔량
-            self.volume = 0             # 거래량
+            self.last_price = 0         # 1. 현재가
+            self.open_price = 0         # 2. 시가
+            self.high_price = 0         # 3. 고가
+            self.low_price = 0          # 4. 저가
+            self.bid_price = 0          # 5. 매수호가
+            self.ask_price = 0          # 6. 매도호가
+            self.bid_size = 0           # 7. 매수잔량
+            self.ask_size = 0           # 8. 매도잔량
+            self.volume = 0             # 9. 거래량
 
             # 전체 업데이트 카운트
             self.update_count = 0
@@ -40,11 +40,11 @@ class TradeData:
     class Account:
         def __init__(self):
             # 각 컬럼에 대응하는 변수 초기화
-            self.symbol = ""           # 종목
-            self.quantity = 0          # 보유수량
-            self.avg_price = 0         # 평균매입가
-            self.pnl = 0               # 평가손익
-            self.available_cash = 0    # 주문가능금액
+            self.symbol = ""           # 1. 종목
+            self.quantity = 0          # 2. 보유수량
+            self.avg_price = 0         # 3. 평균매입가
+            self.pnl = 0               # 4. 평가손익
+            self.available_cash = 0    # 5. 주문가능금액
 
             # 전체 업데이트 카운트
             self.update_count = 0
@@ -66,13 +66,13 @@ class TradeData:
     class Order:
         def __init__(self):
             # 각 컬럼에 대응하는 변수 초기화
-            self.order_id = 0           # 주문번호
-            self.order_type = ""        # 주문종류
-            self.order_price = 0        # 주문가격
-            self.order_quantity = 0     # 주문수량
-            self.filled_quantity = 0    # 체결수량
-            self.order_time = ""        # 주문시간
-            self.status = ""            # 상태
+            self.order_id = 0           # 1. 주문번호
+            self.order_type = ""        # 2. 주문종류
+            self.order_price = 0        # 3. 주문가격
+            self.order_quantity = 0     # 4. 주문수량
+            self.filled_quantity = 0    # 5. 체결수량
+            self.order_time = ""        # 6. 주문시간
+            self.order_status = ""      # 7. 주문상태
 
             # 전체 업데이트 카운트
             self.update_count = 0
@@ -88,7 +88,7 @@ class TradeData:
                 '주문수량': self.order_quantity,
                 '체결수량': self.filled_quantity,
                 '주문시간': self.order_time,
-                '상태': self.status,
+                '주문상태': self.order_status,
             }
             self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)        
 
@@ -96,12 +96,12 @@ class TradeData:
     class Strategy:
         def __init__(self):
             # 각 컬럼에 대응하는 변수 초기화
-            self.symbol = ""      # 종목
-            self.ma_5 = 0         # 단기 이동평균
-            self.ma_20 = 0        # 장기 이동평균
-            self.rsi = 0          # RSI 지표
-            self.macd = 0         # MACD 지표
-            self.signal = ""      # 전략 신호 ('BUY', 'SELL', '')
+            self.symbol = ""      # 1. 종목
+            self.ma_5 = 0         # 2. 단기 이동평균
+            self.ma_20 = 0        # 3. 장기 이동평균
+            self.rsi = 0          # 4. RSI 지표
+            self.macd = 0         # 5. MACD 지표
+            self.signal = ""      # 6. 전략 신호 ('BUY', 'SELL', 'None')
             
             # 전체 업데이트 카운트
             self.update_count = 0
