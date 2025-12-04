@@ -3,7 +3,7 @@ import sys
 import pandas as pd
 import random
 from COMMON.Flag import TradeData
-
+from COM.TcpJsonClient import TcpJsonClient 
 class FormMain(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -11,8 +11,18 @@ class FormMain(QtWidgets.QMainWindow):
 
     def initUI(self):
 
+        # -----------------------
         # UI 파일 로드
         uic.loadUi("GUI/Main.ui", self)
+        # UI 파일 로드
+        # -----------------------
+
+        # -----------------------
+        # TCP JSON 클라이언트 생성
+        self.client = TcpJsonClient(host="127.0.0.1", port=9001)
+        # TCP JSON 클라이언트 생성
+        # -----------------------
+
 
         # -----------------------
         # FomMain 기본 창 설정
@@ -205,7 +215,15 @@ class FormMain(QtWidgets.QMainWindow):
         print("주삐를 종료합니당")      
 
     def btnConnectedClickEvent(self):
-        print("통신 연결 버튼 클릭")      
+        try:
+            self.client.connect()
+            print("✔ Python → C# 연결 성공")
+            self.btnConnected.setText("통신 연결 O")
+            self.btnConnected.setStyleSheet("color: Lime;")
+        except Exception as e:
+            print(f"연결 실패: {e}")
+            self.btnConnected.setText("통신 연결")
+            self.btnConnected.setStyleSheet("color: Silver;")
     # 버튼 클릭 이벤트
     # -----------------------
 
@@ -239,6 +257,7 @@ class FormMain(QtWidgets.QMainWindow):
         TradeData.market.bid_size = random.randint(1, 100)
         TradeData.market.ask_size = random.randint(1, 100)
         TradeData.market.volume = random.randint(1000, 10000)
+
         # Market 데이터 생성
         # ------------------------
 
