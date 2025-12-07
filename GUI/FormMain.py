@@ -1,4 +1,5 @@
 from PyQt5 import QtWidgets, uic ,QtCore, QtGui
+from PyQt5.QtCore import Qt
 import sys
 import pandas as pd
 import random
@@ -180,11 +181,34 @@ class FormMain(QtWidgets.QMainWindow):
                 color: white;
                 border: 1px solid rgb(90,90,90);
                 font-family: Consolas;
-                font-size: 15px;
+                font-size: 13px;
             }
         """)
         # 로그 창 추가
         # -----------------------
+
+    # -----------------------
+    # Form Mouse Dragging ##
+
+    # 마우스 누를 때
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._isDragging = True
+            self._startPos = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+
+    # 마우스 이동 중일 때
+    def mouseMoveEvent(self, event):
+        if self._isDragging and event.buttons() == Qt.LeftButton:
+            self.move(event.globalPos() - self._startPos)
+            event.accept()
+
+    # 마우스 버튼에서 손 뗐을 때
+    def mouseReleaseEvent(self, event):
+        self._isDragging = False
+
+    # Form Mouse Dragging ##
+    # -----------------------
 
     # -----------------------
     # 버튼 클릭 이벤트
@@ -195,6 +219,16 @@ class FormMain(QtWidgets.QMainWindow):
         self.update_table(self.tbAccount, TradeData.account.df)
         self.update_table(self.tbOrder, TradeData.order.df)
         self.update_table(self.tbStrategy, TradeData.strategy.df)
+        print("테스트 표 업데이트 완료")
+
+        # C#으로 전송  
+        if(not TcpJsonClient.Isconnected):
+            print("❌ Python → C# 연결 실패: 연결되지 않음")
+            return
+        self.client.send_message("market", TradeData.market_dict())
+        self.client.send_message("account", TradeData.account_dict())
+        self.client.send_message("order", TradeData.order_dict())
+        self.client.send_message("strategy", TradeData.strategy_dict())
 
     def btnDataSendClickEvent(self):
         print("데이터 송신 테스트 버튼 클릭")
@@ -248,6 +282,8 @@ class FormMain(QtWidgets.QMainWindow):
     def DataCreat(self):
                 # ------------------------
         # Market 데이터 생성
+        TradeData.market.symbol = round(random.uniform(100, 1000), 2)
+        TradeData.market.symbol_name = "MarketTest"
         TradeData.market.last_price = round(random.uniform(100, 1000), 2)
         TradeData.market.open_price = round(random.uniform(100, 1000), 2)
         TradeData.market.high_price = round(random.uniform(100, 1000), 2)
@@ -263,7 +299,8 @@ class FormMain(QtWidgets.QMainWindow):
 
         # ------------------------
         # Account 데이터 생성
-        TradeData.account.symbol = "AAPL"
+        TradeData.account.symbol = round(random.uniform(100, 1000), 2)
+        TradeData.account.symbol_name = "AccountTest"
         TradeData.account.quantity = random.randint(0, 50)
         TradeData.account.avg_price = round(random.uniform(100, 1000), 2)
         TradeData.account.pnl = round(random.uniform(-500, 500), 2)
@@ -273,7 +310,8 @@ class FormMain(QtWidgets.QMainWindow):
 
         # ------------------------
         # Order 데이터 생성
-        TradeData.order.order_id = random.randint(1000, 9999)
+        TradeData.order.symbol = round(random.uniform(100, 1000), 2)
+        TradeData.order.symbol_name = "OrderTest"
         TradeData.order.order_type = "BUY"
         TradeData.order.order_price = round(random.uniform(100, 1000), 2)
         TradeData.order.order_quantity = random.randint(1, 50)
@@ -285,7 +323,8 @@ class FormMain(QtWidgets.QMainWindow):
 
         # ------------------------
         # Strategy 데이터 생성
-        TradeData.strategy.symbol = "AAPL"
+        TradeData.strategy.symbol = round(random.uniform(100, 1000), 2)
+        TradeData.strategy.symbol_name = "StrategyTest"
         TradeData.strategy.ma_5 = round(random.uniform(100, 1000), 2)
         TradeData.strategy.ma_20 = round(random.uniform(100, 1000), 2)
         TradeData.strategy.rsi = round(random.uniform(0, 100), 2)
@@ -340,8 +379,8 @@ class FormMain(QtWidgets.QMainWindow):
     def style_table(self, tableWidget):
 
         # 글꼴 적용 
-        tableWidget.setFont(QtGui.QFont("Noto Sans KR", 20))
-        tableWidget.horizontalHeader().setFont(QtGui.QFont("Noto Sans KR", 21, QtGui.QFont.Bold))
+        tableWidget.setFont(QtGui.QFont("Noto Sans KR", 12))
+        tableWidget.horizontalHeader().setFont(QtGui.QFont("Noto Sans KR", 13, QtGui.QFont.Bold))
 
         # 헤더 크기 자동 분배
         header = tableWidget.horizontalHeader()
@@ -361,14 +400,14 @@ class FormMain(QtWidgets.QMainWindow):
                 background-color: rgb(50,80,110);
                 color: Black;
                 gridline-color: rgb(140,140,140);
-                font-size: 20px;
+                font-size: 13px;
             }
             QHeaderView::section {
                 background-color: rgb(40,60,90);
                 color: Black;
                 font-family: "Noto Sans KR";
                 font-weight: bold;
-                font-size: 15px;   
+                font-size: 13px;   
                 border: 1px solid rgb(150,150,150);
             }
         """)
