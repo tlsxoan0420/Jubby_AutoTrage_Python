@@ -6,7 +6,6 @@ import time
 import zlib
 from datetime import datetime
 
-
 class TcpJsonClient:
     """
     Python → C# 통신용 TCP JSON 클라이언트
@@ -16,6 +15,8 @@ class TcpJsonClient:
     - JSON 메시지를 C# 서버 프로토콜 형식(헤더 + 데이터)으로 전송
     - 대량 데이터 송신 시 안정적 전송
     """
+
+    Isconnected = False;
 
     def __init__(self, host="127.0.0.1", port=9001,
                  use_compression=True,
@@ -41,16 +42,27 @@ class TcpJsonClient:
     # TCP 서버(C#)에 연결
     # ------------------------------
     def connect(self):
-        """C# TCP 서버에 자동으로 연결 시도 (실패 시 무한 재시도)"""
+    # C# TCP 서버에 자동 연결 시도 (실패 시 재시도), 30초 지나면 중단 #
+        start_time = time.time()  # 시작 시간 기록
+        timeout = 30              # 제한 시간(초)
+
         while not self._stop:
+            # 1) 1분 초과 체크
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                self._stop = True
+                print("[CLIENT] Connection timeout: 30 Sec passed. Stop trying.")
+                return  # 그냥 종료하거나 self._stop = True로 바꿔도 됨
+
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.connect((self.host, self.port))
 
                 self.sock = s
-
                 print("[CLIENT] Connected to C# server.")
+                TcpJsonClient.Isconnected = True  # 연결 성공
                 return
+
             except Exception as e:
                 print(f"[CLIENT] Connect failed: {e}. Retry in 1 sec...")
                 time.sleep(1)
@@ -91,7 +103,7 @@ class TcpJsonClient:
                 # 압축 여부 결정
                 compressed = self.use_compression if compress_override is None else compress_override
                 if compressed:
-                    body = zlib.compress(body)
+                    body = zlib.compress(body, wbits=-zlib.MAX_WBITS)
 
                 # 헤더 구성
                 # [1byte version][1byte flags][4byte length]
