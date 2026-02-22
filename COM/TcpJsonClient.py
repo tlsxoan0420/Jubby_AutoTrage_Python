@@ -42,17 +42,20 @@ class TcpJsonClient:
     # TCP 서버(C#)에 연결
     # ------------------------------
     def connect(self):
-    # C# TCP 서버에 자동 연결 시도 (실패 시 재시도), 30초 지나면 중단 #
+        # 🟢 [수정됨] 이미 연결된 소켓이 있다면 중복 연결 방지
+        if self.sock is not None:
+            print("[CLIENT] 이미 C# 서버에 연결되어 있습니다.")
+            return
+
         start_time = time.time()  # 시작 시간 기록
         timeout = 30              # 제한 시간(초)
 
         while not self._stop:
-            # 1) 1분 초과 체크
+            # 1) 시간 초과 체크
             elapsed = time.time() - start_time
             if elapsed > timeout:
-                self._stop = True
                 print("[CLIENT] Connection timeout: 30 Sec passed. Stop trying.")
-                return  # 그냥 종료하거나 self._stop = True로 바꿔도 됨
+                return 
 
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -66,12 +69,59 @@ class TcpJsonClient:
             except Exception as e:
                 print(f"[CLIENT] Connect failed: {e}. Retry in 1 sec...")
                 time.sleep(1)
+        start_time = time.time()  
+        timeout = 30              
+
+        while not self._stop:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                # self._stop = True  <--- 🚨 이 줄을 반드시 지우거나 주석 처리 하세요!
+                print("[CLIENT] Connection timeout: 30 Sec passed. Stop trying.")
+                return 
+
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect((self.host, self.port))
+
+                self.sock = s
+                print("[CLIENT] Connected to C# server.")
+                TcpJsonClient.Isconnected = True
+                return
+
+            except Exception as e:
+                print(f"[CLIENT] Connect failed: {e}. Retry in 1 sec...")
+                time.sleep(1)
+                
+        start_time = time.time()  
+        timeout = 3              # [수정] 30초 -> 3초로 단축 (UI가 30초간 먹통되는 현상 방지)
+
+        while not self._stop:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                # [수정] 연결에 실패했다고 self._stop = True로 아예 죽이지 않고 빠져나오게 함
+                TcpJsonClient.Isconnected = False 
+                print("[CLIENT] Connection timeout: 3 Sec passed. Stop trying.")
+                return 
+
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect((self.host, self.port))
+
+                self.sock = s
+                print("[CLIENT] Connected to C# server.")
+                TcpJsonClient.Isconnected = True  
+                return
+
+            except Exception as e:
+                print(f"[CLIENT] Connect failed: {e}. Retry in 1 sec...")
+                time.sleep(1)
 
     # ------------------------------
     # 연결 종료
     # ------------------------------
     def close(self):
         self._stop = True
+        TcpJsonClient.Isconnected = False  # [수정] 연결 강제 종료 시 상태 확실히 False로 변경
         with self.lock:
             if self.sock:
                 try:
@@ -88,6 +138,47 @@ class TcpJsonClient:
         payload: JSON(dict)
         compress_override: True/False/None
         """
+        with self.lock:
+            # [수정] 오작동을 유발하던 '자동 연결(self.connect())' 로직을 완전히 삭제합니다.
+            # 연결이 안 되어 있다면 그냥 메시지를 무시하고 빠져나갑니다.
+            if self.sock is None:
+                return
+
+            try:
+                # JSON 문자열 → UTF-8 bytes
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+                # 압축 여부 결정
+                compressed = self.use_compression if compress_override is None else compress_override
+                if compressed:
+                    body = zlib.compress(body, wbits=-zlib.MAX_WBITS)
+
+                # 헤더 구성
+                # [1byte version][1byte flags][4byte length]
+                version = 1
+                flags = 0x01 if compressed else 0x00
+                length = len(body)
+
+                header = struct.pack("!BBI", version, flags, length)
+
+                # 실제 송신
+                self.sock.sendall(header + body)
+
+            except Exception as e:
+                print(f"[CLIENT] Send failed: {e}. Reconnecting...")
+                try:
+                    self.sock.close()
+                except:
+                    pass
+
+                self.sock = None
+                TcpJsonClient.Isconnected = False  # 🟢 [수정됨] 통신 끊김 상태 반영
+                self.connect()
+                
+                """
+                payload: JSON(dict)
+                compress_override: True/False/None
+                """
         with self.lock:
             # 연결 안되어 있으면 자동 연결
             if self.sock is None:
