@@ -249,15 +249,47 @@ class FormMain(QtWidgets.QMainWindow):
         print("주삐를 종료합니당")      
 
     def btnConnectedClickEvent(self):
-        try:
-            self.client.connect()
-            print("✔ Python → C# 연결 성공")
-            self.btnConnected.setText("통신 연결 O")
-            self.btnConnected.setStyleSheet("color: Lime;")
-        except Exception as e:
-            print(f"연결 실패: {e}")
-            self.btnConnected.setText("통신 연결")
+        # 1. 이미 연결되어 있는 경우 -> 연결 해제
+        if TcpJsonClient.Isconnected:
+            try:
+                if hasattr(self, 'client') and self.client:
+                    self.client.close()
+            except Exception as e:
+                pass # 이미 닫힌 소켓 에러 무시
+            
+            TcpJsonClient.Isconnected = False
+            print("✔ Python → C# 연결 강제 해제됨")
+            self.btnConnected.setText("통신 연결 X")
             self.btnConnected.setStyleSheet("color: Silver;")
+            
+        # 2. 연결이 끊어져 있는 경우 -> 새로 연결 시도
+        else:
+            try:
+                # [핵심] 기존 클라이언트 찌꺼기가 남아있으면 완전히 죽임
+                if hasattr(self, 'client') and self.client:
+                    try:
+                        self.client.close()
+                    except:
+                        pass
+                    
+                # 새 객체를 생성하여 완전 초기화 상태에서 시작 (압축 충돌이 의심되면 use_compression=False 추가)
+                self.client = TcpJsonClient(host="127.0.0.1", port=9001)
+                self.client.connect()
+                
+                # 결과에 따라 UI 업데이트
+                if TcpJsonClient.Isconnected:
+                    print("✔ Python → C# 연결 성공")
+                    self.btnConnected.setText("통신 연결 O")
+                    self.btnConnected.setStyleSheet("color: Lime;")
+                else:
+                    print("❌ Python → C# 연결 실패 (시간 초과)")
+                    self.btnConnected.setText("통신 연결 X")
+                    self.btnConnected.setStyleSheet("color: Silver;")
+                    
+            except Exception as e:
+                print(f"연결 실패: {e}")
+                self.btnConnected.setText("통신 연결 X")
+                self.btnConnected.setStyleSheet("color: Silver;")
     # 버튼 클릭 이벤트
     # -----------------------
 
@@ -280,14 +312,25 @@ class FormMain(QtWidgets.QMainWindow):
     # -----------------------
     # 데이터 생성 함수 #
     def DataCreat(self):
-                # ------------------------
+        # ------------------------
         # Market 데이터 생성
+
+        # 4개의 가격 값을 먼저 랜덤으로 생성
+        prices = [round(random.uniform(100, 1000), 2) for _ in range(4)]
+
+        # 정렬하여 고가와 저가를 확실히 배정
+        prices.sort()
+        low = prices[0]
+        high = prices[3]
+        open_p = prices[1]
+        last_p = prices[2]
+
         TradeData.market.symbol = round(random.uniform(100, 1000), 2)
         TradeData.market.symbol_name = "MarketTest"
-        TradeData.market.last_price = round(random.uniform(100, 1000), 2)
-        TradeData.market.open_price = round(random.uniform(100, 1000), 2)
-        TradeData.market.high_price = round(random.uniform(100, 1000), 2)
-        TradeData.market.low_price = round(random.uniform(100, 1000), 2)
+        TradeData.market.open_price = open_p
+        TradeData.market.last_price = last_p
+        TradeData.market.high_price = high
+        TradeData.market.low_price = low
         TradeData.market.bid_price = round(random.uniform(100, 1000), 2)
         TradeData.market.ask_price = round(random.uniform(100, 1000), 2)
         TradeData.market.bid_size = random.randint(1, 100)
