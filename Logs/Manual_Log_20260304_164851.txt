@@ -1,0 +1,4 @@
+[16:48:49] 🧠 AI 두뇌(jubby_brain.pkl) 이식 완료!
+[16:48:49] 🎫 KIS API 접속 준비 시작...
+[16:48:49] 🚀 실시간 감시 스레드 출발!
+[16:48:49] ⚠️ 잔고 로드 에러: 'KIS_API' object has no attribute 'get_account_holdings'
