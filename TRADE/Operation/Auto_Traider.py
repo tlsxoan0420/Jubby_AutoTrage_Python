@@ -125,6 +125,32 @@ class JubbyAutoTrader:
             
             time.sleep(60) # 1분마다 반복
 
+    def execute_guaranteed_sell(self, code, qty, current_price):
+        """
+        [요구사항 1] 매도가 정상적으로 될 때까지 적절한 금액을 찾으며 재시도합니다.
+        """
+        max_retries = 3
+        target_price = current_price
+        
+        for attempt in range(max_retries):
+            # 1. 지정가(혹은 목표가)로 매도 시도
+            success = self.mw.api_manager.sell(code, qty, target_price) 
+            
+            if success:
+                self.sig_log.emit(f"✅ [{code}] 매도 체결 성공! (단가: {target_price})", "info")
+                return True
+                
+            # 2. 안 팔렸다면? 호가를 낮춰서(적절한 매도금액 다시 찾기) 재시도
+            # 한국 호가 단위에 맞춰 대략 0.2~0.5% 정도 깎아서 다시 던집니다.
+            target_price = int(target_price * 0.995) 
+            self.sig_log.emit(f"⚠️ [{code}] 매도 미체결. 목표가를 {target_price}원으로 낮춰 재시도합니다... ({attempt+1}/{max_retries})", "warning")
+            time.sleep(1.0) # 1초 대기 후 다음 루프에서 재시도
+            
+        # 3. 3번 다 실패하면 묻지도 따지지도 않고 '시장가'로 강제 매도 처리 (KIS API 시장가 코드 '01' 적용)
+        self.sig_log.emit(f"🚨 [{code}] 3회 재시도 실패! 시장가로 강제 청산합니다.", "warning")
+        success = self.mw.api_manager.sell_market_price(code, qty) # 구현된 시장가 매도 함수 사용
+        return success
+
 # ---------------------------------------------------------------------
 # 🚀 실행부
 # ---------------------------------------------------------------------
