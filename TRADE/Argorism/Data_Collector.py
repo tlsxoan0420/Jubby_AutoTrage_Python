@@ -20,7 +20,8 @@ class UltraDataCollector:
         self.api = KIS.KIS_API(app_key, app_secret, account_no, is_mock)
         self.api.get_access_token()
         self.base_url = "https://openapivts.koreainvestment.com:29443" if is_mock else "https://openapi.koreainvestment.com:9443"
-
+        self.send_log(f"🔑 발급된 토큰 확인: {self.api.access_token}", "info")
+        
     def send_log(self, msg, log_type="info"):
         if self.log_callback:
             self.log_callback(msg, log_type)
@@ -51,8 +52,9 @@ class UltraDataCollector:
             
             res = requests.get(url, headers=headers, params=params)
             
-            if res.status_code == 200 and res.json()['rt_cd'] == '0':
-                data = res.json()['output2']
+            # 정상 응답 처리
+            if res.status_code == 200 and res.json().get('rt_cd') == '0':
+                data = res.json().get('output2', [])
                 if not data: break 
                 
                 df_chunk = pd.DataFrame(data)
@@ -61,7 +63,16 @@ class UltraDataCollector:
                 target_time = data[-1]['stck_cntg_hour'] 
                 time.sleep(0.5) 
             else:
-                self.send_log(f"❌ [{stock_code}] 수집 중 서버 에러 발생. 건너뜁니다.", "error")
+                # 💡 [핵심 해결] 한투 서버가 뱉어내는 "진짜 에러 메시지"를 추출합니다!
+                try:
+                    err_msg = res.json().get('msg1', '알 수 없는 에러')
+                except:
+                    err_msg = f"HTTP 상태코드 {res.status_code}"
+                
+                self.send_log(f"❌ [{stock_code}] 한투 서버 거절 사유: {err_msg}", "error")
+                
+                # 💡 [안전장치] 에러가 났을 때도 잠시 쉬어주어 IP 차단을 방지합니다.
+                time.sleep(0.5) 
                 break
             
         if not all_chunks: return None
@@ -69,10 +80,14 @@ class UltraDataCollector:
         df = pd.concat(all_chunks).drop_duplicates().sort_values('stck_cntg_hour')
         df['code'] = stock_code 
         
-        df.columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume', 'acc_volume', 'extra', 'code'][:len(df.columns)]
-        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-        
-        return df.reset_index(drop=True)
+        # 데이터가 혹시라도 부족하게 올 경우를 대비한 방어 코드
+        required_cols = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
+        if len(df.columns) >= len(required_cols):
+            df.columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume', 'acc_volume', 'extra', 'code'][:len(df.columns)]
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+            return df.reset_index(drop=True)
+        else:
+            return None
 
     def make_ai_dataset(self, df):
         if df is None or len(df) < 30: return None
@@ -176,3 +191,5 @@ if __name__ == "__main__":
     
     collector = UltraDataCollector(APP_KEY, APP_SECRET, ACCOUNT)
     collector.run_collection(stock_list)
+
+    
