@@ -31,7 +31,7 @@ class DataCollectorWorker(QThread):
     def run(self):
         try:
             try: from TRADE.Argorism.Data_Collector import UltraDataCollector
-            except ImportError: from Data_Collector import UltraDataCollector 
+            except: from TRADE.Argorism.Data_Collector import UltraDataCollector
             import FinanceDataReader as fdr
             self.emit_log("📡 한국 거래소(KRX)에서 [당일 거래대금 상위 1000개] 핫플레이스 명단을 추출합니다...", "info")
             krx_df = fdr.StockListing('KRX')
