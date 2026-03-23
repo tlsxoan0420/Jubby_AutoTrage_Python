@@ -20,7 +20,11 @@ class UltraDataCollector:
         self.api = KIS.KIS_API(app_key, app_secret, account_no, is_mock)
         self.api.get_access_token()
         self.base_url = "https://openapivts.koreainvestment.com:29443" if is_mock else "https://openapi.koreainvestment.com:9443"
-        self.send_log(f"🔑 발급된 토큰 확인: {self.api.access_token}", "info")
+        
+        if not self.api.access_token:
+            self.send_log("🚨 [경고] 토큰 발급에 실패했습니다. API Key나 모의/실전 여부를 다시 확인하세요!", "error")
+        else:
+            self.send_log(f"🔑 발급된 토큰 확인: {self.api.access_token[:15]}... (보안상 일부만 표시)", "info")
         
     def send_log(self, msg, log_type="info"):
         if self.log_callback:
@@ -63,7 +67,7 @@ class UltraDataCollector:
                 target_time = data[-1]['stck_cntg_hour'] 
                 time.sleep(0.5) 
             else:
-                # 💡 [핵심 해결] 한투 서버가 뱉어내는 "진짜 에러 메시지"를 추출합니다!
+                # 💡 한투 서버가 뱉어내는 "진짜 에러 메시지"를 추출합니다!
                 try:
                     err_msg = res.json().get('msg1', '알 수 없는 에러')
                 except:
@@ -71,7 +75,7 @@ class UltraDataCollector:
                 
                 self.send_log(f"❌ [{stock_code}] 한투 서버 거절 사유: {err_msg}", "error")
                 
-                # 💡 [안전장치] 에러가 났을 때도 잠시 쉬어주어 IP 차단을 방지합니다.
+                # 에러가 났을 때도 잠시 쉬어주어 IP 차단을 방지합니다.
                 time.sleep(0.5) 
                 break
             
@@ -137,7 +141,8 @@ class UltraDataCollector:
 
     def run_collection(self, stock_list):
         final_combined_data = []
-        # 1000개 수집은 시간이 꽤 걸리므로 미리 알려줍니다.
+        consecutive_errors = 0 # 💡 연속 에러를 세기 위한 카운터
+        
         self.send_log(f"📊 총 {len(stock_list)}개 종목 사냥 시작! 예상 시간 약 1.5시간~2시간", "info")
         
         for idx, code in enumerate(stock_list):
@@ -147,13 +152,25 @@ class UltraDataCollector:
                     processed = self.make_ai_dataset(raw)
                     if processed is not None:
                         final_combined_data.append(processed)
+                        consecutive_errors = 0 # 💡 정상 수집 시 카운터 리셋
                         
                         if (idx + 1) % 10 == 0:
                             current_count = sum(len(d) for d in final_combined_data)
                             self.send_log(f"✅ {idx + 1}번째 종목 완료! (수집 데이터: {current_count:,}줄)", "success")
+                    else:
+                        consecutive_errors += 1
+                else:
+                    consecutive_errors += 1
+                    
             except Exception as e:
+                consecutive_errors += 1
                 self.send_log(f"⚠️ [{code}] 사냥 실패(건너뜀): {e}", "warning")
-                continue
+
+            # 💡 [핵심 추가] 연속 에러가 20회 누적되면 무의미한 통신을 멈추고 강제 종료
+            if consecutive_errors >= 20:
+                self.send_log("🚨 [치명적 오류] 서버 거절(Bearer 등)이 20번 연속 발생했습니다. 수집망을 강제 종료합니다.", "error")
+                self.send_log("💡 해결법: C# UI 로그인 창에서 입력한 API Key와 모의/실전 여부가 짝이 맞는지 다시 확인하세요.", "warning")
+                break
 
         if final_combined_data:
             master_df = pd.concat(final_combined_data).reset_index(drop=True)
@@ -173,23 +190,17 @@ if __name__ == "__main__":
     APP_SECRET = "3IS6VELZscyON3lhpinnbWf9I6+oCfFR+k5+XyreSvnwgi1IFaOFlN4M35ZL8IvTidXiSWws+qCe8Y015l/w2VN8kVC/BHmncRwLBVZUxICBE6RcVt3JsPp/xlHyjo1meR0XWqU8yqlIUkOcib3HfSamhnpiCKFalhlVeyYcgU3uP/1UWP8="
     ACCOUNT = "50172151"
 
-    # 💡 [핵심] 수동 하드코딩 제거! 시총 상위 1000개 종목을 자동으로 긁어옵니다.
     print("📡 한국 거래소(KRX)에서 시가총액 상위 1000개 종목 명단을 다운로드합니다...")
     krx_df = fdr.StockListing('KRX')
     
-    # 스팩, 리츠 등 이상한 주식 제외하고 진짜 주식만 필터링 후 1000개 추출
     krx_df = krx_df[(krx_df['Market'] == 'KOSPI') | (krx_df['Market'] == 'KOSDAQ')]
     top_1000_df = krx_df.sort_values('Marcap', ascending=False).head(1000)
     
-    # 💡 [매우 중요] FormMain.py가 나중에 읽어볼 수 있도록 사전(Dictionary) 파일로 저장해둡니다!
     dict_path = os.path.join(root_dir, "stock_dict.csv")
     top_1000_df[['Code', 'Name']].to_csv(dict_path, index=False, encoding="utf-8-sig")
     print(f"✅ 명단 저장 완료! 실전 매매 시 이 명단을 그대로 사용합니다. ({dict_path})")
 
-    # 추출한 1000개 종목 코드를 리스트로 변환하여 수집기에 던져줍니다.
     stock_list = top_1000_df['Code'].tolist()
     
     collector = UltraDataCollector(APP_KEY, APP_SECRET, ACCOUNT)
     collector.run_collection(stock_list)
-
-    
