@@ -8,7 +8,7 @@ import random
 import joblib              
 import pandas as pd        
 import numpy as np         
-import requests # 텔레그램 통신용
+import requests # 카카오톡 통신용
 from datetime import datetime 
 from PyQt5 import QtWidgets, uic, QtCore, QtGui  
 from PyQt5.QtCore import Qt, QThread, pyqtSignal 
@@ -45,7 +45,6 @@ class DataCollectorWorker(QThread):
             root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             top_1000_df[['Code', 'Name']].to_csv(os.path.join(root_dir, "stock_dict.csv"), index=False, encoding="utf-8-sig")
             
-            # 여기서 받아온 동적 API Key로 수집기를 실행합니다.
             collector = UltraDataCollector(self.app_key, self.app_secret, self.account_no, self.is_mock, log_callback=self.emit_log)
             collector.run_collection(top_1000_df['Code'].tolist())
         except Exception as e: self.emit_log(f"🚨 수집기 스레드 내부 오류: {e}", "error")
@@ -85,26 +84,45 @@ class AutoTradeWorker(QThread):
 
     def process_trading(self):
         now = datetime.now() 
-        self.sig_log.emit(f"🔄 [주삐 엔진 가동중] {now.strftime('%H:%M')} - 스캔 및 프로 방어 모드 작동중...", "info")
-        MAX_STOCKS = 10; TAKE_PROFIT = 2.0; STOP_LOSS = -2.0    
+        self.sig_log.emit(f"🔄 [주삐 엔진 가동중] {now.strftime('%H:%M')} - 스캔 및 AI 방어 모드 작동중...", "info")
+        MAX_STOCKS = 10 
         SCAN_POOL = list(self.mw.DYNAMIC_STOCK_DICT.keys()) 
         account_rows = []; market_rows = []; strategy_rows = [] 
         total_invested = 0; total_current_val = 0  
+
+        market_crash_mode = False
+        kospi_etf = self.mw.api_manager.fetch_minute_data("069500")
+        if kospi_etf is not None and len(kospi_etf) > 1:
+            etf_now = kospi_etf.iloc[-1]['close']
+            etf_prev = kospi_etf.iloc[-2]['close']
+            market_ret_1m = ((etf_now - etf_prev) / etf_prev) * 100.0
+            
+            self.mw.strategy_engine.market_return_1m = market_ret_1m
+            
+            etf_open = kospi_etf.iloc[0]['open']
+            etf_drop = ((etf_now - etf_open) / etf_open) * 100
+            if etf_drop <= -1.5: 
+                market_crash_mode = True
+                self.sig_log.emit(f"⚠️ [시장 경고] 코스피 지수가 급락 중입니다. (시가 대비 {etf_drop:.2f}%) 신규 매수를 일시 차단합니다.", "warning")
 
         if len(self.mw.my_holdings) > 0: 
             sold_codes = []; hold_status_list = [] 
             for code, info in list(self.mw.my_holdings.items()): 
                 buy_price = info['price']; buy_qty = info['qty']; stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
-                
-                high_watermark = info.get('high_watermark', buy_price)
-                buy_time = info.get('buy_time', now)
-                half_sold = info.get('half_sold', False) 
+                high_watermark = info.get('high_watermark', buy_price); buy_time = info.get('buy_time', now); half_sold = info.get('half_sold', False) 
 
                 df = self.mw.api_manager.fetch_minute_data(code)
                 if df is None or len(df) < 30: continue 
                 
-                curr_price = df.iloc[-1]['close']; profit_rate = ((curr_price - buy_price) / buy_price) * 100 
+                df = self.mw.strategy_engine.calculate_indicators(df)
                 
+                curr_price = df.iloc[-1]['close']
+                profit_rate = ((curr_price - buy_price) / buy_price) * 100 
+                
+                target_price, stop_price = self.mw.strategy_engine.get_dynamic_exit_prices(df, buy_price)
+                target_rate = ((target_price - buy_price) / buy_price) * 100
+                stop_rate = ((stop_price - buy_price) / buy_price) * 100
+
                 if curr_price > high_watermark:
                     self.mw.my_holdings[code]['high_watermark'] = curr_price
                     high_watermark = curr_price
@@ -112,24 +130,11 @@ class AutoTradeWorker(QThread):
                 elapsed_mins = (now - buy_time).total_seconds() / 60.0
 
                 total_invested += (buy_price * buy_qty); total_current_val += (curr_price * buy_qty)
-                curr_open = float(df.iloc[-1].get('open', curr_price)); curr_high = float(df.iloc[-1].get('high', curr_price))
-                curr_low = float(df.iloc[-1].get('low', curr_price)); curr_vol = float(df.iloc[-1].get('volume', 0)) 
-
-                df['MA5'] = df['close'].rolling(5).mean(); df['MA20'] = df['close'].rolling(20).mean()
-                df['Vol_MA5'] = df['volume'].rolling(5).mean(); df['Vol_Energy'] = np.where(df['Vol_MA5'] > 0, df['volume'] / df['Vol_MA5'], 1)
-                df['Disparity_20'] = (df['close'] / df['MA20']) * 100
-                delta = df['close'].diff(); up = delta.clip(lower=0); down = -1 * delta.clip(upper=0)
-                df['RSI'] = 100 - (100 / (1 + (up.ewm(com=13).mean() / down.ewm(com=13).mean())))
-                df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
-                df['Signal'] = df['MACD'].ewm(span=9).mean()
                 
-                curr_macd = df.iloc[-1]['MACD']; curr_signal = df.iloc[-1]['Signal']
-                prev_close = df.iloc[-2]['close'] if len(df) > 1 else curr_open
-                ret_1m = ((curr_price - prev_close) / prev_close) * 100.0 if prev_close else 0.0
-                
-                trade_amt = (curr_price * curr_vol) / 1000000.0 
-                curr_vol_energy = df.iloc[-1]['Vol_Energy'] if not pd.isna(df.iloc[-1]['Vol_Energy']) else 1.0
-                curr_disp = df.iloc[-1]['Disparity_20'] if not pd.isna(df.iloc[-1]['Disparity_20']) else 100.0
+                curr_open = float(df.iloc[-1]['open']); curr_high = float(df.iloc[-1]['high']); curr_low = float(df.iloc[-1]['low']); curr_vol = float(df.iloc[-1]['volume']) 
+                curr_macd = df.iloc[-1]['MACD']; curr_signal = df.iloc[-1]['Signal_Line']
+                ret_1m = df.iloc[-1]['return']; trade_amt = df.iloc[-1]['Trade_Amount']
+                curr_vol_energy = df.iloc[-1]['Vol_Energy']; curr_disp = df.iloc[-1]['Disparity_20']
 
                 market_rows.append({
                     '종목코드': code, '종목명': stock_name, '현재가': f"{curr_price:,.0f}", '시가': f"{curr_open:,.0f}", '고가': f"{curr_high:,.0f}", '저가': f"{curr_low:,.0f}",
@@ -137,24 +142,25 @@ class AutoTradeWorker(QThread):
                 })
 
                 is_sell_all = False; is_sell_half = False; status_msg = ""; sell_qty = buy_qty
+                
                 strat_signal = self.mw.strategy_engine.check_trade_signal(df, code)
 
                 if now.hour == 15 and now.minute >= 10: is_sell_all = True; status_msg = "마감 임박 청산"
                 elif now.hour == 15 and 0 <= now.minute < 10:
                     if profit_rate >= 0.3: is_sell_all = True; status_msg = "수수료 방어 마감 익절"
                     elif profit_rate > 0.0 and curr_macd < curr_signal: is_sell_all = True; status_msg = "마감 전 추세꺾임 탈출"
-                    elif profit_rate <= STOP_LOSS: is_sell_all = True; status_msg = "마감 전 기계적 손절"
+                    elif profit_rate <= stop_rate: is_sell_all = True; status_msg = "마감 전 기계적 손절"
                 else:
                     if strat_signal == "SELL" and profit_rate > 0.5:
-                        is_sell_all = True; status_msg = "전략엔진 강력 매도 신호 (수익 보존 탈출)"
-                    elif strat_signal == "SELL" and profit_rate <= STOP_LOSS:
-                        is_sell_all = True; status_msg = "전략엔진 강력 매도 신호 (리스크 최소화 손절)"
-                    elif profit_rate >= TAKE_PROFIT and not half_sold: 
-                        is_sell_half = True; sell_qty = max(1, buy_qty // 2); status_msg = "목표가 1차 절반(50%) 익절"
+                        is_sell_all = True; status_msg = "전략엔진 매도 신호 (수익 보존)"
+                    elif strat_signal == "SELL" and profit_rate <= stop_rate:
+                        is_sell_all = True; status_msg = "전략엔진 매도 신호 (리스크 최소화)"
+                    elif profit_rate >= target_rate and not half_sold: 
+                        is_sell_half = True; sell_qty = max(1, buy_qty // 2); status_msg = f"동적 목표가({target_rate:.1f}%) 도달 1차 익절"
                     elif half_sold and trail_drop_rate >= 0.5:
                         is_sell_all = True; status_msg = "트레일링 스탑 (나머지 전량 익절)"
-                    elif profit_rate <= STOP_LOSS: 
-                        is_sell_all = True; status_msg = "기계적 리스크 손절"
+                    elif profit_rate <= stop_rate: 
+                        is_sell_all = True; status_msg = f"ATR 동적 손절라인({stop_rate:.1f}%) 이탈"
                     elif profit_rate >= 1.5 and curr_macd < curr_signal: 
                         is_sell_all = True; status_msg = "데드크로스 수익보존 탈출"
                     elif elapsed_mins >= 45 and (-1.0 <= profit_rate <= 1.0):
@@ -174,7 +180,9 @@ class AutoTradeWorker(QThread):
                         sell_msg = (f"{log_icon} [매도 체결 완료] {stock_name} | 매도가: {curr_price:,.0f}원 | "
                                     f"수량: {sell_qty}주 | 실현 손익: {int(realized_profit):,}원 ({profit_rate:.2f}%) | 사유: {status_msg}")
                         self.sig_log.emit(sell_msg, log_color) 
-                        self.mw.send_telegram_msg(f"🔔 [주삐 매도 알림]\n종목: {stock_name}\n수익률: {profit_rate:.2f}%\n손익: {int(realized_profit):,}원\n사유: {status_msg}") 
+                        
+                        # 💬 카카오톡 매도 알림 전송
+                        self.mw.send_kakao_msg(f"🔔 [주삐 매도 알림]\n종목: {stock_name}\n수익률: {profit_rate:.2f}%\n손익: {int(realized_profit):,}원\n사유: {status_msg}") 
                         
                         sell_type_str = '익절(SELL_PROFIT)' if profit_rate > 0 else '손절(SELL_LOSS)'
                         self.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': sell_type_str, '주문가격': f"{curr_price:,.0f}", '주문수량': sell_qty, '체결수량': sell_qty, '주문시간': now.strftime("%Y-%m-%d %H:%M:%S"), '상태': '체결완료'})
@@ -193,15 +201,6 @@ class AutoTradeWorker(QThread):
         current_count = len(self.mw.my_holdings); needed_count = MAX_STOCKS - current_count 
         api_cash = self.mw.api_manager.get_balance(); my_cash = api_cash if api_cash is not None else getattr(self.mw, 'last_known_cash', 0)
         self.mw.last_known_cash = my_cash; cash_str = f"{my_cash:,}" 
-        
-        market_crash_mode = False
-        if needed_count > 0 and now.hour < 15:
-            kospi_etf = self.mw.api_manager.fetch_minute_data("069500")
-            if kospi_etf is not None and len(kospi_etf) > 0:
-                etf_now = kospi_etf.iloc[-1]['close']; etf_open = kospi_etf.iloc[0]['open']; etf_drop = ((etf_now - etf_open) / etf_open) * 100
-                if etf_drop <= -1.5: 
-                    market_crash_mode = True
-                    self.sig_log.emit(f"⚠️ [시장 경고] 코스피 지수가 급락 중입니다. (시가 대비 {etf_drop:.2f}%) 신규 매수를 일시 차단합니다.", "warning")
 
         if now.hour >= 15: pass
         elif market_crash_mode: pass
@@ -211,6 +210,7 @@ class AutoTradeWorker(QThread):
 
             for code in scan_targets:
                 if code in self.mw.my_holdings: continue 
+                
                 prob, curr_price, df_feat = self.mw.get_ai_probability(code)
                 if prob == -1.0: break 
 
@@ -218,23 +218,26 @@ class AutoTradeWorker(QThread):
                 
                 if df_feat is not None and not df_feat.empty:
                     strat_signal = self.mw.strategy_engine.check_trade_signal(df_feat, code)
-                    if 0.5 <= prob < 0.6:
+                    if 0.5 <= prob < 0.7:
                         self.sig_log.emit(f"🔎 [{stock_name}] AI 확신도 부족 ({prob*100:.1f}%) -> 매수 보류", "warning")
-                    if strat_signal == "BUY" and prob < 0.6:
-                        self.sig_log.emit(f"💡 [{stock_name}] 전략엔진은 강력 매수를 추천하나, AI 확신도 미달로 스킵", "info")
+                    if strat_signal == "BUY" and prob < 0.7:
+                        self.sig_log.emit(f"💡 [{stock_name}] 전략엔진은 강력 매수를 추천하나, AI 확신도(70% 미달)로 스킵", "info")
 
-                    curr_open = float(df_feat.iloc[-1].get('open', curr_price)); curr_high = float(df_feat.iloc[-1].get('high', curr_price)); curr_low  = float(df_feat.iloc[-1].get('low', curr_price)); curr_vol  = float(df_feat.iloc[-1].get('volume', 0))
-                    ret_1m = float(df_feat.iloc[-1].get('return', 0)) * 100.0; trade_amt = (curr_price * curr_vol) / 1000000.0
-                    curr_vol_energy = float(df_feat.iloc[-1].get('Vol_Energy', 1.0)); curr_disp = float(df_feat.iloc[-1].get('Disparity_20', 100.0))
+                    curr_open = float(df_feat.iloc[-1]['open']); curr_high = float(df_feat.iloc[-1]['high'])
+                    curr_low  = float(df_feat.iloc[-1]['low']); curr_vol  = float(df_feat.iloc[-1]['volume'])
+                    ret_1m = float(df_feat.iloc[-1]['return']); trade_amt = float(df_feat.iloc[-1]['Trade_Amount'])
+                    curr_vol_energy = float(df_feat.iloc[-1]['Vol_Energy']); curr_disp = float(df_feat.iloc[-1]['Disparity_20'])
+                    curr_macd = float(df_feat.iloc[-1]['MACD']); curr_rsi = float(df_feat.iloc[-1]['RSI'])
                 else: 
                     curr_open = curr_high = curr_low = curr_price; curr_vol = ret_1m = trade_amt = curr_disp = 0.0; curr_vol_energy = 1.0
+                    curr_macd = curr_rsi = 0.0
 
                 market_rows.append({'종목코드': code, '종목명': stock_name, '현재가': f"{curr_price:,.0f}", '시가': f"{curr_open:,.0f}", '고가': f"{curr_high:,.0f}", '저가': f"{curr_low:,.0f}", '1분등락률': f"{ret_1m:.2f}", '거래대금': f"{trade_amt:,.1f}", '거래량에너지': f"{curr_vol_energy:.2f}", '이격도': f"{curr_disp:.2f}", '거래량': f"{curr_vol:,.0f}"})
                 
                 if df_feat is not None: 
-                    strategy_rows.append({'종목코드': code, '종목명': stock_name, '상승확률': f"{prob*100:.1f}%", 'MA_5': f"{df_feat.iloc[-1]['MA5']:.0f}", 'MA_20': f"{df_feat.iloc[-1]['MA20']:.0f}", 'RSI': f"{df_feat.iloc[-1]['RSI']:.1f}", 'MACD': f"{df_feat.iloc[-1]['MACD']:.2f}", '전략신호': "BUY 🟢" if prob >= 0.6 else "WAIT 🟡"})
+                    strategy_rows.append({'종목코드': code, '종목명': stock_name, '상승확률': f"{prob*100:.1f}%", 'MA_5': f"{df_feat.iloc[-1]['MA5']:.0f}", 'MA_20': f"{df_feat.iloc[-1]['MA20']:.0f}", 'RSI': f"{curr_rsi:.1f}", 'MACD': f"{curr_macd:.2f}", '전략신호': "BUY 🟢" if prob >= 0.7 else "WAIT 🟡"})
                 
-                if prob >= 0.6: candidates.append({'code': code, 'prob': prob, 'price': curr_price})
+                if prob >= 0.7: candidates.append({'code': code, 'prob': prob, 'price': curr_price})
                 time.sleep(0.1) 
             
             if candidates:
@@ -261,9 +264,11 @@ class AutoTradeWorker(QThread):
                         
                         my_cash -= (curr_price * buy_qty) 
                         self.sig_log.emit(f"🔵 [매수 체결 성공] {stock_name} | 매수가: {curr_price:,.0f}원 | 수량: {buy_qty}주 | 확률: {prob*100:.1f}% | 비중: {weight*100:.0f}%", "buy") 
-                        self.mw.send_telegram_msg(f"🛒 [주삐 매수 알림]\n종목: {stock_name}\n체결가: {curr_price:,.0f}원\n수량: {buy_qty}주\nAI 확률: {prob*100:.1f}%\n투자비중: {weight*100:.0f}%") 
-                        self.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': '매수(BUY)', '주문가격': f"{curr_price:,.0f}", '주문수량': buy_qty, '체결수량': buy_qty, '주문시간': now.strftime("%Y-%m-%d %H:%M:%S"), '상태': '체결완료'})
                         
+                        # 💬 카카오톡 매수 알림 전송
+                        self.mw.send_kakao_msg(f"🛒 [주삐 매수 알림]\n종목: {stock_name}\n체결가: {curr_price:,.0f}원\n수량: {buy_qty}주\nAI 확률: {prob*100:.1f}%\n투자비중: {weight*100:.0f}%") 
+                        
+                        self.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': '매수(BUY)', '주문가격': f"{curr_price:,.0f}", '주문수량': buy_qty, '체결수량': buy_qty, '주문시간': now.strftime("%Y-%m-%d %H:%M:%S"), '상태': '체결완료'})
                         account_rows.append({'종목코드': code, '종목명': stock_name, '보유수량': buy_qty, '평균매입가': f"{curr_price:,.0f}", '현재가': f"{curr_price:,.0f}", '평가손익': "0.00%", '주문가능금액': 0})
 
         if account_rows: account_rows[0]['주문가능금액'] = f"{my_cash:,}" 
@@ -297,8 +302,8 @@ class FormMain(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         
-        self.TELEGRAM_TOKEN = "" 
-        self.TELEGRAM_CHAT_ID = "" 
+        # 💬 카카오톡 설정 (토큰만 유지)
+        self.KAKAO_TOKEN = "여기에_발급받은_카카오톡_REST_API_토큰을_입력하세요" 
 
         self.initUI() 
         self.output_logger = OutputLogger(); self.output_logger.emit_log.connect(self.sys_print_to_log)
@@ -309,10 +314,6 @@ class FormMain(QtWidgets.QMainWindow):
         if os.path.exists(dict_path):
             df_dict = pd.read_csv(dict_path); self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['Code'].astype(str).str.zfill(6), df_dict['Name']))
         else: self.DYNAMIC_STOCK_DICT = {"005930": "삼성전자"} 
-
-        self.model = None
-        for p in [os.path.join(os.getcwd(), "jubby_brain.pkl"), os.path.join(root_dir, "jubby_brain.pkl")]:
-            if os.path.exists(p): self.model = joblib.load(p); break
 
         self.strategy_engine = JubbyStrategy(log_callback=self.add_log)
 
@@ -325,14 +326,90 @@ class FormMain(QtWidgets.QMainWindow):
         self.trade_worker.sig_sync_cs.connect(self.btnDataSendClickEvent)
         self.trade_worker.sig_order_append.connect(self.append_order_table_slot)            
         self.trade_worker.sig_market_df.connect(self.update_market_table_slot)   
+        
         QtCore.QTimer.singleShot(3000, self.load_real_holdings) 
+        
+        # ⏱️ [추가] 1시간마다 카카오톡 자동 보고 타이머 설정
+        self.kakao_timer = QtCore.QTimer(self)
+        self.kakao_timer.timeout.connect(self.auto_status_report)
+        self.kakao_timer.start(1000 * 60 * 60) # 3600000ms = 1시간마다 실행
 
-    def send_telegram_msg(self, text):
-        if not self.TELEGRAM_TOKEN or not self.TELEGRAM_CHAT_ID: return
+# =====================================================================
+    # 💬 [최종 완성] 카카오톡 무한 자동 갱신 전송 시스템
+    # =====================================================================
+    def send_kakao_msg(self, text):
+        # 🚨 여기에 회원님의 [REST API 키]를 꼭 넣어주세요! (토큰 자동 갱신에 필요함)
+        REST_API_KEY = "4cbe02304c893a129a812045d5f200a3" 
+        
         try:
-            url = f"https://api.telegram.org/bot{self.TELEGRAM_TOKEN}/sendMessage"
-            requests.get(url, params={"chat_id": self.TELEGRAM_CHAT_ID, "text": text})
-        except: pass
+            import json
+            # 아까 만든 kakao_token.json 파일 위치 찾기
+            token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kakao_token.json")
+            
+            # 파일 읽어서 토큰 꺼내기
+            with open(token_path, "r") as fp:
+                tokens = json.load(fp)
+            
+            url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
+            headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+            safe_text = text.replace('\n', '\\n').replace('"', '\\"')
+            data = {"template_object": '{"object_type": "text", "text": "' + safe_text + '", "link": {}}'}
+            
+            # 1차 카톡 전송 시도
+            res = requests.post(url, headers=headers, data=data)
+            
+            # 만약 에러가 났다면? (토큰 6시간 수명 만료됨)
+            if res.status_code != 200:
+                self.add_log("🔄 카카오톡 토큰이 만료되었습니다. 스스로 인공호흡(자동 갱신)을 시작합니다...", "warning")
+                
+                # 리프레시 토큰으로 새로운 액세스 토큰 발급 받기
+                refresh_url = "https://kauth.kakao.com/oauth/token"
+                refresh_data = {
+                    "grant_type": "refresh_token",
+                    "client_id": REST_API_KEY,
+                    "refresh_token": tokens["refresh_token"]
+                }
+                new_token_res = requests.post(refresh_url, data=refresh_data).json()
+                
+                # 새 생명을 얻은 토큰을 json 파일에 덮어쓰기 (다음번을 위해)
+                tokens["access_token"] = new_token_res.get("access_token", tokens["access_token"])
+                if "refresh_token" in new_token_res:
+                    tokens["refresh_token"] = new_token_res["refresh_token"]
+                    
+                with open(token_path, "w") as fp:
+                    json.dump(tokens, fp)
+                    
+                # 새 토큰으로 다시 카톡 전송!
+                headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+                requests.post(url, headers=headers, data=data)
+                self.add_log("✅ 카카오톡 토큰 자동 갱신 및 메시지 재전송 성공!", "success")
+                
+        except Exception as e:
+            self.add_log(f"카카오톡 전송/갱신 완전 실패: {e}", "error")
+
+    # =====================================================================
+    # ⏱️ 1시간 자동 보고서 브리핑
+    # =====================================================================
+    def auto_status_report(self):
+        my_cash = self.api_manager.get_balance()
+        if my_cash is None: my_cash = 0
+        
+        msg = f"📊 [주삐 정기 보고]\n💰 남은 현금: {my_cash:,}원\n\n[현재 보유 종목]\n"
+        
+        if len(self.my_holdings) == 0:
+            msg += "보유 중인 주식이 없습니다."
+        else:
+            for code, info in self.my_holdings.items():
+                name = self.DYNAMIC_STOCK_DICT.get(code, code)
+                df = self.api_manager.fetch_minute_data(code)
+                if df is not None and len(df) > 0:
+                    profit = ((df.iloc[-1]['close'] - info['price']) / info['price']) * 100
+                    msg += f"🔹 {name}: {profit:+.2f}%\n"
+                else:
+                    msg += f"🔹 {name}: 데이터 대기중\n"
+                    
+        self.send_kakao_msg(msg)
+        self.add_log("💬 카카오톡으로 현재 계좌 현황을 자동 전송했습니다.", "info")
 
     @QtCore.pyqtSlot(str)
     def sys_print_to_log(self, text): self.add_log(f"🖥️ {text}", "info")
@@ -499,7 +576,6 @@ class FormMain(QtWidgets.QMainWindow):
                     self.add_log(f"   🔹 {stock_name} - 데이터 수신 대기중...", "warning")
                 time.sleep(0.05) 
 
-    # 💡 [수정 2] 기존 Ctrl+좌클릭 텍스트 저장 기능을 완전히 걷어내고 드래그(창 이동)만 남겼습니다.
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton and event.modifiers() == Qt.ControlModifier: 
             self.show_algorithm_menu(event.globalPos())
@@ -507,7 +583,6 @@ class FormMain(QtWidgets.QMainWindow):
             self._isDragging = True
             self._startPos = event.globalPos() - self.frameGeometry().topLeft()
 
-    # 💡 [수정 2] Ctrl + 우클릭 시 나오는 메뉴에 '로그 저장' 버튼을 추가했습니다.
     def show_algorithm_menu(self, pos):
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet("QMenu { background-color: rgb(30, 40, 60); color: white; font-size: 14px; border: 1px solid Silver; } QMenu::item { padding: 10px 25px; } QMenu::item:selected { background-color: rgb(80, 120, 160); }")
@@ -516,7 +591,7 @@ class FormMain(QtWidgets.QMainWindow):
         act_train = menu.addAction("🧠 Jubby AI Trainer (AI 학습기 실행)")
         act_strategy = menu.addAction("📊 Strategy (전략 엔진 점검)")
         
-        menu.addSeparator() # 깔끔한 구분선
+        menu.addSeparator() 
         act_save_log = menu.addAction("💾 현재 로그 텍스트로 저장 (Save Log)") 
 
         action = menu.exec_(pos)
@@ -526,11 +601,10 @@ class FormMain(QtWidgets.QMainWindow):
         elif action == act_train: 
             self.start_ai_trainer()
         elif action == act_strategy: 
-            self.add_log("📊 [Strategy] 13개 다차원 전략 엔진(Strategy.py)이 메인 루프에 정상 연결되어 있습니다.", "success")
+            self.add_log("📊 [Strategy] 15개 다차원 전략 엔진(Strategy.py)이 메인 루프에 정상 연결되어 있습니다.", "success")
         elif action == act_save_log: 
             self.save_manual_log()
 
-    # 💡 [수정 2] 분리되어 깔끔해진 로그 저장 함수
     def save_manual_log(self):
         try:
             text = self.txtLog.toPlainText()
@@ -542,8 +616,6 @@ class FormMain(QtWidgets.QMainWindow):
         except Exception as e:
             self.add_log(f"🚨 [저장 실패] 오류 발생: {e}", "error")
 
-    # 💡 [수정 1] Bearer 에러 완벽 차단!
-    # 하드코딩된 키(오류 원인)를 버리고 KIS_Manager에서 실제로 접속에 성공한 API 키와 모의투자 여부를 훔쳐옵니다!
     def start_data_collector(self):
         try:
             if hasattr(self, 'collector_worker') and self.collector_worker.isRunning(): 
@@ -552,7 +624,6 @@ class FormMain(QtWidgets.QMainWindow):
             
             self.add_log("🚀 거래대금 상위 1000종목 핫플레이스 수집을 백그라운드에서 실행합니다. (1~2시간 소요)", "info")
             
-            # 메인 엔진에서 사용중인 API KEY 값들을 가져옵니다.
             app_key = getattr(self.api_manager, 'app_key', getattr(self.api_manager, 'APP_KEY', "PSargEXRJo0zf5vOG1HAAKr7bKX9VKDzBhjy"))
             app_secret = getattr(self.api_manager, 'app_secret', getattr(self.api_manager, 'APP_SECRET', "3IS6VELZscyON3lhpinnbWf9I6+oCfFR+k5+XyreSvnwgi1IFaOFlN4M35ZL8IvTidXiSWws+qCe8Y015l/w2VN8kVC/BHmncRwLBVZUxICBE6RcVt3JsPp/xlHyjo1meR0XWqU8yqlIUkOcib3HfSamhnpiCKFalhlVeyYcgU3uP/1UWP8="))
             account_no = getattr(self.api_manager, 'account_no', getattr(self.api_manager, 'ACCOUNT_NO', "50172151"))
@@ -596,33 +667,30 @@ class FormMain(QtWidgets.QMainWindow):
         if not self.trade_worker.is_running: 
             self.trade_worker.start(); self.btnAutoDataTest.setText("자동 매매 중단 (STOP)"); self.btnAutoDataTest.setStyleSheet("background-color: rgb(70, 10, 10); color: Lime; font-weight: bold;")
             self.add_log("🚀 [주삐 엔진] 1분 단위 감시망 가동! 잠시 후 첫 브리핑이 시작됩니다.", "success")
-            self.send_telegram_msg("🤖 [주삐 알림] 자동매매 감시망 가동을 시작합니다!") 
+            self.send_kakao_msg("🤖 [주삐 알림] 자동매매 감시망 가동을 시작합니다!") 
         else: 
             self.trade_worker.is_running = False; self.trade_worker.quit(); self.btnAutoDataTest.setText("자동 매매 가동 (GO)"); self.btnAutoDataTest.setStyleSheet("background-color: rgb(5,5,15); color: Silver;")
             self.add_log("🛑 [주삐 엔진] 감시망을 거둡니다. 푹 쉬세요!", "warning")
-            self.send_telegram_msg("🛑 [주삐 알림] 자동매매를 종료합니다. 수고하셨습니다!") 
+            self.send_kakao_msg("🛑 [주삐 알림] 자동매매를 종료합니다. 수고하셨습니다!") 
 
+    # =========================================================================
+    # 💡 [핵심 추가] 15개 지표 계산 및 확률 추론을 모두 AI 전략 엔진에 위임합니다!
+    # =========================================================================
     def get_ai_probability(self, code):
         df = self.api_manager.fetch_minute_data(code) 
         if df is None or len(df) < 30: return 0.0, 0, None 
-        df['return'] = df['close'].pct_change(); df['vol_change'] = df['volume'].pct_change()
-        delta = df['close'].diff(); up = delta.clip(lower=0); down = -1 * delta.clip(upper=0)
-        df['RSI'] = 100 - (100 / (1 + (up.ewm(com=13).mean() / down.ewm(com=13).mean())))
-        df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
-        df['MA5'] = df['close'].rolling(5).mean(); df['MA20'] = df['close'].rolling(20).mean()
-        df['BB_Lower'] = df['MA20'] - (df['close'].rolling(20).std() * 2); df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
-        df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['MA20']
-        df['Disparity_5'] = (df['close'] / df['MA5']) * 100; df['Disparity_20'] = (df['close'] / df['MA20']) * 100
-        df['Vol_MA5'] = df['volume'].rolling(5).mean(); df['Vol_Energy'] = np.where(df['Vol_MA5'] > 0, df['volume'] / df['Vol_MA5'], 1)
-        df['OBV'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum(); df['OBV_Trend'] = df['OBV'].pct_change()
-        high_low = df['high'] - df['low']; high_close = np.abs(df['high'] - df['close'].shift()); low_close = np.abs(df['low'] - df['close'].shift())
-        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['ATR'] = true_range.rolling(14).mean()
-        df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1); df['Low_Tail'] = df[['open', 'close']].min(axis=1)
-        curr = df.iloc[-1].replace([np.inf, -np.inf], 0).fillna(0); curr_price = curr['close'] 
-        features = ['return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 'ATR', 'High_Tail', 'Low_Tail']
-        X = curr[features].values.reshape(1, -1)
-        prob = self.model.predict_proba(X)[0][1] if hasattr(self, 'model') and self.model is not None else -1.0 
+        
+        # Strategy 엔진을 통해 15개 퀀트 지표를 완벽하게 계산합니다.
+        df = self.strategy_engine.calculate_indicators(df)
+        curr_price = df.iloc[-1]['close'] 
+        
+        prob = 0.0
+        # AI 뇌가 탑재되어 있다면 확률을 물어봅니다.
+        if self.strategy_engine.ai_model is not None:
+            features = self.strategy_engine.get_ai_features(df)
+            if features is not None:
+                prob = self.strategy_engine.ai_model.predict_proba(features)[0][1]
+                
         return prob, curr_price, df
 
     @QtCore.pyqtSlot(object) 

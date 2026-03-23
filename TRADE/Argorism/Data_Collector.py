@@ -21,6 +21,9 @@ class UltraDataCollector:
         self.api.get_access_token()
         self.base_url = "https://openapivts.koreainvestment.com:29443" if is_mock else "https://openapi.koreainvestment.com:9443"
         
+        # 💡 시장 지수 매핑을 위한 딕셔너리 준비
+        self.market_dict = {} 
+
         if not self.api.access_token:
             self.send_log("🚨 [경고] 토큰 발급에 실패했습니다. API Key나 모의/실전 여부를 다시 확인하세요!", "error")
         else:
@@ -56,7 +59,6 @@ class UltraDataCollector:
             
             res = requests.get(url, headers=headers, params=params)
             
-            # 정상 응답 처리
             if res.status_code == 200 and res.json().get('rt_cd') == '0':
                 data = res.json().get('output2', [])
                 if not data: break 
@@ -67,15 +69,12 @@ class UltraDataCollector:
                 target_time = data[-1]['stck_cntg_hour'] 
                 time.sleep(0.5) 
             else:
-                # 💡 한투 서버가 뱉어내는 "진짜 에러 메시지"를 추출합니다!
                 try:
                     err_msg = res.json().get('msg1', '알 수 없는 에러')
                 except:
                     err_msg = f"HTTP 상태코드 {res.status_code}"
                 
                 self.send_log(f"❌ [{stock_code}] 한투 서버 거절 사유: {err_msg}", "error")
-                
-                # 에러가 났을 때도 잠시 쉬어주어 IP 차단을 방지합니다.
                 time.sleep(0.5) 
                 break
             
@@ -84,7 +83,6 @@ class UltraDataCollector:
         df = pd.concat(all_chunks).drop_duplicates().sort_values('stck_cntg_hour')
         df['code'] = stock_code 
         
-        # 데이터가 혹시라도 부족하게 올 경우를 대비한 방어 코드
         required_cols = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
         if len(df.columns) >= len(required_cols):
             df.columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume', 'acc_volume', 'extra', 'code'][:len(df.columns)]
@@ -96,7 +94,7 @@ class UltraDataCollector:
     def make_ai_dataset(self, df):
         if df is None or len(df) < 30: return None
         
-        df['return'] = df['close'].pct_change() 
+        df['return'] = df['close'].pct_change() * 100 # 퍼센트로 스케일 맞춤
         df['vol_change'] = df['volume'].pct_change() 
 
         delta = df['close'].diff()
@@ -129,6 +127,18 @@ class UltraDataCollector:
         df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1)
         df['Low_Tail'] = df[['open', 'close']].min(axis=1) - df['low']
 
+        # =========================================================================
+        # 🚀 [추가된 1단계 핵심 지표]
+        # =========================================================================
+        # 1. 매수 압력 (Buying Pressure): 호가창 매수/매도 잔량 비율을 대체하는 실전 차트 지표
+        # (종가 - 저가) / (고가 - 저가) -> 1.0에 가까울수록 누군가 멱살 잡고 끌어올린 것!
+        df['Buying_Pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-9)
+
+        # 2. 시장 1분 등락률 매핑 (Market_Return_1m)
+        # 사전에 만들어둔 market_dict에서 현재 캔들의 'time'과 일치하는 시장 수익률을 꽂아 넣음
+        df['Market_Return_1m'] = df['time'].map(self.market_dict).fillna(0.0)
+        # =========================================================================
+
         df['future_max_10'] = df['close'].rolling(window=10).max().shift(-10)
         df['future_min_10'] = df['close'].rolling(window=10).min().shift(-10)
 
@@ -140,8 +150,19 @@ class UltraDataCollector:
         return df.dropna().reset_index(drop=True)
 
     def run_collection(self, stock_list):
+        # 💡 [핵심] 1000개 종목을 돌기 전에, '코스닥 150 ETF(114800)' 데이터를 먼저 싹 긁어와서 시장 지도를 만듭니다.
+        self.send_log("📈 [시장 지수 맵핑] 코스닥150 ETF(114800) 데이터를 수집하여 시장 등락률 지표를 생성합니다...", "info")
+        market_df = self.fetch_full_day_data('114800')
+        if market_df is not None:
+            market_df['Market_Return_1m'] = market_df['close'].pct_change() * 100
+            # 시간을 키(Key)로, 1분 수익률을 값(Value)으로 하는 딕셔너리(지도) 생성
+            self.market_dict = dict(zip(market_df['time'], market_df['Market_Return_1m'].fillna(0)))
+            self.send_log("✅ 시장 지수 기준 데이터 맵핑 완료! 개별 종목 수집을 시작합니다.", "success")
+        else:
+            self.send_log("⚠️ 시장 지수 수집 실패. 지수 등락률 지표는 0으로 고정됩니다.", "warning")
+
         final_combined_data = []
-        consecutive_errors = 0 # 💡 연속 에러를 세기 위한 카운터
+        consecutive_errors = 0 
         
         self.send_log(f"📊 총 {len(stock_list)}개 종목 사냥 시작! 예상 시간 약 1.5시간~2시간", "info")
         
@@ -152,7 +173,7 @@ class UltraDataCollector:
                     processed = self.make_ai_dataset(raw)
                     if processed is not None:
                         final_combined_data.append(processed)
-                        consecutive_errors = 0 # 💡 정상 수집 시 카운터 리셋
+                        consecutive_errors = 0 
                         
                         if (idx + 1) % 10 == 0:
                             current_count = sum(len(d) for d in final_combined_data)
@@ -166,10 +187,8 @@ class UltraDataCollector:
                 consecutive_errors += 1
                 self.send_log(f"⚠️ [{code}] 사냥 실패(건너뜀): {e}", "warning")
 
-            # 💡 [핵심 추가] 연속 에러가 20회 누적되면 무의미한 통신을 멈추고 강제 종료
             if consecutive_errors >= 20:
                 self.send_log("🚨 [치명적 오류] 서버 거절(Bearer 등)이 20번 연속 발생했습니다. 수집망을 강제 종료합니다.", "error")
-                self.send_log("💡 해결법: C# UI 로그인 창에서 입력한 API Key와 모의/실전 여부가 짝이 맞는지 다시 확인하세요.", "warning")
                 break
 
         if final_combined_data:
@@ -177,7 +196,7 @@ class UltraDataCollector:
             save_path = os.path.join(root_dir, "AI_Ultra_Master_Train_Data_V3.csv")
             master_df.to_csv(save_path, index=False, encoding="utf-8-sig")
             
-            self.send_log(f"💎 [대성공!] 총 {len(master_df):,}줄의 1000종목 거대 족보 완성!", "buy")
+            self.send_log(f"💎 [대성공!] 총 {len(master_df):,}줄의 15가지 고급 지표 족보 완성!", "buy")
             self.send_log(f"📍 파일 저장 위치: {save_path}", "info")
             return save_path
         else:
