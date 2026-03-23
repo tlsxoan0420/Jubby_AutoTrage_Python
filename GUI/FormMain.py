@@ -28,28 +28,41 @@ class OutputLogger(QtCore.QObject):
 
 class DataCollectorWorker(QThread):
     sig_log = pyqtSignal(str, str)
+    
     def __init__(self, app_key, app_secret, account_no, is_mock):
         super().__init__()
-        self.app_key = app_key; self.app_secret = app_secret; self.account_no = account_no; self.is_mock = is_mock
+        # 🚨 [핵심 수정] 데이터 수집은 한투 정책상 무조건 "실전투자" 키와 서버를 써야 작동합니다!
+        self.real_app_key = "PSyRu5RV8xnJfKIdkeLN1vvTgXuI3tLQC0l2"
+        self.real_app_secret = "TahpkKn3F0Khv3NR9qfDKy+iIbEI8vK94AUO+M2rkyr2nOheMEdZVy3XYy+5d5UzUfSMtzvVPjbgAbK6J6/6KXWgpoyjJt0YjtvOY55QprQw37qxG7F63olSsEKCC7pMaN2xl1UrpOkdAuRRbcmMdSKSisMBS2goMJt+MzqaQr+biVRMhOU="
+        
+        self.account_no = account_no
+        self.is_mock = False  # 무조건 실전 서버 모드(False)로 고정!
+
     def run(self):
         try:
             try: from TRADE.Argorism.Data_Collector import UltraDataCollector
             except: from TRADE.Argorism.Data_Collector import UltraDataCollector
             import FinanceDataReader as fdr
+            
             self.emit_log("📡 한국 거래소(KRX)에서 [당일 거래대금 상위 1000개] 핫플레이스 명단을 추출합니다...", "info")
             krx_df = fdr.StockListing('KRX')
             krx_df = krx_df[(krx_df['Market'] == 'KOSPI') | (krx_df['Market'] == 'KOSDAQ')]
             if 'Close' in krx_df.columns: krx_df = krx_df[krx_df['Close'] >= 1000]
             if 'Amount' in krx_df.columns: top_1000_df = krx_df.sort_values('Amount', ascending=False).head(1000)
             else: top_1000_df = krx_df.sort_values('Marcap', ascending=False).head(1000)
+            
             root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             top_1000_df[['Code', 'Name']].to_csv(os.path.join(root_dir, "stock_dict.csv"), index=False, encoding="utf-8-sig")
             
-            collector = UltraDataCollector(self.app_key, self.app_secret, self.account_no, self.is_mock, log_callback=self.emit_log)
+            # 수집기에 무조건 실전투자 키와 실전모드(is_mock=False)를 전달합니다!
+            collector = UltraDataCollector(self.real_app_key, self.real_app_secret, self.account_no, self.is_mock, log_callback=self.emit_log)
             collector.run_collection(top_1000_df['Code'].tolist())
-        except Exception as e: self.emit_log(f"🚨 수집기 스레드 내부 오류: {e}", "error")
-    def emit_log(self, msg, level="info"): self.sig_log.emit(msg, level)
-
+            
+        except Exception as e: 
+            self.emit_log(f"🚨 수집기 스레드 내부 오류: {e}", "error")
+            
+    def emit_log(self, msg, level="info"): 
+        self.sig_log.emit(msg, level)
 class AITrainerWorker(QThread):
     sig_log = pyqtSignal(str, str)
     def run(self):
@@ -344,7 +357,8 @@ class FormMain(QtWidgets.QMainWindow):
         try:
             import json
             # 아까 만든 kakao_token.json 파일 위치 찾기
-            token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kakao_token.json")
+            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            token_path = os.path.join(root_dir, "COMMON", "kakao_token.json")
             
             # 파일 읽어서 토큰 꺼내기
             with open(token_path, "r") as fp:

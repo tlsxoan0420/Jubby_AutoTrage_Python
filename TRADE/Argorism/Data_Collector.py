@@ -19,9 +19,10 @@ class UltraDataCollector:
         
         self.api = KIS.KIS_API(app_key, app_secret, account_no, is_mock)
         self.api.get_access_token()
-        self.base_url = "https://openapivts.koreainvestment.com:29443" if is_mock else "https://openapi.koreainvestment.com:9443"
         
-        # 💡 시장 지수 매핑을 위한 딕셔너리 준비
+        # 💡 [핵심 수정] 강제로 실전 서버로 보냈던 주소를, 토큰(모의/실전)에 맞게 찰떡같이 따라가도록 수정!
+        self.base_url = self.api.base_url
+        
         self.market_dict = {} 
 
         if not self.api.access_token:
@@ -41,11 +42,13 @@ class UltraDataCollector:
 
         for i in range(15):
             url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+            
+            # 💡 헤더(appkey, appsecret)를 한투가 좋아하는 소문자 규격으로 고정
             headers = {
-                "Content-Type": "application/json",
+                "content-type": "application/json",
                 "authorization": f"Bearer {self.api.access_token}",
-                "appKey": self.api.app_key,
-                "appSecret": self.api.app_secret,
+                "appkey": self.api.app_key,
+                "appsecret": self.api.app_secret,
                 "tr_id": "FHKST03010200", 
                 "custtype": "P"
             }
@@ -67,7 +70,7 @@ class UltraDataCollector:
                 all_chunks.append(df_chunk)
                 
                 target_time = data[-1]['stck_cntg_hour'] 
-                time.sleep(0.5) 
+                time.sleep(0.1) # 🚀 속도 가속 모드 유지
             else:
                 try:
                     err_msg = res.json().get('msg1', '알 수 없는 에러')
@@ -94,7 +97,7 @@ class UltraDataCollector:
     def make_ai_dataset(self, df):
         if df is None or len(df) < 30: return None
         
-        df['return'] = df['close'].pct_change() * 100 # 퍼센트로 스케일 맞춤
+        df['return'] = df['close'].pct_change() * 100 
         df['vol_change'] = df['volume'].pct_change() 
 
         delta = df['close'].diff()
@@ -127,17 +130,8 @@ class UltraDataCollector:
         df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1)
         df['Low_Tail'] = df[['open', 'close']].min(axis=1) - df['low']
 
-        # =========================================================================
-        # 🚀 [추가된 1단계 핵심 지표]
-        # =========================================================================
-        # 1. 매수 압력 (Buying Pressure): 호가창 매수/매도 잔량 비율을 대체하는 실전 차트 지표
-        # (종가 - 저가) / (고가 - 저가) -> 1.0에 가까울수록 누군가 멱살 잡고 끌어올린 것!
         df['Buying_Pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-9)
-
-        # 2. 시장 1분 등락률 매핑 (Market_Return_1m)
-        # 사전에 만들어둔 market_dict에서 현재 캔들의 'time'과 일치하는 시장 수익률을 꽂아 넣음
         df['Market_Return_1m'] = df['time'].map(self.market_dict).fillna(0.0)
-        # =========================================================================
 
         df['future_max_10'] = df['close'].rolling(window=10).max().shift(-10)
         df['future_min_10'] = df['close'].rolling(window=10).min().shift(-10)
@@ -150,12 +144,10 @@ class UltraDataCollector:
         return df.dropna().reset_index(drop=True)
 
     def run_collection(self, stock_list):
-        # 💡 [핵심] 1000개 종목을 돌기 전에, '코스닥 150 ETF(114800)' 데이터를 먼저 싹 긁어와서 시장 지도를 만듭니다.
         self.send_log("📈 [시장 지수 맵핑] 코스닥150 ETF(114800) 데이터를 수집하여 시장 등락률 지표를 생성합니다...", "info")
         market_df = self.fetch_full_day_data('114800')
         if market_df is not None:
             market_df['Market_Return_1m'] = market_df['close'].pct_change() * 100
-            # 시간을 키(Key)로, 1분 수익률을 값(Value)으로 하는 딕셔너리(지도) 생성
             self.market_dict = dict(zip(market_df['time'], market_df['Market_Return_1m'].fillna(0)))
             self.send_log("✅ 시장 지수 기준 데이터 맵핑 완료! 개별 종목 수집을 시작합니다.", "success")
         else:
@@ -164,7 +156,7 @@ class UltraDataCollector:
         final_combined_data = []
         consecutive_errors = 0 
         
-        self.send_log(f"📊 총 {len(stock_list)}개 종목 사냥 시작! 예상 시간 약 1.5시간~2시간", "info")
+        self.send_log(f"📊 총 {len(stock_list)}개 종목 사냥 시작! 예상 시간 약 1시간 (가속 모드)", "info")
         
         for idx, code in enumerate(stock_list):
             try:
@@ -205,6 +197,7 @@ class UltraDataCollector:
 
 
 if __name__ == "__main__":
+    # ⚠️ 본인의 정보 확인 유지
     APP_KEY = "PSargEXRJo0zf5vOG1HAAKr7bKX9VKDzBhjy"
     APP_SECRET = "3IS6VELZscyON3lhpinnbWf9I6+oCfFR+k5+XyreSvnwgi1IFaOFlN4M35ZL8IvTidXiSWws+qCe8Y015l/w2VN8kVC/BHmncRwLBVZUxICBE6RcVt3JsPp/xlHyjo1meR0XWqU8yqlIUkOcib3HfSamhnpiCKFalhlVeyYcgU3uP/1UWP8="
     ACCOUNT = "50172151"
