@@ -238,6 +238,17 @@ class AutoTradeWorker(QThread):
                         self.cumulative_realized_profit += realized_profit
                         
                         # ==============================================================
+                        # 🔥 [돈 증발 완벽 해결!] 주식을 팔아서 생긴 현금을 즉시 내 지갑에 더합니다.
+                        # ==============================================================
+                        my_cash += (curr_price * sell_qty)
+                        self.mw.last_known_cash = my_cash 
+                        
+                        # 팔아치운 주식이니 보유 중인 주식 총액 계산에서는 빼줍니다.
+                        total_invested -= (buy_price * sell_qty)
+                        total_current_val -= (curr_price * sell_qty)
+                        # ==============================================================
+                        
+                        # ==============================================================
                         # 🔥 [돈 증발 해결!] 팔아서 번 돈을 즉시 내 현금 지갑에 더해줍니다!
                         # ==============================================================
                         my_cash += (curr_price * sell_qty)
@@ -527,7 +538,7 @@ class AutoTradeWorker(QThread):
             except ValueError:
                 return "0"
 
-        # 🔥 [핵심 수정] 종목코드가 '-' 인 경우에도 차단하지 않고 C#으로 보냅니다!
+        # 🔥 [핵심 수정 복구] 종목코드가 '-' 인 경우에도 차단하지 않고 C#으로 보냅니다!
         def get_symbol(row):
             sym = str(row.get("종목코드", ""))
             if sym == "" or sym == "0": return ""
@@ -552,8 +563,8 @@ class AutoTradeWorker(QThread):
                     "quantity": clean_num(row.get("보유수량", "0")), 
                     "avg_price": clean_num(row.get("평균매입가", "0")), 
                     "current_price": clean_num(row.get("현재가", "0")), 
-                    "pnl_amt": clean_num(row.get("평가손익금", "0")), 
-                    "pnl_rate": clean_num(row.get("수익률", "0")), 
+                    "pnl_amt": clean_num(row.get("평가손익", "0")), # 컬럼명 매칭 주의
+                    "pnl_rate": clean_num(row.get("평가손익", "0")), 
                     "available_cash": clean_num(row.get("주문가능금액", "0"))
                 })
             if account_list: self.client.send_message("account", account_list)
@@ -573,7 +584,7 @@ class AutoTradeWorker(QThread):
                 sym = get_symbol(row)
                 if not sym: continue
                 o_type = str(row.get("주문종류", "")); o_type = "BUY" if "BUY" in o_type else ("SELL_PROFIT" if "SELL_PROFIT" in o_type else "SELL_LOSS")
-                order_list.append({"symbol": sym, "symbol_name": str(row.get("종목명", "")), "order_type": o_type, "order_price": clean_num(row.get("주문가격", "0")), "order_quantity": clean_num(row.get("주문수량", "0")), "filled_quantity": clean_num(row.get("체결수량", "0")), "order_time": str(row.get("주문시간", "")), "Status": str(row.get("상태", "")), "order_yield": str(row.get("수익률", "0.00%"))})
+                order_list.append({"symbol": sym, "symbol_name": str(row.get("종목명", "")), "order_type": o_type, "order_price": clean_num(row.get("주문가격", "0")), "order_quantity": clean_num(row.get("주문수량", "0")), "filled_quantity": clean_num(row.get("체결수량", "0")), "order_time": str(row.get("주문시간", "")), "Status": str(row.get("상태", ""))})
             if order_list: self.client.send_message("order", order_list)
 
     # 🔥 (2) 비상 매도 시에도 수익률 계산 후 표에 전달
