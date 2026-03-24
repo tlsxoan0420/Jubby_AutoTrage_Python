@@ -3,6 +3,9 @@ import numpy as np
 import joblib
 import os
 
+# 🌐 [핵심 추가] 시장 모드(DOMESTIC/OVERSEAS)를 확인하기 위해 가져옵니다.
+from COMMON.Flag import SystemConfig
+
 class JubbyStrategy:
     """
     [주삐 메인 인공지능 (AI 전략 엔진)]
@@ -16,16 +19,29 @@ class JubbyStrategy:
         self.ai_model = None
         self.load_ai_brain()
 
+    # =========================================================================
+    # 🧠 [핵심 수정] 모드에 따라 국내용/해외용 AI 뇌(PKL)를 바꿔 끼우는 함수
+    # =========================================================================
     def load_ai_brain(self):
         try:
             root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            model_path = os.path.join(root_dir, "jubby_brain.pkl")
+            
+            # 현재 선택된 시장 모드를 확인합니다.
+            if SystemConfig.MARKET_MODE == "DOMESTIC":
+                model_name = "jubby_brain.pkl"
+                market_title = "🇰🇷 국내 주식"
+            else:
+                model_name = "jubby_brain_overseas.pkl"
+                market_title = "🌐 미국(해외) 주식"
+                
+            model_path = os.path.join(root_dir, model_name)
             
             if os.path.exists(model_path):
                 self.ai_model = joblib.load(model_path)
-                self.send_log("🧠 [전략엔진] 주삐 AI 뇌(앙상블 모델) 장착 완료! 실전 퀀트 매매를 시작합니다.", "success")
+                self.send_log(f"🧠 [전략엔진] {market_title} 특화 주삐 AI 뇌({model_name}) 장착 완료! 실전 퀀트 매매를 시작합니다.", "success")
             else:
-                self.send_log("⚠️ [전략엔진] AI 뇌 파일(jubby_brain.pkl)이 없습니다. 일반 지표 매매로 동작합니다.", "warning")
+                self.ai_model = None # 파일이 없으면 기존 모델 비우기
+                self.send_log(f"⚠️ [전략엔진] {market_title} 전용 AI 뇌 파일({model_name})이 없습니다. 우선 일반 지표 매매로 동작합니다.", "warning")
         except Exception as e:
             self.send_log(f"🚨 [전략엔진] AI 뇌 이식 실패: {e}", "error")
 
@@ -101,7 +117,7 @@ class JubbyStrategy:
 
     # =====================================================================
     # 🛡️ 3. [동적 방어막] ATR 기반 유동적 익절/손절가 계산기
-# =====================================================================
+    # =====================================================================
     def get_dynamic_exit_prices(self, df, avg_buy_price):
         """
         고정된 손절이 아니라, 종목의 성격(변동성)에 맞춰 손절가를 고무줄처럼 조절합니다!

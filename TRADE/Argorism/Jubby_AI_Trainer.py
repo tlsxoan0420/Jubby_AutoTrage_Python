@@ -9,6 +9,11 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.ensemble import VotingClassifier # 🚀 여러 AI를 투표시키는 앙상블 라이브러리
 
+# =====================================================================
+# 🌐 [추가됨] 시스템 전역 설정 (국내/해외 시장 모드 판별용)
+# =====================================================================
+from COMMON.Flag import SystemConfig 
+
 # Optuna의 불필요한 로그를 숨겨서 화면을 깔끔하게 만듭니다.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -17,14 +22,26 @@ def train_jubby_brain(log_callback=None):
         if log_callback: log_callback(msg, level)
         else: print(msg)
 
-    send_log("🧠 [주삐 AI 연구소] Optuna 자동 튜닝 및 앙상블(합체) 모델 학습을 시작합니다...", "info")
+    # 현재 모드에 따라 인사말을 다르게 출력합니다.
+    market_name = "🇰🇷 국내 주식" if SystemConfig.MARKET_MODE == "DOMESTIC" else "🌐 미국(해외) 주식"
+    send_log(f"🧠 [주삐 AI 연구소] {market_name} 맞춤형 Optuna 자동 튜닝 및 앙상블 학습을 시작합니다...", "info")
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
     root_dir = os.path.dirname(os.path.dirname(current_dir))
-    data_path = os.path.join(root_dir, "AI_Ultra_Master_Train_Data_V3.csv")
+    
+    # =========================================================================
+    # 📂 [핵심 분기 1] 현재 모드에 따라 '읽어올 훈련 데이터(CSV)' 경로 변경
+    # =========================================================================
+    if SystemConfig.MARKET_MODE == "DOMESTIC":
+        data_file = "AI_Ultra_Master_Train_Data_V3.csv"
+    else:
+        # 해외 모드일 때는 Data_Collector가 만든 해외 전용 데이터를 불러옵니다.
+        data_file = "AI_Ultra_Master_Train_Data_Overseas.csv"
+        
+    data_path = os.path.join(root_dir, data_file)
 
     if not os.path.exists(data_path):
-        send_log("🚨 데이터가 없습니다! Data Collector를 먼저 실행해주세요.", "error")
+        send_log(f"🚨 데이터가 없습니다! ({data_file}) Data Collector를 먼저 실행해주세요.", "error")
         return
 
     # 1. 데이터 로드
@@ -66,7 +83,7 @@ def train_jubby_brain(log_callback=None):
         preds = model.predict(X_test)
         return accuracy_score(y_test, preds)
 
-    # 20번의 모의고사를 치르며 최고 점수 찾기 (더 정밀하게 하려면 n_trials를 50, 100으로 올리세요!)
+    # 20번의 모의고사를 치르며 최고 점수 찾기
     xgb_study = optuna.create_study(direction='maximize')
     xgb_study.optimize(xgb_objective, n_trials=20) 
     best_xgb_params = xgb_study.best_params
@@ -108,13 +125,11 @@ def train_jubby_brain(log_callback=None):
     # =========================================================================
     # 👑 [Phase 3] 최강 앙상블 (투표 시스템) 결성 및 최종 학습
     # =========================================================================
-    send_log("🤝 [3/3] 튜닝된 XGBoost와 LightGBM을 하나로 합체(앙상블)하여 최종 학습합니다!", "warning")
+    send_log(f"🤝 [3/3] 튜닝된 {market_name} 특화 XGBoost와 LightGBM을 하나로 합체(앙상블)합니다!", "warning")
 
-    # 가장 똑똑해진 2명의 AI를 소환합니다.
     xgb_best_model = xgb.XGBClassifier(**best_xgb_params)
     lgb_best_model = lgb.LGBMClassifier(**best_lgb_params)
 
-    # 두 AI가 각자 확률을 계산한 뒤, 부드럽게 평균을 내서(soft voting) 최종 결정!
     ensemble_model = VotingClassifier(
         estimators=[('xgb', xgb_best_model), ('lgb', lgb_best_model)],
         voting='soft'
@@ -122,18 +137,23 @@ def train_jubby_brain(log_callback=None):
 
     ensemble_model.fit(X_train, y_train)
 
-    # 최종 모의고사 채점
     final_preds = ensemble_model.predict(X_test)
     final_accuracy = accuracy_score(y_test, final_preds)
     send_log(f"🏆 [합체 완료] 최종 앙상블 주삐 AI 정답률: {final_accuracy * 100:.2f}%", "success")
 
     # =========================================================================
-    # 💾 저장 및 마무리
+    # 💾 [핵심 분기 2] 저장할 '뇌(모델 파일)' 이름 분기 처리
     # =========================================================================
-    save_path = os.path.join(root_dir, "jubby_brain.pkl")
+    if SystemConfig.MARKET_MODE == "DOMESTIC":
+        model_name = "jubby_brain.pkl"
+    else:
+        # 해외 모드일 때는 해외 전용 이름으로 뇌를 저장합니다.
+        model_name = "jubby_brain_overseas.pkl"
+        
+    save_path = os.path.join(root_dir, model_name)
     joblib.dump(ensemble_model, save_path)
     
-    send_log(f"💾 [저장 완료] 시장 지수까지 꿰뚫어보는 완벽한 뇌가 이식되었습니다!", "buy")
+    send_log(f"💾 [저장 완료] {market_name} 맞춤형 완벽한 뇌가 이식되었습니다!", "buy")
     send_log(f"📍 뇌 저장 위치: {save_path}", "info")
 
 if __name__ == "__main__":
