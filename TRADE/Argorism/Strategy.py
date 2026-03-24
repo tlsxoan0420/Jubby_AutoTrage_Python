@@ -101,23 +101,25 @@ class JubbyStrategy:
 
     # =====================================================================
     # 🛡️ 3. [동적 방어막] ATR 기반 유동적 익절/손절가 계산기
-    # =====================================================================
+# =====================================================================
     def get_dynamic_exit_prices(self, df, avg_buy_price):
         """
-        고정된 -2% 손절이 아니라, 종목의 성격(변동성)에 맞춰 손절가를 고무줄처럼 조절합니다!
+        고정된 손절이 아니라, 종목의 성격(변동성)에 맞춰 손절가를 고무줄처럼 조절합니다!
         """
         if len(df) == 0 or avg_buy_price <= 0:
-            return avg_buy_price * 1.02, avg_buy_price * 0.98 # 계산 불가 시 기본 2% 적용
+            # 🚨 [수정 1] ATR 계산이 안 될 때 쓰는 기본값도 넓혔습니다! (목표 +5%, 손절 -3%)
+            return avg_buy_price * 1.05, avg_buy_price * 0.97 
 
         current = df.iloc[-1]
         atr = current['ATR']
 
         if pd.isna(atr) or atr == 0:
-            return avg_buy_price * 1.02, avg_buy_price * 0.98
+            return avg_buy_price * 1.05, avg_buy_price * 0.97
         
-        # 💡 [핵심] 익절은 변동성의 2.5배 높게, 손절은 변동성의 1.5배 짧게! (비율은 수정 가능)
-        target_price = avg_buy_price + (atr * 2.5)
-        stop_price = avg_buy_price - (atr * 1.5)
+        # 💡 [수정 2] 곱해주는 배수를 팍! 늘렸습니다. 
+        # 이제 자잘한 흔들기(개미털기)에는 콧방귀도 안 뀌고 묵직하게 버팁니다!
+        target_price = avg_buy_price + (atr * 4.0)  # 기존 2.5 -> 4.0배 (길게 먹기)
+        stop_price = avg_buy_price - (atr * 3.0)    # 기존 1.5 -> 3.0배 (깊게 버티기)
 
         return target_price, stop_price
 
