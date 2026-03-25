@@ -5,9 +5,10 @@ import pandas as pd
 import numpy as np
 
 # =====================================================================
-# 🌐 시스템 전역 설정 (국내/해외 시장 모드 판별용)
+# 🌐 시스템 전역 설정 (국내/해외 시장 모드 판별용) 및 DB 매니저
 # =====================================================================
 from COMMON.Flag import SystemConfig 
+from COMMON.DB_Manager import JubbyDB_Manager # 🔥 [DB 연동] 추가
 
 # =====================================================================
 # 👨‍💼 [1] KIS_API 클래스 (실제 통신 담당)
@@ -19,16 +20,24 @@ class KIS_API:
         self.account_no = str(account_no).strip()
         self.is_mock = is_mock 
         
-        # 한국투자증권 API 도메인
+        # 한국투자증권 API 주소 (모의투자는 VTS, 실전은 일반 주소)
         self.base_url = "https://openapivts.koreainvestment.com:29443" if is_mock else "https://openapi.koreainvestment.com:9443"
         self.access_token = "" 
         self.log = log_callback 
+        
+        # 🔥 [DB 연동] 통신 에러나 성공 기록을 무조건 DB에 남기기 위해 장착
+        self.db = JubbyDB_Manager()
 
     def _log_msg(self, msg, log_type="error"):
+        """ 터미널에 로그를 띄우고, 동시에 C#이 볼 수 있게 DB에도 저장합니다. """
         if self.log: self.log(msg, log_type)
-        else: print(f"[{log_type}] {msg}")
+        else: print(f"[{log_type.upper()}] {msg}")
+        
+        try: self.db.insert_log(log_type.upper(), msg)
+        except: pass
 
     def get_access_token(self):
+        """ API 출입증(토큰)을 발급받습니다. """
         url = f"{self.base_url}/oauth2/tokenP"
         headers = {"content-type": "application/json"}
         body = {"grant_type": "client_credentials", "appkey": self.app_key, "appsecret": self.app_secret}
@@ -47,9 +56,10 @@ class KIS_API:
     # 💰 계좌 주문 가능 금액(잔고) 조회
     # =====================================================================
     def get_account_balance(self):
+        """ 내 주머니에 주식을 살 수 있는 현금이 얼마 있는지 확인합니다. """
         time.sleep(0.1)
+        balance = 0.0 # 초기값
         
-        # 🇰🇷 [분기 1] 국내 주식 모드일 때
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
             tr_id = "VTTC8908R" if self.is_mock else "TTTC8908R"
@@ -58,25 +68,17 @@ class KIS_API:
                 "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "N", "OVRS_ICLD_YN": "N"
             }
             
-        # 🌐 [분기 2] 해외 주식 모드일 때
         elif SystemConfig.MARKET_MODE == "OVERSEAS":
             url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-present-balance"
             tr_id = "VTTS3012R" if self.is_mock else "JTTT3012R"
-            
-            # 🔥 [핵심 수정] 해외 잔고조회 필수 파라미터(OVRS_EXCG_CD 등) 완벽 세팅
             params = {
-                "CANO": self.account_no[:8], 
-                "ACNT_PRDT_CD": "01", 
-                "OVRS_EXCG_CD": "NASD", # 나스닥 (전체는 NASD로 통일해도 조회됨)
-                "TR_CRCY_CD": "USD",    # 달러
-                "CTX_AREA_FK200": "", 
-                "CTX_AREA_NK200": ""
+                "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "OVRS_EXCG_CD": "NASD", 
+                "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""
             }
 
         headers = {
             "Content-Type": "application/json", "authorization": f"Bearer {self.access_token}",
-            "appKey": self.app_key, "appSecret": self.app_secret,
-            "tr_id": tr_id, "custtype": "P"
+            "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"
         }
         
         try:
@@ -85,15 +87,19 @@ class KIS_API:
             
             if data.get('rt_cd') == '0':
                 if SystemConfig.MARKET_MODE == "DOMESTIC":
-                    return float(data['output']['ord_psbl_cash'])
+                    balance = float(data['output']['ord_psbl_cash'])
                 else:
-                    # 💡 해외는 output2 또는 output3에 주문 가능 금액(달러)이 들어있습니다.
                     out2 = data.get('output2', {})
                     out3 = data.get('output3', {})
-                    
-                    # 외화주문가능금액1(frcr_ord_psbl_amt1) 또는 외화예수금(frcr_dncl_amt_2) 스캔
+                    # 해외의 경우 달러 예수금을 찾습니다.
                     cash = out2.get('frcr_ord_psbl_amt1') or out3.get('frcr_ord_psbl_amt1') or out2.get('frcr_dncl_amt_2') or 0
-                    return float(cash)
+                    balance = float(cash)
+                    
+                # 🔥 [핵심 추가] 알아낸 내 잔고를 C# 화면 상단 '예수금' 칸에 띄워주기 위해 DB에 적어둡니다!
+                try: self.db.set_shared_setting("ACCOUNT", "CASH", str(balance))
+                except: pass
+                
+                return balance
             else:
                 market_str = "국내" if SystemConfig.MARKET_MODE == "DOMESTIC" else "해외"
                 self._log_msg(f"⚠️ {market_str} 잔고 조회 거절: {data.get('msg1')}", "error")
@@ -106,10 +112,10 @@ class KIS_API:
     # 📦 계좌 보유 종목 조회
     # =====================================================================
     def get_account_holdings(self):
+        """ 현재 내 계좌에 물려있거나(?) 들고 있는 주식 목록을 가져옵니다. """
         time.sleep(0.1)
         holdings = {}
         
-        # 🇰🇷 [분기 1] 국내 주식 모드
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
             tr_id = "VTTC8434R" if self.is_mock else "TTTC8434R"
@@ -119,26 +125,17 @@ class KIS_API:
                 "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""
             }
             
-        # 🌐 [분기 2] 해외 주식 모드
         elif SystemConfig.MARKET_MODE == "OVERSEAS":
-            # 🔥 [핵심 수정] 해외 주식 잔고는 inquire-balance가 아니라 inquire-present-balance를 써야 합니다.
             url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-present-balance"
             tr_id = "VTTS3012R" if self.is_mock else "JTTT3012R"
-            
-            # 🔥 [핵심 수정] 잔고 조회와 똑같은 필수 파라미터 세팅
             params = {
-                "CANO": self.account_no[:8], 
-                "ACNT_PRDT_CD": "01",
-                "OVRS_EXCG_CD": "NASD", 
-                "TR_CRCY_CD": "USD", 
-                "CTX_AREA_FK200": "", 
-                "CTX_AREA_NK200": ""
+                "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "OVRS_EXCG_CD": "NASD", 
+                "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""
             }
 
         headers = {
             "Content-Type": "application/json", "authorization": f"Bearer {self.access_token}",
-            "appKey": self.app_key, "appSecret": self.app_secret,
-            "tr_id": tr_id, "custtype": "P"
+            "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"
         }
         
         try:
@@ -151,8 +148,8 @@ class KIS_API:
                     pdno_key = 'pdno' if SystemConfig.MARKET_MODE == "DOMESTIC" else 'ovrs_pdno'
                     price_key = 'pchs_avg_pric'
                     
-                    if qty_key in item and int(item.get(qty_key, 0)) > 0:
-                        holdings[item[pdno_key]] = {'price': float(item[price_key]), 'qty': int(item[qty_key])}
+                    if qty_key in item and int(float(item.get(qty_key, 0))) > 0:
+                        holdings[item[pdno_key]] = {'price': float(item[price_key]), 'qty': int(float(item[qty_key]))}
             else:
                 market_str = "국내" if SystemConfig.MARKET_MODE == "DOMESTIC" else "해외"
                 self._log_msg(f"⚠️ {market_str} 보유종목 조회 거절: {data.get('msg1')}", "warning")
@@ -165,26 +162,22 @@ class KIS_API:
     # 🛒 시장가 매수/매도 주문
     # =====================================================================
     def order_stock(self, stock_code, qty, is_buy=True):
+        """ 한국투자증권에 실제로 '이거 사줘!', '이거 팔아줘!' 라고 명령을 보냅니다. """
         time.sleep(0.2)
         
-        # 🇰🇷 [분기 1] 국내 주식 주문
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
             tr_id = ("VTTC0802U" if is_buy else "VTTC0801U") if self.is_mock else ("TTTC0802U" if is_buy else "TTTC0801U")
-            
             payload = {
                 "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01",
-                "PDNO": str(stock_code), "ORD_DVSN": "01", # 01: 시장가
+                "PDNO": str(stock_code), "ORD_DVSN": "01", 
                 "ORD_QTY": str(int(qty)), "ORD_UNPR": "0",
                 "CTAC_TLNO": "", "PRSR_DVSN": "", "ALGO_NO": ""
             }
             
-        # 🌐 [분기 2] 해외 주식 주문
         elif SystemConfig.MARKET_MODE == "OVERSEAS":
             url = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
-            # 🔥 해외주식 매매 TR_ID 완벽 교정 (모의/실전 구분)
             tr_id = ("VTTT1002U" if is_buy else "VTTT1006U") if self.is_mock else ("JTTT1002U" if is_buy else "JTTT1006U")
-            
             payload = {
                 "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01",
                 "OVRS_EXCG_CD": "NASD", "PDNO": str(stock_code),
@@ -205,10 +198,8 @@ class KIS_API:
                 self._log_msg(f"✅ [{SystemConfig.MARKET_MODE}] 주문 성공: {data.get('msg1')}", "success")
                 return True
             else:
-                # 🚨 에러가 발생하면 반드시 로그창에 이유를 띄웁니다!
                 self._log_msg(f"⚠️ 주문 거절 (사유: {data.get('msg1')})", "warning")
-                
-                # 모의투자 에러 우회
+                # 모의투자 에러 우회 (계좌 종류 문제 해결)
                 if SystemConfig.MARKET_MODE == "DOMESTIC" and not is_buy and self.is_mock and ("잔고" in data.get('msg1', '')):
                     payload["ACNT_PRDT_CD"] = "02"
                     self._log_msg(f"🔄 [{stock_code}] 상품코드 02로 재시도 중...", "info")
@@ -224,9 +215,9 @@ class KIS_API:
     # 📈 1분봉 차트 데이터 조회 (어떤 이름이 와도 알아서 변환)
     # =====================================================================
     def fetch_minute_data(self, stock_code):
+        """ 실시간 1분봉 데이터를 가져와 예쁜 엑셀 형태(DataFrame)로 만들어줍니다. """
         time.sleep(0.1)
         
-        # 🇰🇷 [분기 1] 국내 분봉 조회
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
             headers = {
@@ -238,18 +229,14 @@ class KIS_API:
                 "FID_INPUT_ISCD": stock_code, "FID_INPUT_HOUR_1": "", "FID_PW_DATA_INCU_YN": "Y"
             }
             
-        # 🌐 [분기 2] 해외(미국) 분봉 조회
         elif SystemConfig.MARKET_MODE == "OVERSEAS":
             url = f"{self.base_url}/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
             headers = {
                 "Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", 
-                "appKey": self.app_key, "appSecret": self.app_secret, 
-                "tr_id": "HHDFS76950200", 
-                "custtype": "P"
+                "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": "HHDFS76950200", "custtype": "P"
             }
             params = {
-                "AUTH": "", "EXCD": "NAS", "SYMB": stock_code, 
-                "NMIN": "1", "PINC": "1", 
+                "AUTH": "", "EXCD": "NAS", "SYMB": stock_code, "NMIN": "1", "PINC": "1", 
                 "NEXT": "", "NREC": "120", "FILL": "", "KEYB": ""
             }
             
@@ -260,20 +247,22 @@ class KIS_API:
             if data['rt_cd'] == '0':
                 df = pd.DataFrame(data['output2'])
                 
+                # API 버전에 따라 달라지는 컬럼 이름을 찰떡같이 맞춰주는 자율 주행 로직
                 cols = df.columns.tolist()
                 c_date = 'stck_bsop_date' if 'stck_bsop_date' in cols else ('xymd' if 'xymd' in cols else cols[0])
                 c_time = 'stck_cntg_hour' if 'stck_cntg_hour' in cols else ('xhms' if 'xhms' in cols else ('xhm' if 'xhm' in cols else cols[1]))
-                c_open = 'open' if 'open' in cols else ('oprc' if 'oprc' in cols else None)
-                c_high = 'high' if 'high' in cols else ('hgpr' if 'hgpr' in cols else None)
-                c_low = 'low' if 'low' in cols else ('lwpr' if 'lwpr' in cols else None)
-                c_close = 'last' if 'last' in cols else ('prpr' if 'prpr' in cols else ('close' if 'close' in cols else None))
+                c_open = 'stck_oprc' if 'stck_oprc' in cols else ('open' if 'open' in cols else ('oprc' if 'oprc' in cols else None))
+                c_high = 'stck_hgpr' if 'stck_hgpr' in cols else ('high' if 'high' in cols else ('hgpr' if 'hgpr' in cols else None))
+                c_low = 'stck_lwpr' if 'stck_lwpr' in cols else ('low' if 'low' in cols else ('lwpr' if 'lwpr' in cols else None))
+                c_close = 'stck_prpr' if 'stck_prpr' in cols else ('last' if 'last' in cols else ('prpr' if 'prpr' in cols else ('close' if 'close' in cols else None)))
                 c_vol = 'evol' if 'evol' in cols else ('vold' if 'vold' in cols else ('cntg_vol' if 'cntg_vol' in cols else ('vol' if 'vol' in cols else None)))
                 
                 df = df[[c_date, c_time, c_open, c_high, c_low, c_close, c_vol]]
                 df.columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
                 
                 return df.apply(pd.to_numeric).iloc[::-1].reset_index(drop=True) 
-        except:
+        except Exception as e:
+            self._log_msg(f"🚨 실시간 차트 조회 중 에러: {e}", "error")
             pass
             
         return None
@@ -297,7 +286,7 @@ class KIS_Manager:
         
     def _log(self, msg, log_type="error"):
         if self.ui: self.ui.add_log(msg, log_type)
-        else: print(f"[{log_type}] {msg}")
+        else: print(f"[{log_type.upper()}] {msg}")
 
     def buy_market_price(self, stock_code, qty):
         mode_icon = "🇰🇷" if SystemConfig.MARKET_MODE == "DOMESTIC" else "🌐"
@@ -306,7 +295,6 @@ class KIS_Manager:
 
     def check_my_balance(self): return self.api.get_account_balance()
     def buy(self, code, qty): return self.api.order_stock(code, qty, is_buy=True)
-    
     def sell(self, code, qty): 
         mode_icon = "🇰🇷" if SystemConfig.MARKET_MODE == "DOMESTIC" else "🌐"
         self._log(f"📉 {mode_icon} [{code}] 매도 전송 중...", "send")

@@ -3,8 +3,9 @@ import numpy as np
 import joblib
 import os
 
-# 🌐 [핵심 추가] 시장 모드(DOMESTIC/OVERSEAS)를 확인하기 위해 가져옵니다.
+# 🌐 시장 모드(DOMESTIC/OVERSEAS) 및 DB 매니저 가져오기
 from COMMON.Flag import SystemConfig
+from COMMON.DB_Manager import JubbyDB_Manager # 🔥 [DB 연동] 추가
 
 class JubbyStrategy:
     """
@@ -15,7 +16,10 @@ class JubbyStrategy:
         self.log_callback = log_callback
         self.market_return_1m = 0.0 
         
-        # 🧠 1. 프로그램이 켜질 때 AI 뇌를 자동으로 불러옵니다!
+        # 🔥 [DB 연동] DB 객체 생성
+        self.db = JubbyDB_Manager()
+        
+        # 🧠 프로그램이 켜질 때 AI 뇌를 자동으로 불러옵니다!
         self.ai_model = None
         self.load_ai_brain()
 
@@ -23,6 +27,7 @@ class JubbyStrategy:
     # 🧠 [핵심 수정] 모드에 따라 국내용/해외용 AI 뇌(PKL)를 바꿔 끼우는 함수
     # =========================================================================
     def load_ai_brain(self):
+        """ 미국장인지 한국장인지 파악해서 알맞은 뇌(Model)를 머리에 끼웁니다. """
         try:
             root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             
@@ -55,6 +60,7 @@ class JubbyStrategy:
     # 📊 1. [퀀트급 보조지표 15개] 실시간 계산 
     # =====================================================================
     def calculate_indicators(self, df):
+        """ 가져온 차트 데이터에 보조지표 선들을 쭉쭉 긋는 작업입니다. """
         if len(df) < 26: 
             return df
             
@@ -106,6 +112,7 @@ class JubbyStrategy:
     # 🤖 2. [AI 입력용 데이터 변환기]
     # =====================================================================
     def get_ai_features(self, df):
+        """ 15개의 지표만 쏙 뽑아서 AI에게 먹여줄 모양으로 압축합니다. """
         if len(df) == 0: return None
         features = [
             'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
@@ -119,11 +126,8 @@ class JubbyStrategy:
     # 🛡️ 3. [동적 방어막] ATR 기반 유동적 익절/손절가 계산기
     # =====================================================================
     def get_dynamic_exit_prices(self, df, avg_buy_price):
-        """
-        고정된 손절이 아니라, 종목의 성격(변동성)에 맞춰 손절가를 고무줄처럼 조절합니다!
-        """
+        """ 종목의 변동성(ATR)과 사용자가 지정한 배수를 결합해 완벽한 탈출선을 긋습니다. """
         if len(df) == 0 or avg_buy_price <= 0:
-            # 🚨 [수정 1] ATR 계산이 안 될 때 쓰는 기본값도 넓혔습니다! (목표 +5%, 손절 -3%)
             return avg_buy_price * 1.05, avg_buy_price * 0.97 
 
         current = df.iloc[-1]
@@ -132,10 +136,15 @@ class JubbyStrategy:
         if pd.isna(atr) or atr == 0:
             return avg_buy_price * 1.05, avg_buy_price * 0.97
         
-        # 💡 [수정 2] 곱해주는 배수를 팍! 늘렸습니다. 
-        # 이제 자잘한 흔들기(개미털기)에는 콧방귀도 안 뀌고 묵직하게 버팁니다!
-        target_price = avg_buy_price + (atr * 4.0)  # 기존 2.5 -> 4.0배 (길게 먹기)
-        stop_price = avg_buy_price - (atr * 3.0)    # 기존 1.5 -> 3.0배 (깊게 버티기)
+        # 🔥 [핵심 연동] C# UI에서 사용자가 설정한 배수(Multiplier)를 실시간으로 가져옵니다!
+        try:
+            atr_tp = float(self.db.get_shared_setting("TRADE", "ATR_TP_MULT", "4.0"))
+            atr_sl = float(self.db.get_shared_setting("TRADE", "ATR_SL_MULT", "3.0"))
+        except:
+            atr_tp, atr_sl = 4.0, 3.0 # DB를 읽지 못하면 기본 방어막 전개
+        
+        target_price = avg_buy_price + (atr * atr_tp)  
+        stop_price = avg_buy_price - (atr * atr_sl)    
 
         return target_price, stop_price
 
@@ -143,9 +152,14 @@ class JubbyStrategy:
     # 🚀 4. 실전 매수/매도 타점 판독 (AI 예측)
     # =====================================================================
     def check_trade_signal(self, df, code):
+        """ 실시간 데이터를 보고 매수/매도할지 결정하는 가장 중요한 두뇌입니다. """
         if len(df) < 26: return "WAIT"
         
         current = df.iloc[-1]
+        
+        # [버그 수정 1] int로 변환하면 해외(미국) 주식의 소수점이 다 날아가서 계산이 망가집니다! float 유지!
+        curr_price = float(current['close']) 
+        ai_prob = 0.0 # [치명적 버그 수정] 에러가 나지 않도록 확률 초기값을 0으로 잡아둡니다.
         
         # -------------------------------------------------------------
         # 💰 [매수 조건] : AI 뇌가 있을 경우 AI의 판단을 100% 신뢰합니다.
@@ -156,9 +170,21 @@ class JubbyStrategy:
                 # 앙상블 모델을 통해 주가가 상승할 확률(%)을 계산합니다.
                 ai_prob = self.ai_model.predict_proba(features)[0][1]
                 
-                # 💡 확률이 70% 이상일 때만 매수 버튼을 누릅니다! (기준 빡빡하게)
-                if ai_prob >= 0.70:
-                    self.send_log(f"🤖 [AI 시그널] {code} 폭등 징후 포착! (상승 확률: {ai_prob*100:.1f}%) -> 강력 매수!", "buy")
+                # 🔥 [핵심 연동] 사용자가 설정한 'AI 확신도 기준점'을 DB에서 읽어옵니다. (없으면 70% 기본값)
+                try: 
+                    ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
+                except: 
+                    ai_threshold = 0.70
+                
+                # 💡 DB에서 가져온 기준 확률 이상일 때만 매수 버튼을 누릅니다!
+                if ai_prob >= ai_threshold:
+                    self.send_log(f"🤖 [AI 시그널] {code} 떡상 징후 포착! (상승 확률: {ai_prob*100:.1f}% / 기준: {ai_threshold*100:.0f}%) -> 강력 매수!", "buy")
+                    
+                    # 🔥 [치명적 버그 수정 2] 리턴(return)해버리면 밑에 있는 DB 업데이트 코드를 영원히 실행하지 못합니다!
+                    # DB에 먼저 알리고 나서 리턴해야 합니다.
+                    try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "AI 강력 매수 신호 발생!")
+                    except: pass
+                    
                     return "BUY"
         else:
             # AI 뇌가 없을 경우 과거 아날로그 방식으로 동작
@@ -166,9 +192,15 @@ class JubbyStrategy:
             if current['RSI'] > 30 and prev['RSI'] <= 30 and current['Vol_Energy'] >= 1.5:
                 return "BUY"
 
+        # 🔥 C# 메인 감시판 업데이트용 데이터 전송
+        # (ai_prob가 0으로 세팅되어 있으므로 NameError 없이 무사히 통과합니다!)
+        try:
+            self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "AI 뇌 풀가동 분석 중...")
+        except:
+            pass
+
         # -------------------------------------------------------------
         # 💸 [매도 조건] : 시장이 붕괴되거나 차트가 망가지면 던집니다.
-        # (기본적인 1차 탈출이며, 찐 매도는 FormMain의 ATR 손절 로직이 처리합니다)
         # -------------------------------------------------------------
         is_rsi_overbought = current['RSI'] >= 75
         body_size = abs(current['open'] - current['close'])
