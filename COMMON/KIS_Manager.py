@@ -131,7 +131,7 @@ class KIS_API:
             
         return 0.0
 
-    # =====================================================================
+   # =====================================================================
     # 📦 계좌 보유 종목 조회
     # =====================================================================
     def get_account_holdings(self):
@@ -155,6 +155,15 @@ class KIS_API:
                 "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "OVRS_EXCG_CD": "NASD", 
                 "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""
             }
+            
+        # 🔥 [치명적 버그 수정] 해외선물 보유종목 조회 로직 추가!
+        elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+            if self.is_mock: return {} # 모의투자는 미지원
+            url = f"{self.base_url}/uapi/overseas-futureoption/v1/trading/inquire-balance"
+            tr_id = "JTFF3012R"
+            params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": "04"}
+        else:
+            return {}
 
         headers = {
             "Content-Type": "application/json", "authorization": f"Bearer {self.access_token}",
@@ -174,7 +183,7 @@ class KIS_API:
                     if qty_key in item and int(float(item.get(qty_key, 0))) > 0:
                         holdings[item[pdno_key]] = {'price': float(item[price_key]), 'qty': int(float(item[qty_key]))}
             else:
-                market_str = "국내" if SystemConfig.MARKET_MODE == "DOMESTIC" else "해외"
+                market_str = "국내" if SystemConfig.MARKET_MODE == "DOMESTIC" else ("해외" if SystemConfig.MARKET_MODE == "OVERSEAS" else "해외선물")
                 self._log_msg(f"⚠️ {market_str} 보유종목 조회 거절: {data.get('msg1')}", "warning")
         except Exception as e: 
             self._log_msg(f"🚨 보유종목 조회 중 통신 오류: {e}", "error")
@@ -208,6 +217,21 @@ class KIS_API:
                 "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": "00" 
             }
 
+        # 🔥 [치명적 버그 수정] 해외선물 매수/매도 주문 로직 추가!
+        elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+            if self.is_mock:
+                self._log_msg("⚠️ 모의투자는 해외선물 주문 API를 지원하지 않습니다.", "warning")
+                return False
+            url = f"{self.base_url}/uapi/overseas-futureoption/v1/trading/order"
+            tr_id = "JTFF1002U" if is_buy else "JTFF1006U" # 선물 실전 매수/매도 TR_ID
+            payload = {
+                "CANO": self.account_no[:8], "ACNT_PRDT_CD": "04",
+                "PDNO": str(stock_code), "ORD_QTY": str(int(qty)),
+                "ORD_DVSN": "01", "ORD_UNPR": "0" # 01: 시장가
+            }
+        else:
+            return False
+
         headers = {
             "Content-Type": "application/json; charset=utf-8", "authorization": f"Bearer {self.access_token}",
             "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"
@@ -222,73 +246,101 @@ class KIS_API:
                 return True
             else:
                 self._log_msg(f"⚠️ 주문 거절 (사유: {data.get('msg1')})", "warning")
-                # 모의투자 에러 우회 (계좌 종류 문제 해결)
                 if SystemConfig.MARKET_MODE == "DOMESTIC" and not is_buy and self.is_mock and ("잔고" in data.get('msg1', '')):
                     payload["ACNT_PRDT_CD"] = "02"
                     self._log_msg(f"🔄 [{stock_code}] 상품코드 02로 재시도 중...", "info")
                     res = requests.post(url, headers=headers, data=json.dumps(payload))
                     if res.json().get('rt_cd') == '0': return True
-                    
                 return False
         except Exception as e:
             self._log_msg(f"🚨 주문 통신 오류: {e}")
             return False
-
-    # =====================================================================
-    # 📈 1분봉 차트 데이터 조회 (어떤 이름이 와도 알아서 변환)
+   # =====================================================================
+    # 📈 최근 1분봉 데이터 120개 조회 (AI 분석용)
     # =====================================================================
     def fetch_minute_data(self, stock_code):
-        """ 실시간 1분봉 데이터를 가져와 예쁜 엑셀 형태(DataFrame)로 만들어줍니다. """
-        time.sleep(0.1)
+        """ 종목 코드를 넣으면, 최근 120분 동안의 1분봉 차트 데이터를 가져옵니다. """
+        
+        # 🚀 [플랜 B 발동] 해외선물은 한투에서 분봉을 안 주므로 야후(yfinance)로 직행!
+        if SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+            try:
+                import yfinance as yf
+                yf_ticker = stock_code
+                if "NQ" in stock_code: yf_ticker = "NQ=F"
+                elif "ES" in stock_code: yf_ticker = "ES=F"
+                elif "YM" in stock_code: yf_ticker = "YM=F"
+                elif "GC" in stock_code: yf_ticker = "GC=F"
+                elif "CL" in stock_code: yf_ticker = "CL=F"
+
+                df_yf = yf.download(yf_ticker, period="1d", interval="1m", progress=False)
+                if df_yf.empty: return None
+                
+                if isinstance(df_yf.columns, pd.MultiIndex):
+                    df_yf.columns = df_yf.columns.get_level_values(0)
+                
+                df_yf = df_yf.reset_index()
+                df_yf.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+                
+                df_res = df_yf[['open', 'high', 'low', 'close', 'volume']].copy()
+                df_res[['open', 'high', 'low', 'close', 'volume']] = df_res[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+                
+                return df_res.dropna().tail(120).reset_index(drop=True)
+            except Exception as e:
+                self._log_msg(f"🚨 야후 파이낸스 실시간 분봉 수집 에러: {e}", "error")
+                return None
+
+        # 🇰🇷 / 🌐 주식은 정상적으로 한국투자증권 API 사용
+        target_time = "153000" if SystemConfig.MARKET_MODE == "DOMESTIC" else "160000"
         
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
-            headers = {
-                "Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", 
-                "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": "FHKST03010200", "custtype": "P"
-            }
+            tr_id = "FHKST03010200"
             params = {
                 "FID_ETC_CLS_CODE": "", "FID_COND_MRKT_DIV_CODE": "J", 
-                "FID_INPUT_ISCD": stock_code, "FID_INPUT_HOUR_1": "", "FID_PW_DATA_INCU_YN": "Y"
+                "FID_INPUT_ISCD": stock_code, "FID_INPUT_HOUR_1": target_time, "FID_PW_DATA_INCU_YN": "Y"
             }
-            
-        elif SystemConfig.MARKET_MODE == "OVERSEAS":
+        else: # OVERSEAS
             url = f"{self.base_url}/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
-            headers = {
-                "Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", 
-                "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": "HHDFS76950200", "custtype": "P"
-            }
+            tr_id = "HHDFS76950200"
             params = {
                 "AUTH": "", "EXCD": "NAS", "SYMB": stock_code, "NMIN": "1", "PINC": "1", 
                 "NEXT": "", "NREC": "120", "FILL": "", "KEYB": ""
             }
-            
+
+        headers = {
+            "content-type": "application/json", "authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": tr_id, "custtype": "P"
+        }
+
         try:
             res = requests.get(url, headers=headers, params=params)
             data = res.json()
-            
-            if data['rt_cd'] == '0':
-                df = pd.DataFrame(data['output2'])
+            if data.get('rt_cd') == '0':
+                output = data.get('output2', [])
+                if not output: return None
                 
-                # API 버전에 따라 달라지는 컬럼 이름을 찰떡같이 맞춰주는 자율 주행 로직
+                df = pd.DataFrame(output)
                 cols = df.columns.tolist()
-                c_date = 'stck_bsop_date' if 'stck_bsop_date' in cols else ('xymd' if 'xymd' in cols else cols[0])
-                c_time = 'stck_cntg_hour' if 'stck_cntg_hour' in cols else ('xhms' if 'xhms' in cols else ('xhm' if 'xhm' in cols else cols[1]))
-                c_open = 'stck_oprc' if 'stck_oprc' in cols else ('open' if 'open' in cols else ('oprc' if 'oprc' in cols else None))
-                c_high = 'stck_hgpr' if 'stck_hgpr' in cols else ('high' if 'high' in cols else ('hgpr' if 'hgpr' in cols else None))
-                c_low = 'stck_lwpr' if 'stck_lwpr' in cols else ('low' if 'low' in cols else ('lwpr' if 'lwpr' in cols else None))
-                c_close = 'stck_prpr' if 'stck_prpr' in cols else ('last' if 'last' in cols else ('prpr' if 'prpr' in cols else ('close' if 'close' in cols else None)))
-                c_vol = 'evol' if 'evol' in cols else ('vold' if 'vold' in cols else ('cntg_vol' if 'cntg_vol' in cols else ('vol' if 'vol' in cols else None)))
                 
-                df = df[[c_date, c_time, c_open, c_high, c_low, c_close, c_vol]]
-                df.columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
+                c_open = next((c for c in ['stck_oprc', 'open', 'oprc'] if c in cols), None)
+                c_high = next((c for c in ['stck_hgpr', 'high', 'hgpr'] if c in cols), None)
+                c_low = next((c for c in ['stck_lwpr', 'low', 'lwpr'] if c in cols), None)
+                c_close = next((c for c in ['stck_prpr', 'last', 'close', 'prpr'] if c in cols), None)
+                c_vol = next((c for c in ['evol', 'cntg_vol', 'vold', 'vol', 'acml_vol'] if c in cols), None)
                 
-                return df.apply(pd.to_numeric).iloc[::-1].reset_index(drop=True) 
-        except Exception as e:
-            self._log_msg(f"🚨 실시간 차트 조회 중 에러: {e}", "error")
-            pass
-            
-        return None
+                if None in [c_open, c_high, c_low, c_close, c_vol]: return None
+
+                df = df[[c_open, c_high, c_low, c_close, c_vol]]
+                df.columns = ['open', 'high', 'low', 'close', 'volume']
+                df = df.apply(pd.to_numeric)
+                
+                # 시간 역순(최신이 맨 앞)으로 오는 데이터를 과거->최신 순으로 뒤집기
+                df = df.iloc[::-1].reset_index(drop=True)
+                return df
+            else:
+                return None
+        except Exception:
+            return None
 
 # =====================================================================
 # 👔 [2] KIS_Manager 클래스

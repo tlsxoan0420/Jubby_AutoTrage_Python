@@ -72,53 +72,55 @@ class JubbyStrategy:
     # 📊 1. [퀀트급 보조지표 15개] 실시간 계산 
     # =====================================================================
     def calculate_indicators(self, df):
-        """ 가져온 차트 데이터에 보조지표 선들을 쭉쭉 긋는 작업입니다. """
-        if len(df) < 26: 
-            return df
+        """ 실시간 1분봉 데이터를 받아 15개의 고급 AI 보조지표를 계산합니다. """
+        if df is None or len(df) < 30: return df
+        
+        try:
+            df['return'] = df['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) * 100 
+            df['vol_change'] = df['volume'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) 
+
+            delta = df['close'].diff()
+            up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
+            rs = up.ewm(com=13).mean() / (down.ewm(com=13).mean() + 1e-9)
+            df['RSI'] = 100 - (100 / (1 + rs))
             
-        df['return'] = df['close'].pct_change() * 100     
-        df['vol_change'] = df['volume'].pct_change() 
-        
-        df['MA5'] = df['close'].rolling(window=5).mean()   
-        df['MA20'] = df['close'].rolling(window=20).mean() 
-        
-        delta = df['close'].diff()
-        up = delta.clip(lower=0)
-        down = -1 * delta.clip(upper=0)
-        rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
-        df['RSI'] = 100 - (100 / (1 + rs))
+            df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+            df['Signal_Line'] = df['MACD'].ewm(span=9).mean() # 매도 시그널용
+            
+            # 🔥 [복원] 누락되었던 5가지 고급 지표 실시간 계산 로직 추가!
+            df['MA5'] = df['close'].rolling(5).mean()
+            df['MA20'] = df['close'].rolling(20).mean()
+            
+            df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
+            df['BB_Lower'] = df['MA20'] - (df['close'].rolling(20).std() * 2)
+            df['BB_Width'] = ((df['BB_Upper'] - df['BB_Lower']) / df['MA20']) * 100
+            
+            df['Disparity_5'] = (df['close'] / df['MA5']) * 100
+            df['Disparity_20'] = (df['close'] / df['MA20']) * 100
 
-        df['MACD'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-        df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+            df['Vol_Energy'] = df['volume'] / (df['volume'].rolling(20).mean() + 1e-9)
 
-        df['BB_Lower'] = df['MA20'] - (df['close'].rolling(20).std() * 2)
-        df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
-        df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['MA20']
+            direction = np.where(df['close'] > df['close'].shift(1), 1, -1)
+            direction = np.where(df['close'] == df['close'].shift(1), 0, direction)
+            obv = (df['volume'] * direction).cumsum()
+            df['OBV_Trend'] = obv.pct_change().replace([np.inf, -np.inf], 0).fillna(0)
 
-        df['Disparity_5'] = (df['close'] / df['MA5']) * 100
-        df['Disparity_20'] = (df['close'] / df['MA20']) * 100
+            tr1 = df['high'] - df['low']
+            tr2 = (df['high'] - df['close'].shift(1)).abs()
+            tr3 = (df['low'] - df['close'].shift(1)).abs()
+            df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-        df['Vol_MA5'] = df['volume'].rolling(5).mean()
-        df['Vol_Energy'] = np.where(df['Vol_MA5'] > 0, df['volume'] / df['Vol_MA5'], 1)
+            df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1)
+            df['Low_Tail'] = df[['open', 'close']].min(axis=1) - df['low']
+            df['Buying_Pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-9)
+            
+            # 실시간 시장 대장주(지수)의 1분 등락률을 꽂아줍니다 (FormMain에서 주입됨)
+            df['Market_Return_1m'] = getattr(self, 'market_return_1m', 0.0)
 
-        df['OBV'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
-        df['OBV_Trend'] = df['OBV'].pct_change()
-
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift())
-        low_close = np.abs(df['low'] - df['close'].shift())
-        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['ATR'] = true_range.rolling(14).mean()
-
-        df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1)
-        df['Low_Tail'] = df[['open', 'close']].min(axis=1) - df['low']
-
-        df['Buying_Pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-9)
-        df['Market_Return_1m'] = self.market_return_1m
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.fillna(0, inplace=True)
-        return df
+            return df.fillna(0)
+        except Exception as e:
+            if self.log_callback: self.log_callback(f"🚨 지표 계산 중 오류: {e}", "error")
+            return df
 
     # =====================================================================
     # 🤖 2. [AI 입력용 데이터 변환기]

@@ -50,6 +50,51 @@ def collect_worker(code, app_key, app_secret, account_no, is_mock, access_token,
 # 📈 [데이터 수집 로직] API 호출부 (국내 / 해외 / 🚀해외선물 통합)
 # =====================================================================
 def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
+    
+    # 🚀 [플랜 B 발동!] 해외선물이면 한투 API를 버리고 야후 파이낸스에서 직수입합니다!
+    if SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+        try:
+            import yfinance as yf
+        except ImportError:
+            if log_func: log_func("🚨 yfinance 라이브러리가 설치되지 않았습니다. 터미널에 'pip install yfinance'를 입력하세요.", "ERROR")
+            return None
+
+        yf_ticker = stock_code
+        if "NQ" in stock_code: yf_ticker = "NQ=F"
+        elif "ES" in stock_code: yf_ticker = "ES=F"
+        elif "YM" in stock_code: yf_ticker = "YM=F"
+        elif "GC" in stock_code: yf_ticker = "GC=F"
+        elif "CL" in stock_code: yf_ticker = "CL=F"
+
+        if log_func: log_func(f"🌐 [야후 파이낸스] '{yf_ticker}' 과거 1분봉 무료 싹쓸이 중...", "INFO")
+        try:
+            df_yf = yf.download(yf_ticker, period="7d", interval="1m", progress=False)
+            if df_yf.empty:
+                if log_func: log_func(f"🚨 {yf_ticker} 야후 데이터를 찾을 수 없습니다.", "ERROR")
+                return None
+            
+            if isinstance(df_yf.columns, pd.MultiIndex):
+                df_yf.columns = df_yf.columns.get_level_values(0)
+            
+            df_yf = df_yf.reset_index()
+            dt_col = 'Datetime' if 'Datetime' in df_yf.columns else 'Date'
+            
+            df_yf['date'] = df_yf[dt_col].dt.strftime('%Y%m%d')
+            df_yf['time'] = df_yf[dt_col].dt.strftime('%H%M%S')
+            df_yf.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+            
+            df_res = df_yf[['date', 'time', 'open', 'high', 'low', 'close', 'volume']].copy()
+            df_res['code'] = stock_code
+            df_res[['open', 'high', 'low', 'close', 'volume']] = df_res[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+            
+            time.sleep(0.5) 
+            return df_res.dropna().reset_index(drop=True)
+            
+        except Exception as e:
+            if log_func: log_func(f"🚨 야후 파이낸스 수집 에러: {e}", "ERROR")
+            return None
+
+    # 🇰🇷/🌐 주식의 경우 원래대로 한투 API를 이용해 정상 수집합니다.
     all_chunks = [] 
     target_time = "153000" if SystemConfig.MARKET_MODE == "DOMESTIC" else "160000"
     next_key = ""
@@ -71,15 +116,6 @@ def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
             params = {
                 "AUTH": "", "EXCD": "NAS", "SYMB": stock_code, "NMIN": "1", "PINC": "1", 
                 "NEXT": next_key, "NREC": "120", "FILL": "", "KEYB": next_key
-            }
-            
-        elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
-            # ⚠️ 해외선물 API 엔드포인트 및 TR_ID (임시 적용값)
-            url = f"{api.base_url}/uapi/overseas-futureoption/v1/quotations/inquire-time-itemchartprice"
-            tr_id = "HHDFS76950200" 
-            params = {
-                "SYMB": stock_code, "NMIN": "1", "NREC": "120", 
-                "NEXT": next_key, "KEYB": next_key
             }
 
         headers = {
@@ -111,7 +147,7 @@ def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
             df_chunk.columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
             all_chunks.append(df_chunk)
 
-            if SystemConfig.MARKET_MODE in ["OVERSEAS", "OVERSEAS_FUTURES"]:
+            if SystemConfig.MARKET_MODE == "OVERSEAS":
                 next_key = res.json().get('output1', {}).get('next', "")
                 if not next_key: break
             else:
@@ -120,7 +156,6 @@ def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
             
             time.sleep(0.35) 
         else:
-            # 🔥 [마법의 코드] HTML 태그의 '<', '>' 기호를 텍스트로 치환하여 UI가 웹페이지로 오해하지 못하게 만듭니다!
             raw_error = str(res.text).replace('<', '&lt;').replace('>', '&gt;')
             error_msg = f"🚨 [{stock_code}] 한투 API 거절 원문 (상태코드: {res.status_code}): {raw_error}"
             
