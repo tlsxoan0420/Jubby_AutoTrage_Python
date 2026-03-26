@@ -52,7 +52,7 @@ class KIS_API:
             self._log_msg(f"토큰 발급 오류: {e}", "error")
         return None
     
-    # =====================================================================
+# =====================================================================
     # 💰 계좌 주문 가능 금액(잔고) 조회
     # =====================================================================
     def get_account_balance(self):
@@ -76,6 +76,22 @@ class KIS_API:
                 "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""
             }
 
+        elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+            # 🔥 [방어 로직] 모의투자일 경우 한투에서 지원하지 않으므로 통신을 시도하지 않고 바로 0을 반환합니다.
+            if self.is_mock:
+                self._log_msg("⚠️ 해외선물은 모의투자 잔고조회 API를 지원하지 않습니다.", "warning")
+                return 0.0
+                
+            url = f"{self.base_url}/uapi/overseas-futureoption/v1/trading/inquire-present-balance"
+            tr_id = "JTFF2001R" # (실전용 TR_ID 고정)
+            params = {
+                "CANO": self.account_no[:8], 
+                "ACNT_PRDT_CD": "04",
+                "TR_CRCY_CD": "USD"
+            }
+        else:
+            return 0.0 
+
         headers = {
             "Content-Type": "application/json", "authorization": f"Bearer {self.access_token}",
             "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"
@@ -83,30 +99,37 @@ class KIS_API:
         
         try:
             res = requests.get(url, headers=headers, params=params)
-            data = res.json()
             
+            # 🔥 [안전장치] 서버가 JSON이 아닌 HTML 에러 페이지를 주면 걸러냅니다!
+            try:
+                data = res.json()
+            except Exception:
+                raw_err = str(res.text).replace('<', '&lt;').replace('>', '&gt;')
+                self._log_msg(f"🚨 잔고 조회 API 거절 원문(상태코드 {res.status_code}): {raw_err}", "error")
+                return 0.0
+
             if data.get('rt_cd') == '0':
                 if SystemConfig.MARKET_MODE == "DOMESTIC":
-                    balance = float(data['output']['ord_psbl_cash'])
-                else:
+                    balance = float(data.get('output', {}).get('ord_psbl_cash', 0))
+                elif SystemConfig.MARKET_MODE == "OVERSEAS":
                     out2 = data.get('output2', {})
                     out3 = data.get('output3', {})
-                    # 해외의 경우 달러 예수금을 찾습니다.
                     cash = out2.get('frcr_ord_psbl_amt1') or out3.get('frcr_ord_psbl_amt1') or out2.get('frcr_dncl_amt_2') or 0
                     balance = float(cash)
+                elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+                    balance = float(data.get('output', {}).get('ord_psbl_amt', 0))
                     
-                # 🔥 [핵심 추가] 알아낸 내 잔고를 C# 화면 상단 '예수금' 칸에 띄워주기 위해 DB에 적어둡니다!
                 try: self.db.set_shared_setting("ACCOUNT", "CASH", str(balance))
                 except: pass
                 
                 return balance
             else:
-                market_str = "국내" if SystemConfig.MARKET_MODE == "DOMESTIC" else "해외"
+                market_str = "국내" if SystemConfig.MARKET_MODE == "DOMESTIC" else ("해외" if SystemConfig.MARKET_MODE == "OVERSEAS" else "해외선물")
                 self._log_msg(f"⚠️ {market_str} 잔고 조회 거절: {data.get('msg1')}", "error")
         except Exception as e:
             self._log_msg(f"🚨 잔고 조회 중 통신 오류: {e}", "error")
             
-        return 0
+        return 0.0
 
     # =====================================================================
     # 📦 계좌 보유 종목 조회
@@ -272,12 +295,21 @@ class KIS_API:
 # =====================================================================
 class KIS_Manager:
     def __init__(self, ui_main=None):
+        """ 매니저 클래스: 복잡한 API 통신 로직을 감싸서 밖에서는 편하게 함수만 부를 수 있게 해줍니다. """
         self.ui = ui_main 
         
         self.APP_KEY = "PSargEXRJo0zf5vOG1HAAKr7bKX9VKDzBhjy"
         self.APP_SECRET = "3IS6VELZscyON3lhpinnbWf9I6+oCfFR+k5+XyreSvnwgi1IFaOFlN4M35ZL8IvTidXiSWws+qCe8Y015l/w2VN8kVC/BHmncRwLBVZUxICBE6RcVt3JsPp/xlHyjo1meR0XWqU8yqlIUkOcib3HfSamhnpiCKFalhlVeyYcgU3uP/1UWP8="
-        self.ACCOUNT_NO = "50172151" 
-        self.IS_MOCK = True 
+        
+        # 🔥 [수정] 모드에 따라 사용하는 계좌번호를 다르게 셋팅합니다!
+        if SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+            self.ACCOUNT_NO = "60039684" # 🚀 해외선물옵션 전용 계좌
+        else:
+            self.ACCOUNT_NO = "50172151" # 🇰🇷/🌐 주식 전용 계좌
+            
+        self.IS_MOCK = True # 현재 모의투자 상태
+        
+        # 위에서 만든 API 통신 전담 직원을 고용합니다.
         self.api = KIS_API(self.APP_KEY, self.APP_SECRET, self.ACCOUNT_NO, is_mock=self.IS_MOCK, log_callback=self._log)
 
     def start_api(self):

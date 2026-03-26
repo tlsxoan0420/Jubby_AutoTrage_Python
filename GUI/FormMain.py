@@ -37,7 +37,7 @@ class OutputLogger(QtCore.QObject):
     def flush(self): pass
 
 # =====================================================================
-# 📡 1000개 종목의 데이터를 수집하는 일꾼 (백그라운드 스레드)
+# 📡 종목 데이터 수집 및 명단을 DB에 저장하는 일꾼 (백그라운드 스레드)
 # =====================================================================
 class DataCollectorWorker(QThread):
     sig_log = pyqtSignal(str, str)
@@ -59,13 +59,15 @@ class DataCollectorWorker(QThread):
             root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             
             # -------------------------------------------------------------
-            # 📂 [명단 작성] 수집할 종목 1,000개의 명단을 먼저 뽑습니다.
+            # 📂 [명단 추출] 모드에 맞는 종목 명단을 뽑아옵니다.
             # -------------------------------------------------------------
+            stock_list = []
+            name_list = []
+            
             if SystemConfig.MARKET_MODE == "DOMESTIC":
                 self.emit_log("📡 한국 거래소(KRX) 명단을 다운로드합니다...", "info")
-                
                 df_market = fdr.StockListing('KRX')
-                # KRX 전체 조회가 튕길 경우를 대비한 튼튼한 방어 로직 (코스피/코스닥 따로 불러서 합치기)
+                
                 if df_market is None or df_market.empty:
                     df_kospi = fdr.StockListing('KOSPI')
                     df_kosdaq = fdr.StockListing('KOSDAQ')
@@ -75,31 +77,23 @@ class DataCollectorWorker(QThread):
                     df_market['Market'] = df_market['Market'].astype(str).str.strip().str.upper()
                     df_market = df_market[df_market['Market'].str.contains('KOSPI|KOSDAQ', na=False)]
 
-                # 인터넷에서 가져온 글자 데이터(1,500)를 완벽한 숫자(1500)로 변환합니다.
                 for col in ['Close', 'Amount', 'Marcap']:
                     if col in df_market.columns:
                         df_market[col] = pd.to_numeric(df_market[col].astype(str).str.replace(r'[^0-9.]', '', regex=True), errors='coerce').fillna(0)
                 
                 if 'Close' in df_market.columns:
-                    df_market = df_market[df_market['Close'] >= 1000] # 동전주(1000원 미만) 아웃!
+                    df_market = df_market[df_market['Close'] >= 1000] # 동전주 아웃!
 
-                if 'Marcap' in df_market.columns:
-                    top_df = df_market.sort_values('Marcap', ascending=False).head(1000)
-                elif 'Amount' in df_market.columns:
-                    top_df = df_market.sort_values('Amount', ascending=False).head(1000)
-                else:
-                    top_df = df_market.head(1000)
+                if 'Marcap' in df_market.columns: top_df = df_market.sort_values('Marcap', ascending=False).head(1000)
+                elif 'Amount' in df_market.columns: top_df = df_market.sort_values('Amount', ascending=False).head(1000)
+                else: top_df = df_market.head(1000)
 
                 code_col = 'Code' if 'Code' in top_df.columns else ('Symbol' if 'Symbol' in top_df.columns else None)
                 name_col = 'Name' if 'Name' in top_df.columns else top_df.columns[1]
 
-                if code_col is None:
-                    self.emit_log("🚨 종목 코드 컬럼을 찾을 수 없습니다! 라이브러리 충돌 의심.", "error")
-                    stock_list = []
-                else:
-                    stock_list = top_df[code_col].astype(str).str.zfill(6).tolist() # 005930 처럼 6자리 만들어주기
-                    top_df[[code_col, name_col]].rename(columns={code_col: 'Code', name_col: 'Name'}).to_csv(os.path.join(root_dir, "stock_dict.csv"), index=False, encoding="utf-8-sig")
-                    self.emit_log(f"✅ 종목 명단 {len(stock_list)}개 준비 완료!", "success")
+                if code_col is not None:
+                    stock_list = top_df[code_col].astype(str).str.zfill(6).tolist()
+                    name_list = top_df[name_col].tolist()
                 
             elif SystemConfig.MARKET_MODE == "OVERSEAS":
                 self.emit_log("📡 미국 나스닥(NASDAQ) 명단을 추출합니다...", "info")
@@ -107,7 +101,49 @@ class DataCollectorWorker(QThread):
                 top_df = df_market.head(1000)
                 code_col = 'Symbol' if 'Symbol' in top_df.columns else 'Code'
                 stock_list = top_df[code_col].astype(str).tolist()
-                top_df[[code_col, 'Name']].rename(columns={code_col: 'Code'}).to_csv(os.path.join(root_dir, "stock_dict.csv"), index=False, encoding="utf-8-sig")
+                name_list = top_df['Name'].tolist()
+                
+            elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+                self.emit_log("📡 해외선물(Overseas Futures) 대표 명단을 설정합니다...", "info")
+                
+                # 🔥 [수정] NQ -> NQM26 처럼 실제 거래 중인 월물 코드로 변경해야 합니다!
+                # (M: 6월물, U: 9월물, Z: 12월물, H: 3월물 등 HTS를 참고해 현재 월물을 적어주세요)
+                # 아래는 2026년 6월물(M26)을 기준으로 한 예시입니다.
+                futures_list = [
+                    {"Code": "NQM26", "Name": "나스닥 100 미니 (6월물)"}, 
+                    {"Code": "ESM26", "Name": "S&P 500 미니 (6월물)"},
+                    {"Code": "YMM26", "Name": "다우존스 미니 (6월물)"},
+                    {"Code": "GCM26", "Name": "금 (Gold 6월물)"},
+                    {"Code": "CLM26", "Name": "크루드 오일 (WTI 6월물)"}
+                ]
+                
+                top_df = pd.DataFrame(futures_list)
+                stock_list = top_df['Code'].tolist()
+                name_list = top_df['Name'].tolist()
+
+            # -------------------------------------------------------------
+            # 🔥 [핵심 수정 - CSV 완전 퇴출] 추출한 명단을 SQL DB에 저장합니다!
+            # -------------------------------------------------------------
+            if stock_list:
+                db_worker = JubbyDB_Manager()
+                df_db = pd.DataFrame({
+                    'symbol': stock_list,
+                    'symbol_name': name_list,
+                    'market_mode': SystemConfig.MARKET_MODE
+                })
+                
+                try:
+                    # 기존 다른 모드의 데이터는 살리고, 현재 모드의 데이터만 갈아끼우는 스마트한 SQL 병합 로직
+                    old_df = pd.read_sql("SELECT * FROM target_stocks", db_worker.conn)
+                    old_df = old_df[old_df['market_mode'] != SystemConfig.MARKET_MODE]
+                    final_df = pd.concat([old_df, df_db], ignore_index=True)
+                    final_df.to_sql('target_stocks', con=db_worker.conn, if_exists='replace', index=False)
+                except:
+                    df_db.to_sql('target_stocks', con=db_worker.conn, if_exists='replace', index=False)
+                    
+                self.emit_log(f"✅ DB에 {SystemConfig.MARKET_MODE} 타겟 명단 {len(stock_list)}개 저장 완료! (CSV 퇴출)", "success")
+            else:
+                self.emit_log("🚨 종목 코드를 추출하지 못했습니다.", "error")
 
             # -------------------------------------------------------------
             # 🚀 수집기 실행 (이제 Data_Collector.py가 SQL DB에 직접 데이터를 씁니다)
@@ -195,10 +231,12 @@ class AutoTradeWorker(QThread):
         total_invested = 0; total_current_val = 0  
 
         # -----------------------------------------------------------------
-        # 📉 [분기 1] 시장 폭락 감지용 ETF 설정 (KOSPI vs NASDAQ)
+        # 📉 [분기 1] 시장 폭락 감지용 ETF 설정
         # -----------------------------------------------------------------
         market_crash_mode = False
-        market_ticker = "069500" if SystemConfig.MARKET_MODE == "DOMESTIC" else "QQQ"
+        if SystemConfig.MARKET_MODE == "DOMESTIC": market_ticker = "069500" # KODEX 200
+        elif SystemConfig.MARKET_MODE == "OVERSEAS": market_ticker = "QQQ"    # 나스닥 ETF
+        else: market_ticker = "NQ"     # 나스닥 선물
         
         market_etf = self.mw.api_manager.fetch_minute_data(market_ticker)
         if market_etf is not None and len(market_etf) > 1:
@@ -211,7 +249,6 @@ class AutoTradeWorker(QThread):
             etf_open = market_etf.iloc[0]['open']
             etf_drop = ((etf_now - etf_open) / etf_open) * 100
             
-            # [DB 연동] 사용자가 C#에서 설정한 '시장 폭락 차단 기준(%)'을 가져옵니다.
             try: crash_limit = float(self.mw.db.get_shared_setting("TRADE", "CRASH_LIMIT", "-1.5"))
             except: crash_limit = -1.5
             
@@ -276,15 +313,23 @@ class AutoTradeWorker(QThread):
 
                 # ⏰ 마감 시간 설정 (한국장 vs 미국장)
                 is_imminent_close = False; is_safe_profit_close = False
+
                 if SystemConfig.MARKET_MODE == "DOMESTIC":
                     if now.hour >= 15: is_closing_phase = True
                     if now.hour == 15 and 0 <= now.minute < 10: is_safe_profit_close = True
                     if now.hour == 15 and now.minute >= 10: is_imminent_close = True
+                    
                 elif SystemConfig.MARKET_MODE == "OVERSEAS":
                     if now.hour == 4 and now.minute >= 30: is_closing_phase = True
                     if now.hour == 4 and 30 <= now.minute < 45: is_safe_profit_close = True
                     if now.hour == 4 and now.minute >= 45: is_imminent_close = True
                     if now.hour == 5: is_imminent_close = True 
+                    
+                elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+                    if now.hour == 5 and now.minute >= 30: is_closing_phase = True
+                    if now.hour == 5 and 30 <= now.minute < 45: is_safe_profit_close = True
+                    if now.hour == 5 and now.minute >= 45: is_imminent_close = True
+                    if now.hour == 6: is_imminent_close = True 
 
                 # 매도 로직 판별
                 if getattr(self, 'panic_mode', False):
@@ -414,7 +459,7 @@ class AutoTradeWorker(QThread):
             
         elif needed_count > 0 and not getattr(self, 'panic_mode', False):
             total_asset = my_cash + sum([info['price'] * info['qty'] for info in self.mw.my_holdings.values()])
-            candidates = []; scan_targets = random.sample(SCAN_POOL, min(40, len(SCAN_POOL)))
+            candidates = []; scan_targets = random.sample(SCAN_POOL, min(40, len(SCAN_POOL))) if SCAN_POOL else []
 
             for code in scan_targets:
                 if code in self.mw.my_holdings: continue 
@@ -564,7 +609,7 @@ class FormMain(QtWidgets.QMainWindow):
         # 1. DB 매니저 생성 및 청소 (오래된 데이터 정리)
         # -------------------------------------------------------------
         self.db = JubbyDB_Manager()
-        self.db.cleanup_old_data() # 프로그램 켤 때마다 쌓여있는 묵은 쓰레기를 치워줍니다.
+        self.db.cleanup_old_data() 
         
         db_mode = self.db.get_shared_setting("SYSTEM", "MARKET_MODE", "DOMESTIC")
         SystemConfig.MARKET_MODE = db_mode
@@ -580,19 +625,21 @@ class FormMain(QtWidgets.QMainWindow):
         sys.stderr = self.output_logger 
 
         # -------------------------------------------------------------
-        # 3. 종목 이름표 파일 로드
+        # 3. 🔥 [핵심 수정 - CSV 제거] DB에서 타겟 종목 명단 로드!
         # -------------------------------------------------------------
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = os.path.dirname(current_dir)
-        dict_path = os.path.join(root_dir, "stock_dict.csv")
-        
-        if os.path.exists(dict_path):
-            df_dict = pd.read_csv(dict_path)
+        try:
+            query = f"SELECT symbol, symbol_name FROM target_stocks WHERE market_mode = '{SystemConfig.MARKET_MODE}'"
+            df_dict = pd.read_sql(query, self.db.conn)
             if SystemConfig.MARKET_MODE == "DOMESTIC":
-                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['Code'].astype(str).str.zfill(6), df_dict['Name']))
+                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str).str.zfill(6), df_dict['symbol_name']))
             else:
-                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['Code'].astype(str), df_dict['Name']))
-        else: self.DYNAMIC_STOCK_DICT = {"005930": "삼성전자"} 
+                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str), df_dict['symbol_name']))
+                
+            if not self.DYNAMIC_STOCK_DICT: raise ValueError("DB 명단이 비어 있습니다.")
+            self.add_log(f"📖 DB에서 {len(self.DYNAMIC_STOCK_DICT)}개 종목 명단을 무사히 불러왔습니다!", "info")
+        except Exception as e:
+            self.add_log(f"⚠️ DB 명단 로드 실패: {e} -> Data Collector를 한 번 실행해 주세요.", "warning")
+            self.DYNAMIC_STOCK_DICT = {"005930": "삼성전자"} # Fallback
 
         # -------------------------------------------------------------
         # 4. KIS 통신 매니저 & AI 두뇌 생성 (순서 매우 중요!)
@@ -682,7 +729,6 @@ class FormMain(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(dict)
     def append_order_table_slot(self, order_info):
-        """ 매수/매도가 체결되면 영수증을 파이썬 화면에 띄우고 DB에도 기록합니다. """
         if not order_info: return 
         
         try:
@@ -715,7 +761,6 @@ class FormMain(QtWidgets.QMainWindow):
     def btnDataSendClickEvent(self):
         """ 
         [가장 핵심] 1분마다 파이썬이 계산한 결과를 DB에 '덮어쓰기' 합니다.
-        이제 C# 통신 연결 여부와 상관없이 무조건 DB를 업데이트합니다!
         """
         def clean_num(val): 
             v = str(val).replace(",", "").replace("%", "").strip()
@@ -730,9 +775,6 @@ class FormMain(QtWidgets.QMainWindow):
             if sym == "-": return sym
             return sym.zfill(6) if SystemConfig.MARKET_MODE == "DOMESTIC" else sym
 
-        # ---------------------------------------------------------
-        # 1. 시장 감시 표 (Market Table) DB 덮어쓰기
-        # ---------------------------------------------------------
         market_list = []
         if not TradeData.market.df.empty:
             for _, row in TradeData.market.df.iterrows():
@@ -753,12 +795,8 @@ class FormMain(QtWidgets.QMainWindow):
             try: self.db.update_market_table(market_list)
             except Exception as e: print(f"DB Market 에러: {e}")
 
-            # 예전 소켓 통신 (옵션)
             if TcpJsonClient.Isconnected: self.client.send_message("market", market_list)
 
-        # ---------------------------------------------------------
-        # 2. 계좌 정보 표 (Account Table) DB 덮어쓰기
-        # ---------------------------------------------------------
         account_list = []
         if not TradeData.account.df.empty:
             for _, row in TradeData.account.df.iterrows():
@@ -776,7 +814,6 @@ class FormMain(QtWidgets.QMainWindow):
                     "available_cash": float(clean_num(row.get("주문가능금액", "0")))
                 })
                 
-                # 🔥 그래프를 그리기 위해 현재가를 계속 누적시킵니다!
                 if curr_price > 0:
                     try: self.db.insert_price_history(sym, curr_price)
                     except: pass
@@ -786,9 +823,6 @@ class FormMain(QtWidgets.QMainWindow):
 
             if TcpJsonClient.Isconnected: self.client.send_message("account", account_list)
 
-        # ---------------------------------------------------------
-        # 3. AI 전략 분석 표 (Strategy Table) DB 덮어쓰기
-        # ---------------------------------------------------------
         strategy_list = []
         if not TradeData.strategy.df.empty:
             for _, row in TradeData.strategy.df.iterrows():
@@ -808,7 +842,6 @@ class FormMain(QtWidgets.QMainWindow):
 
             if TcpJsonClient.Isconnected: self.client.send_message("strategy", strategy_list)
 
-        # 4. 주문(Order) 소켓 전송 (DB 저장은 위 append_order_table_slot에서 이미 처리함)
         if not TradeData.order.df.empty and TcpJsonClient.Isconnected:
             order_list = []
             for _, row in TradeData.order.df.iterrows():
@@ -897,9 +930,12 @@ class FormMain(QtWidgets.QMainWindow):
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet("QMenu { background-color: rgb(30, 40, 60); color: white; font-size: 14px; border: 1px solid Silver; } QMenu::item { padding: 10px 25px; } QMenu::item:selected { background-color: rgb(80, 120, 160); }")
         
-        current_mode_str = "🇰🇷 국내 주식" if SystemConfig.MARKET_MODE == "DOMESTIC" else "🌐 미국 주식"
+        if SystemConfig.MARKET_MODE == "DOMESTIC": current_mode_str = "🇰🇷 국내 주식"
+        elif SystemConfig.MARKET_MODE == "OVERSEAS": current_mode_str = "🌐 해외 주식"
+        else: current_mode_str = "🚀 해외 선물"
+        
         act_toggle_mode = menu.addAction(f"🔄 시장 모드 변경 (현재: {current_mode_str})")
-        menu.addSeparator() 
+        menu.addSeparator()
         
         act_collect = menu.addAction("📡 Data Collector (1000종목 수집기 실행)")
         act_train = menu.addAction("🧠 Jubby AI Trainer (AI 학습기 실행)")
@@ -924,30 +960,38 @@ class FormMain(QtWidgets.QMainWindow):
             self.add_log("⚠️ 자동매매 가동 중에는 시장 모드를 변경할 수 없습니다. 먼저 STOP 해주세요.", "warning")
             return
 
+        # 🔥 3단 순환 모드 (국내 -> 해외 -> 해외선물 -> 국내)
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             SystemConfig.MARKET_MODE = "OVERSEAS"
             self.add_log("🌐 [모드 변경] 미국(NASDAQ) 주식 자동매매 모드로 전환되었습니다!", "send")
+        elif SystemConfig.MARKET_MODE == "OVERSEAS":
+            SystemConfig.MARKET_MODE = "OVERSEAS_FUTURES"
+            self.add_log("🚀 [모드 변경] 해외선물(CME) 자동매매 모드로 전환되었습니다!", "send")
         else:
             SystemConfig.MARKET_MODE = "DOMESTIC"
             self.add_log("🇰🇷 [모드 변경] 국내(KRX) 주식 자동매매 모드로 전환되었습니다!", "send")
 
         try: self.db.set_shared_setting("SYSTEM", "MARKET_MODE", SystemConfig.MARKET_MODE)
         except: pass
+        
         self.sync_config_to_cs()
 
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = os.path.dirname(current_dir)
-        dict_path = os.path.join(root_dir, "stock_dict.csv")
-        
-        if os.path.exists(dict_path):
-            df_dict = pd.read_csv(dict_path)
+        # -------------------------------------------------------------
+        # 🔥 [핵심 수정] 모드가 바뀔 때마다 DB에서 새로운 종목 사전을 읽어옵니다.
+        # -------------------------------------------------------------
+        try:
+            query = f"SELECT symbol, symbol_name FROM target_stocks WHERE market_mode = '{SystemConfig.MARKET_MODE}'"
+            df_dict = pd.read_sql(query, self.db.conn)
+            
             if SystemConfig.MARKET_MODE == "DOMESTIC":
-                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['Code'].astype(str).str.zfill(6), df_dict['Name']))
+                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str).str.zfill(6), df_dict['symbol_name']))
             else:
-                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['Code'].astype(str), df_dict['Name']))
-            self.add_log(f"📖 시장 모드에 맞춰 종목 사전 갱신 완료 (총 {len(self.DYNAMIC_STOCK_DICT)}개 종목)", "info")
-        else:
-            self.add_log("⚠️ 종목 사전(stock_dict.csv) 파일이 없습니다. Data Collector를 돌려주세요.", "warning")
+                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str), df_dict['symbol_name']))
+                
+            self.add_log(f"📖 시장 모드에 맞춰 종목 사전 DB 갱신 완료 (총 {len(self.DYNAMIC_STOCK_DICT)}개 종목)", "info")
+        except Exception as e:
+            self.add_log(f"⚠️ DB에서 종목 사전을 불러올 수 없습니다. Data Collector를 실행해 주세요. ({e})", "warning")
+            self.DYNAMIC_STOCK_DICT = {}
 
         if hasattr(self.strategy_engine, 'load_ai_brain'):
             self.strategy_engine.load_ai_brain()
@@ -1061,8 +1105,6 @@ class FormMain(QtWidgets.QMainWindow):
         self.txtLog.appendHtml(html_msg); self.txtLog.verticalScrollBar().setValue(self.txtLog.verticalScrollBar().maximum())
 
     def sync_config_to_cs(self):
-        """ [핵심] 현재 파이썬의 설정값을 DB에 덮어써서 C# 화면 상단에 띄워줍니다! """
-        # ※ 이 함수는 반드시 api_manager가 생성된 이후에 호출되어야 에러가 안 납니다!
         current_config = {
             'MARKET_MODE': SystemConfig.MARKET_MODE,
             'IS_MOCK': str(self.api_manager.IS_MOCK),

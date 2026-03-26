@@ -10,7 +10,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.ensemble import VotingClassifier # 🚀 여러 AI를 투표시키는 앙상블 라이브러리
 
 # =====================================================================
-# 🌐 시스템 전역 설정 (국내/해외 시장 모드 판별용) 및 DB 매니저 호출
+# 🌐 시스템 전역 설정 (국내/해외/해선 시장 모드 판별용) 및 DB 매니저 호출
 # =====================================================================
 from COMMON.Flag import SystemConfig 
 from COMMON.DB_Manager import JubbyDB_Manager # 🔥 우리가 만든 투 트랙 DB 매니저
@@ -32,13 +32,24 @@ def train_jubby_brain(log_callback=None):
             print(f"[{level.upper()}] {msg}")
             
         # C# UI 하단 '로그 창'에 띄워주기 위해 공유 DB에 저장!
-        db.insert_log(level.upper(), msg)
+        try: db.insert_log(level.upper(), msg)
+        except: pass
 
     # 🚀 C# 화면의 진행바(ProgressBar)를 0%로 초기화하며 시작을 알립니다.
     db.update_system_status('TRAINER', '학습 준비 중...', 0)
 
-    # 현재 모드에 따라 인사말을 다르게 출력합니다.
-    market_name = "🇰🇷 국내 주식" if SystemConfig.MARKET_MODE == "DOMESTIC" else "🌐 미국(해외) 주식"
+    # -----------------------------------------------------------------
+    # 🔥 [분기 1] 현재 모드에 따라 인사말과 타겟 시장을 다르게 출력합니다.
+    # -----------------------------------------------------------------
+    if SystemConfig.MARKET_MODE == "DOMESTIC":
+        market_name = "🇰🇷 국내 주식"
+    elif SystemConfig.MARKET_MODE == "OVERSEAS":
+        market_name = "🌐 미국(해외) 주식"
+    elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+        market_name = "🚀 해외 선물"
+    else:
+        market_name = "❓ 알 수 없는 시장"
+        
     send_log(f"🧠 [주삐 AI 연구소] {market_name} 맞춤형 Optuna 자동 튜닝 및 앙상블 학습을 시작합니다...", "INFO")
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -47,11 +58,15 @@ def train_jubby_brain(log_callback=None):
     # =========================================================================
     # 📂 [핵심 수정 1] CSV 파일을 버리고, 무한 누적된 SQL DB에서 데이터를 꺼내옵니다!
     # =========================================================================
-    send_log("📡 SQL 데이터베이스에서 누적된 빅데이터를 불러오는 중입니다...", "INFO")
+    send_log(f"📡 SQL 데이터베이스에서 누적된 [{market_name}] 빅데이터를 불러오는 중입니다...", "INFO")
     db.update_system_status('TRAINER', 'DB 데이터 로드 중', 10)
     
     # DB 매니저에게 "현재 모드에 맞는 학습 데이터 싹 다 가져와!" 라고 명령합니다.
-    df = db.get_training_data(SystemConfig.MARKET_MODE)
+    try:
+        df = db.get_training_data(SystemConfig.MARKET_MODE)
+    except Exception as e:
+        send_log(f"🚨 DB 데이터 로드 중 에러 발생: {e}", "ERROR")
+        return
 
     # 🛡️ 방어 로직: 데이터가 아예 없거나 너무 적으면 학습을 포기합니다.
     if df is None or len(df) < 100:
@@ -163,22 +178,26 @@ def train_jubby_brain(log_callback=None):
     send_log(f"🏆 [합체 완료] 최종 앙상블 주삐 AI 정답률: {final_accuracy:.2f}%", "SUCCESS")
 
     # =========================================================================
-    # 💾 [저장 및 마무리] 완성된 뇌(Model) 저장 및 C#에 보고
+    # 💾 [저장 및 마무리] 🔥 모드별로 뇌(Model) 파일 이름을 다르게 저장합니다!
     # =========================================================================
     if SystemConfig.MARKET_MODE == "DOMESTIC":
         model_name = "jubby_brain.pkl"
-    else:
+    elif SystemConfig.MARKET_MODE == "OVERSEAS":
         model_name = "jubby_brain_overseas.pkl"
+    elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+        model_name = "jubby_brain_futures.pkl"  # 🚀 해외선물 전용 뇌 이식!
+    else:
+        model_name = "jubby_brain_temp.pkl"
         
     save_path = os.path.join(root_dir, model_name)
     joblib.dump(ensemble_model, save_path) # 실물 파일(.pkl)로 저장하여 내일도 쓸 수 있게 합니다.
     
-    send_log(f"💾 [저장 완료] {market_name} 맞춤형 완벽한 뇌가 이식되었습니다!", "SUCCESS")
+    send_log(f"💾 [저장 완료] {market_name} 맞춤형 완벽한 뇌({model_name})가 이식되었습니다!", "SUCCESS")
     send_log(f"📍 뇌 저장 위치: {save_path}", "INFO")
 
     # 🔥 내부 DB에 "오늘 몇 개의 데이터로 공부해서 몇 점 맞았음" 이라는 성적표를 남깁니다.
     db.insert_ai_train_log(model_name=model_name, accuracy=final_accuracy, data_count=total_data_count)
-    send_log("📈 [기록 완료] 내부 DB(jubby_python.db)에 AI 학습 성적표가 등록되었습니다.", "INFO")
+    send_log("📈 [기록 완료] 내부 DB에 AI 학습 성적표가 등록되었습니다.", "INFO")
     
     # 🚀 C# 화면의 진행바를 100%로 꽉 채우고 완료 상태를 알립니다.
     db.update_system_status('TRAINER', '학습 완료!', 100)

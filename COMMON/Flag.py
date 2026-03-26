@@ -7,7 +7,8 @@ from datetime import datetime
 # =========================================================================
 class SystemConfig:
     # 기본값은 "DOMESTIC"(국내)으로 설정합니다.
-    # C# UI에서 Ctrl+우클릭 시 이 값을 "OVERSEAS"(해외)로 변경하게 됩니다.
+    # C# UI에서 Ctrl+우클릭 시 DOMESTIC ➡️ OVERSEAS ➡️ OVERSEAS_FUTURES 순으로 변경됩니다.
+    # 사용 가능 값: "DOMESTIC", "OVERSEAS", "OVERSEAS_FUTURES"
     MARKET_MODE = "DOMESTIC"
 
 class TradeData:

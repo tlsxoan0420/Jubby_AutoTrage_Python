@@ -12,4 +12,5 @@ def main():
     print("UI 실행 완료")
 
 if __name__ == "__main__":
-    main()
+    main() 
+    

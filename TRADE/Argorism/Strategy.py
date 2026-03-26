@@ -24,32 +24,44 @@ class JubbyStrategy:
         self.load_ai_brain()
 
     # =========================================================================
-    # 🧠 [핵심 수정] 모드에 따라 국내용/해외용 AI 뇌(PKL)를 바꿔 끼우는 함수
+    # 🧠 [핵심 수정] 모드에 따라 국내/해외/해외선물 AI 뇌(PKL)를 바꿔 끼우는 함수
     # =========================================================================
     def load_ai_brain(self):
         """ 미국장인지 한국장인지 파악해서 알맞은 뇌(Model)를 머리에 끼웁니다. """
         try:
             root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             
-            # 현재 선택된 시장 모드를 확인합니다.
+            # 🔥 모드에 따른 분기 처리!
             if SystemConfig.MARKET_MODE == "DOMESTIC":
-                model_name = "jubby_brain.pkl"
-                market_title = "🇰🇷 국내 주식"
+                model_path = os.path.join(root_dir, "jubby_brain.pkl")
+                market_icon = "🇰🇷"
+            elif SystemConfig.MARKET_MODE == "OVERSEAS":
+                model_path = os.path.join(root_dir, "jubby_brain_overseas.pkl")
+                market_icon = "🌐"
+            elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
+                model_path = os.path.join(root_dir, "jubby_brain_futures.pkl")
+                market_icon = "🚀"
             else:
-                model_name = "jubby_brain_overseas.pkl"
-                market_title = "🌐 미국(해외) 주식"
-                
-            model_path = os.path.join(root_dir, model_name)
-            
+                model_path = os.path.join(root_dir, "jubby_brain.pkl")
+                market_icon = "❓"
+
             if os.path.exists(model_path):
                 self.ai_model = joblib.load(model_path)
-                self.send_log(f"🧠 [전략엔진] {market_title} 특화 주삐 AI 뇌({model_name}) 장착 완료! 실전 퀀트 매매를 시작합니다.", "success")
+                msg = f"🧠 {market_icon} 맞춤형 주삐 AI 뇌({os.path.basename(model_path)}) 장착 완료!"
+                if self.log_callback: self.log_callback(msg, "success")
+                else: print(msg)
             else:
-                self.ai_model = None # 파일이 없으면 기존 모델 비우기
-                self.send_log(f"⚠️ [전략엔진] {market_title} 전용 AI 뇌 파일({model_name})이 없습니다. 우선 일반 지표 매매로 동작합니다.", "warning")
+                self.ai_model = None
+                msg = f"⚠️ {market_icon} 맞춤형 AI 뇌 파일이 없습니다. (Jubby AI Trainer를 먼저 돌려주세요!)"
+                if self.log_callback: self.log_callback(msg, "warning")
+                else: print(msg)
+                
         except Exception as e:
-            self.send_log(f"🚨 [전략엔진] AI 뇌 이식 실패: {e}", "error")
-
+            msg = f"🚨 AI 뇌 로드 중 에러 발생: {e}"
+            if self.log_callback: self.log_callback(msg, "error")
+            else: print(msg)
+            self.ai_model = None
+            
     def send_log(self, msg, log_type="info"):
         if self.log_callback:
             self.log_callback(msg, log_type)
