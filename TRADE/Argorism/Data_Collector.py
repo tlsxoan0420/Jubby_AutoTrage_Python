@@ -46,20 +46,11 @@ def collect_worker(code, app_key, app_secret, account_no, is_mock, access_token,
 # 📈 [데이터 수집 로직] API 호출부 (국내 / 해외 / 🚀해외선물 통합)
 # =====================================================================
 def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
-<<<<<<< HEAD
-=======
-    
-    # 🚀 [플랜 B 발동!] 해외선물이면 한투 API를 버리고 야후 파이낸스에서 직수입합니다!
->>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
     if SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
         try:
             import yfinance as yf
         except ImportError:
-<<<<<<< HEAD
             if log_func: log_func("🚨 yfinance 라이브러리가 설치되지 않았습니다.", "ERROR")
-=======
-            if log_func: log_func("🚨 yfinance 라이브러리가 설치되지 않았습니다. 터미널에 'pip install yfinance'를 입력하세요.", "ERROR")
->>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
             return None
 
         yf_ticker = stock_code
@@ -69,7 +60,6 @@ def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
         elif "GC" in stock_code: yf_ticker = "GC=F"
         elif "CL" in stock_code: yf_ticker = "CL=F"
 
-<<<<<<< HEAD
         try:
             df_yf = yf.download(yf_ticker, period="7d", interval="1m", progress=False)
             if df_yf.empty: return None
@@ -84,40 +74,10 @@ def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
             df_res['code'] = stock_code
             df_res[['open', 'high', 'low', 'close', 'volume']] = df_res[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
             return df_res.dropna().reset_index(drop=True)
-=======
-        if log_func: log_func(f"🌐 [야후 파이낸스] '{yf_ticker}' 과거 1분봉 무료 싹쓸이 중...", "INFO")
-        try:
-            df_yf = yf.download(yf_ticker, period="7d", interval="1m", progress=False)
-            if df_yf.empty:
-                if log_func: log_func(f"🚨 {yf_ticker} 야후 데이터를 찾을 수 없습니다.", "ERROR")
-                return None
-            
-            if isinstance(df_yf.columns, pd.MultiIndex):
-                df_yf.columns = df_yf.columns.get_level_values(0)
-            
-            df_yf = df_yf.reset_index()
-            dt_col = 'Datetime' if 'Datetime' in df_yf.columns else 'Date'
-            
-            df_yf['date'] = df_yf[dt_col].dt.strftime('%Y%m%d')
-            df_yf['time'] = df_yf[dt_col].dt.strftime('%H%M%S')
-            df_yf.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
-            
-            df_res = df_yf[['date', 'time', 'open', 'high', 'low', 'close', 'volume']].copy()
-            df_res['code'] = stock_code
-            df_res[['open', 'high', 'low', 'close', 'volume']] = df_res[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-            
-            time.sleep(0.5) 
-            return df_res.dropna().reset_index(drop=True)
-            
->>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
         except Exception as e:
             if log_func: log_func(f"🚨 야후 파이낸스 수집 에러: {e}", "ERROR")
             return None
 
-<<<<<<< HEAD
-=======
-    # 🇰🇷/🌐 주식의 경우 원래대로 한투 API를 이용해 정상 수집합니다.
->>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
     all_chunks = [] 
     target_time = "153000" if SystemConfig.MARKET_MODE == "DOMESTIC" else "160000"
     next_key = ""
@@ -131,20 +91,7 @@ def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
         elif SystemConfig.MARKET_MODE == "OVERSEAS":
             url = f"{api.base_url}/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
             tr_id = "HHDFS76950200"
-<<<<<<< HEAD
             params = {"AUTH": "", "EXCD": "NAS", "SYMB": stock_code, "NMIN": "1", "PINC": "1", "NEXT": next_key, "NREC": "120", "FILL": "", "KEYB": next_key}
-=======
-            params = {
-                "AUTH": "", "EXCD": "NAS", "SYMB": stock_code, "NMIN": "1", "PINC": "1", 
-                "NEXT": next_key, "NREC": "120", "FILL": "", "KEYB": next_key
-            }
-
-        headers = {
-            "content-type": "application/json", 
-            "authorization": f"Bearer {api.access_token}",
-            "appkey": api.app_key, "appsecret": api.app_secret, "tr_id": tr_id, "custtype": "P"
-        }
->>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
 
         headers = {"content-type": "application/json", "authorization": f"Bearer {api.access_token}", "appkey": api.app_key, "appsecret": api.app_secret, "tr_id": tr_id, "custtype": "P"}
         res = requests.get(url, headers=headers, params=params)
@@ -165,10 +112,6 @@ def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
             df_chunk = df_chunk[[c_date, c_time, c_open, c_high, c_low, c_close, c_vol]]
             df_chunk.columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
             all_chunks.append(df_chunk)
-<<<<<<< HEAD
-=======
-
->>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
             if SystemConfig.MARKET_MODE == "OVERSEAS":
                 next_key = res.json().get('output1', {}).get('next', "")
                 if not next_key: break
@@ -177,24 +120,7 @@ def fetch_data_logic(api, stock_code, is_market_index=False, log_func=None):
                 if int(target_time) <= 90000: break
             time.sleep(0.35) 
         else:
-<<<<<<< HEAD
             time.sleep(1.5); continue
-=======
-            raw_error = str(res.text).replace('<', '&lt;').replace('>', '&gt;')
-            error_msg = f"🚨 [{stock_code}] 한투 API 거절 원문 (상태코드: {res.status_code}): {raw_error}"
-            
-            if log_func: log_func(error_msg, "ERROR")
-            else: print(error_msg)
-            
-            if "초당 거래건수" in raw_error or "EGW00201" in raw_error:
-                if log_func: log_func(f"⏳ [{stock_code}] 속도 제한! 1.5초 대기 후 이어서 수집합니다...", "WARNING")
-                time.sleep(1.5)
-                continue
-                
-            if res.status_code == 401:
-                if log_func: log_func("🚨 토큰이 만료되었습니다. 프로그램을 재시작하세요.", "ERROR")
-            break
->>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
             
     if not all_chunks: return None
     df = pd.concat(all_chunks).drop_duplicates().sort_values(['date', 'time'])

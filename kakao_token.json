@@ -1,5 +1,1 @@
-<<<<<<< HEAD
-{"access_token": "gqQPeNMZcGrRJKJfCUWyNOndX7IZlJCpAAAAAQoXFO4AAAGdLGAPIeAsyCcGfplL", "token_type": "bearer", "refresh_token": "2FqWPIYBV9Mg9NAvmBK62o-BN4sH1bb7AAAAAgoXAVAAAAGdHYt4H-AsyCcGfplL", "expires_in": 21599, "scope": "talk_message", "refresh_token_expires_in": 5183999}
-=======
-{"access_token": "KtFne5Fit4WrXKl_0V9UisNnsfx87zpHAAAAAQoXC2sAAAGdKL0V-OAsyCcGfplL", "token_type": "bearer", "refresh_token": "2FqWPIYBV9Mg9NAvmBK62o-BN4sH1bb7AAAAAgoXAVAAAAGdHYt4H-AsyCcGfplL", "expires_in": 21599, "scope": "talk_message", "refresh_token_expires_in": 5183999}
->>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
+{"access_token": "upBUovCKN6iHvxbSEObVZsv1_EXO_p94AAAAAQoXAVAAAAGdLfn6iOAsyCcGfplL", "token_type": "bearer", "refresh_token": "2FqWPIYBV9Mg9NAvmBK62o-BN4sH1bb7AAAAAgoXAVAAAAGdHYt4H-AsyCcGfplL", "expires_in": 21599, "scope": "talk_message", "refresh_token_expires_in": 5183999}
