@@ -69,6 +69,7 @@ class JubbyStrategy:
     # 📊 1. [초단타 퀀트 지표] VWAP, 거래량 돌파 에너지 등 실시간 계산
     # =====================================================================
     def calculate_indicators(self, df):
+<<<<<<< HEAD
         """ 실시간 1분봉 데이터를 받아 초단타에 특화된 15개 지표를 계산합니다. """
         if df is None or len(df) < 30: return df
         df = df.copy() # 원본 훼손 방지
@@ -124,6 +125,56 @@ class JubbyStrategy:
             return df.fillna(0)
         except Exception as e:
             self.send_log(f"🚨 지표 계산 중 오류: {e}", "error")
+=======
+        """ 실시간 1분봉 데이터를 받아 15개의 고급 AI 보조지표를 계산합니다. """
+        if df is None or len(df) < 30: return df
+        
+        try:
+            df['return'] = df['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) * 100 
+            df['vol_change'] = df['volume'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) 
+
+            delta = df['close'].diff()
+            up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
+            rs = up.ewm(com=13).mean() / (down.ewm(com=13).mean() + 1e-9)
+            df['RSI'] = 100 - (100 / (1 + rs))
+            
+            df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+            df['Signal_Line'] = df['MACD'].ewm(span=9).mean() # 매도 시그널용
+            
+            # 🔥 [복원] 누락되었던 5가지 고급 지표 실시간 계산 로직 추가!
+            df['MA5'] = df['close'].rolling(5).mean()
+            df['MA20'] = df['close'].rolling(20).mean()
+            
+            df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
+            df['BB_Lower'] = df['MA20'] - (df['close'].rolling(20).std() * 2)
+            df['BB_Width'] = ((df['BB_Upper'] - df['BB_Lower']) / df['MA20']) * 100
+            
+            df['Disparity_5'] = (df['close'] / df['MA5']) * 100
+            df['Disparity_20'] = (df['close'] / df['MA20']) * 100
+
+            df['Vol_Energy'] = df['volume'] / (df['volume'].rolling(20).mean() + 1e-9)
+
+            direction = np.where(df['close'] > df['close'].shift(1), 1, -1)
+            direction = np.where(df['close'] == df['close'].shift(1), 0, direction)
+            obv = (df['volume'] * direction).cumsum()
+            df['OBV_Trend'] = obv.pct_change().replace([np.inf, -np.inf], 0).fillna(0)
+
+            tr1 = df['high'] - df['low']
+            tr2 = (df['high'] - df['close'].shift(1)).abs()
+            tr3 = (df['low'] - df['close'].shift(1)).abs()
+            df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+
+            df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1)
+            df['Low_Tail'] = df[['open', 'close']].min(axis=1) - df['low']
+            df['Buying_Pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-9)
+            
+            # 실시간 시장 대장주(지수)의 1분 등락률을 꽂아줍니다 (FormMain에서 주입됨)
+            df['Market_Return_1m'] = getattr(self, 'market_return_1m', 0.0)
+
+            return df.fillna(0)
+        except Exception as e:
+            if self.log_callback: self.log_callback(f"🚨 지표 계산 중 오류: {e}", "error")
+>>>>>>> 57cac1a06d103c97f6afd69617e371a86e07758f
             return df
 
     # =====================================================================

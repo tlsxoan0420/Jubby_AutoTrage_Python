@@ -9,7 +9,7 @@ def main():
     window.show()                       # UI 창 띄우기
     sys.exit(app.exec_())                   # 이벤트 루프 실행
 
-    print("UI 실행 완료")
+    print("- UI 실행 완료 -")
 
 if __name__ == "__main__":
     main() 
