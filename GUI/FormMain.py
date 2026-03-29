@@ -3,7 +3,7 @@
 # =====================================================================
 import sys
 import os                  
-# 🔥 [핵심 추가] AI 라이브러리(LightGBM 등)와 화면(PyQt5)이 동시에 여러 작업을 처리하려다 
+# 🔥 [핵심 추가] AI 라이브러리와 화면(PyQt5)이 동시에 작업을 처리하려다 
 # 컴퓨터가 뻗어버리는(팅기는) 현상을 억지로 막아주는 마법의 설정입니다.
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True' 
 
@@ -20,9 +20,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from COMMON.Flag import TradeData            
 from COMMON.KIS_Manager import KIS_Manager   
 
-# 💡 [TCP 소켓 통신 삭제 완료]
-# 이제 C#과 파이썬이 복잡하게 TCP로 대화할 필요 없이, 
-# 'JubbyDB_Manager'라는 튼튼한 DB 우체통을 통해 정보를 주고받습니다.
+# 💡 [TCP 소켓 통신 삭제 완료] - TcpJsonClient 및 TCP 관련 흔적 100% 영구 제거!
 from COMMON.Flag import SystemConfig
 from COMMON.DB_Manager import JubbyDB_Manager
 
@@ -31,6 +29,16 @@ from TRADE.Argorism.Strategy import JubbyStrategy
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+# =========================================================================
+# [ EXE 파일 변환 시 리소스(UI 파일, 이미지 등) 절대 경로를 찾아주는 함수 ]
+# =========================================================================
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 # =====================================================================
 # 🖥️ 파이썬 검은 창(터미널)에 뜨는 글씨를 UI 화면으로 끌어오는 도구
@@ -78,7 +86,6 @@ class DataCollectorWorker(QThread):
                     if col in df_market.columns:
                         df_market[col] = pd.to_numeric(df_market[col].astype(str).str.replace(r'[^0-9.]', '', regex=True), errors='coerce').fillna(0)
 
-                # 🔥 [핵심] 가격 1,000원 이상 + 오늘 거래대금 0 초과인 '모든' 정상 종목 수집 (100개 제한 삭제!)
                 top_df = df_market[(df_market['Close'] >= 1000) & (df_market['Amount'] > 0)]
                 print(f"▶️ [수집기] 유령 종목 제외 후 남은 개수(전부 수집): {len(top_df)}개", flush=True)
 
@@ -109,90 +116,48 @@ class DataCollectorWorker(QThread):
                 db_worker = JubbyDB_Manager()
                 df_db = pd.DataFrame({'symbol': stock_list, 'symbol_name': name_list, 'market_mode': SystemConfig.MARKET_MODE})
                 try:
-                    print(f"▶️ [수집기] DB에 {len(stock_list)}개 명단 저장 시도...", flush=True)
                     db_worker.conn.execute(f"DELETE FROM target_stocks WHERE market_mode = '{SystemConfig.MARKET_MODE}'")
                     df_db.to_sql('target_stocks', con=db_worker.conn, if_exists='append', index=False)
                     db_worker.conn.commit()
-                    print("▶️ [수집기] DB 저장 완료!", flush=True)
+                    self.sig_log.emit(f"▶️ [수집기] DB에 {len(stock_list)}개 명단 저장 완료!", "info")
                 except Exception as e:
-                    print(f"🔥 [수집기] DB 저장 에러 발생: {e}", flush=True)
+                    self.sig_log.emit(f"🔥 [수집기] DB 저장 에러: {e}", "error")
                     
                 self.emit_log(f"✅ AI 학습용 빅데이터 타겟 {len(stock_list)}개 확정!", "success")
             else:
                 print("🚨 [수집기] 조건에 맞는 종목을 하나도 찾지 못했습니다.", flush=True)
                 return
 
-            print("▶️ [수집기] UltraDataCollector 가동 시작...", flush=True)
             collector = UltraDataCollector(self.real_app_key, self.real_app_secret, self.account_no, self.is_mock, log_callback=self.emit_log)
             collector.run_collection(stock_list)
-            print("▶️ [수집기] 모든 작업 정상 종료", flush=True)
+            self.emit_log("📡 [수집기] 모든 데이터 수집 및 분석이 완료되었습니다.", "success")
             
         except Exception as e: 
-            print(f"🔥 [수집기] run 함수 대폭발: {e}", flush=True)
             traceback.print_exc()
             self.emit_log(f"🚨 수집기 치명적 에러: {e}", "error")
             
     def emit_log(self, msg, level="info"): self.sig_log.emit(msg, level)
 
+
 # =====================================================================
-# 🧠 [일꾼 2호] AI 학습기 (🔥 독립 프로세스 격리 버전 - 팅김 완전 방지)
+# 🧠 [일꾼 2호] AI 학습기
 # =====================================================================
 class AITrainerWorker(QThread):
     sig_log = pyqtSignal(str, str)
     def run(self):
-        import subprocess, sys, os
-        from COMMON.Flag import SystemConfig
-        
-        self.emit_log("🛡️ [시스템] 프로그램 팅김 방지를 위해 완전 독립된 공간에서 AI 학습을 시작합니다...", "info")
+        self.emit_log("🛡️ [시스템] 프로그램 팅김 방지를 위해 안전한 스레드에서 AI 학습을 시작합니다...", "info")
         try:
-            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            inline_script = (
-                "import sys\n"
-                f"sys.path.append(r'{root_dir}')\n"
-                "from COMMON.Flag import SystemConfig\n"
-                f"SystemConfig.MARKET_MODE = '{SystemConfig.MARKET_MODE}'\n"
-                "from TRADE.Argorism.Jubby_AI_Trainer import train_jubby_brain\n"
-                "try:\n"
-                "    train_jubby_brain(log_callback=None)\n"
-                "finally:\n"
-                "    import os\n"
-                "    os._exit(0)\n"
-            )
-            
-            env = os.environ.copy()
-            env['KMP_DUPLICATE_LIB_OK'] = 'True'
-            
-            process = subprocess.Popen(
-                [sys.executable, "-c", inline_script],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
-                text=True, encoding='utf-8', errors='replace', env=env, cwd=root_dir
-            )
-            
-            while True:
-                line = process.stdout.readline()
-                if not line and process.poll() is not None: break
-                line = line.strip()
-                if line:
-                    level = "info"
-                    if any(x in line for x in ["[SUCCESS]", "✅", "🏆", "💾", "📈"]): level = "success"
-                    elif any(x in line for x in ["[WARNING]", "⚠️", "⚖️", "⚙️"]): level = "warning"
-                    elif any(x in line for x in ["[ERROR]", "🚨"]): level = "error"
-                    clean_line = line.split("] ", 1)[-1] if "] " in line else line
-                    self.emit_log(clean_line, level)
-                    
-            exit_code = process.returncode
-            if exit_code == 0 or exit_code == 3221226505: 
-                self.emit_log("✅ AI 뇌(Model) 학습 및 저장이 완벽하게 끝났습니다! 자동매매를 시작하셔도 좋습니다.", "success")
-            else: 
-                self.emit_log(f"🚨 AI 학습이 비정상 종료되었습니다. (오류 코드: {exit_code})", "error")
-                
-        except Exception as e: self.emit_log(f"🚨 AI 학습 프로세스 생성 오류: {e}", "error")
+            from TRADE.Argorism.Jubby_AI_Trainer import train_jubby_brain
+            train_jubby_brain(log_callback=self.emit_log)
+            self.emit_log("✅ AI 뇌(Model) 학습 및 저장이 완벽하게 끝났습니다! 자동매매를 시작하셔도 좋습니다.", "success")
+        except Exception as e: 
+            self.emit_log(f"🚨 AI 학습 프로세스 생성 오류: {e}", "error")
             
     def emit_log(self, msg, level="info"): self.sig_log.emit(msg, level)
 
+
 # =====================================================================
-# 🤖 [일꾼 3호] 매매 관리자 (🔥 실시간 주도주 스캐너 탑재 버전!)
-# 1분마다 시장 랭킹 1위~100위를 1초 만에 스캔하여 AI에게 넘깁니다.
+# 🤖 [일꾼 3호] 매매 관리자 (🔥 팅김 원인 100% 격리 버전)
 # =====================================================================
 class AutoTradeWorker(QThread):
     sig_log = pyqtSignal(str, str); sig_account_df = pyqtSignal(object)        
@@ -206,26 +171,21 @@ class AutoTradeWorker(QThread):
         self.panic_mode = False; self.closing_mode_notified = False; self.imminent_notified = False
         
     def run(self):
-        self.local_db = JubbyDB_Manager()
         self.is_running = True
-        try: self.local_db.update_system_status('TRADER', '감시망 가동 중 🟢', 100)
+        try: JubbyDB_Manager().update_system_status('TRADER', '감시망 가동 중 🟢', 100)
         except: pass
         
         while self.is_running:
             try: self.process_trading() 
             except Exception as e: self.sig_log.emit(f"🚨 매매 분석 중 일시적 오류 발생 (스레드 복구됨): {e}", "error")
                 
-            for _ in range(60):
+            for _ in range(120):
                 if not self.is_running: break 
-                time.sleep(1)
+                time.sleep(0.5)
                 
-        try: 
-            if hasattr(self, 'local_db') and self.local_db is not None:
-                self.local_db.update_system_status('TRADER', '감시망 중단 🔴', 0)
-                if hasattr(self.local_db, 'conn') and self.local_db.conn is not None:
-                    self.local_db.conn.close() 
-        except: pass
-        finally: self.local_db = None 
+        # 🔥 스레드가 종료될 때는 조용히 루프만 빠져나옵니다. 
+        # (이때 통신이나 DB를 건드리면 Segfault로 튕김)
+        self.is_running = False
 
     def execute_guaranteed_sell(self, code, qty, current_price):
         stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
@@ -240,7 +200,6 @@ class AutoTradeWorker(QThread):
         self.mw.send_kakao_msg(f"🚨 [주삐 긴급 SOS]\n종목: {stock_name}\n매도 주문이 {max_retries}회 연속 튕겨 나갔습니다!")
         return False
 
-   # 🚀 [새로 추가된 마법의 무기] 1초 만에 시장 전체 랭킹을 훔쳐오는 함수
     def get_realtime_hot_stocks(self, limit=100):
         import requests, random
         pool = list(self.mw.DYNAMIC_STOCK_DICT.keys())
@@ -267,9 +226,6 @@ class AutoTradeWorker(QThread):
                 res = requests.get(url, headers=headers, params=params, timeout=3)
                 if res.status_code == 200 and res.json().get('rt_cd') == '0':
                     data = res.json().get('output', [])
-                    
-                    # 🔥 [에러 수정] 한투 API 랭킹표는 'mksc_shrn_iscd' 라는 이름표를 씁니다.
-                    # 혹시 몰라 두 가지 이름표를 다 검사하도록 안전하게 바꿨습니다.
                     hot_list = []
                     for item in data:
                         code = item.get('mksc_shrn_iscd') or item.get('stck_shrn_iscd')
@@ -277,13 +233,10 @@ class AutoTradeWorker(QThread):
                             hot_list.append(code)
                             if len(hot_list) >= limit: 
                                 break
-                                
-                    if hot_list:
-                        return hot_list
+                    if hot_list: return hot_list
             except Exception as e:
-                print(f"🔥 실시간 랭킹 스캐너 일시적 통신 오류: {e}")
+                self.sig_log.emit(f"🔥 실시간 랭킹 스캐너 일시적 통신 오류: {e}", "warning")
 
-        # 해외 시장이거나 통신 에러가 났을 때는 기존처럼 랜덤으로 추출하여 시스템이 멈추는 것을 방지
         return random.sample(pool, min(limit, len(pool))) if pool else []
 
     def process_trading(self):
@@ -329,11 +282,13 @@ class AutoTradeWorker(QThread):
         market_ticker = "069500" if SystemConfig.MARKET_MODE == "DOMESTIC" else ("QQQ" if SystemConfig.MARKET_MODE == "OVERSEAS" else "NQM26")
         market_etf = self.mw.api_manager.fetch_minute_data(market_ticker)
         
+        db_temp = JubbyDB_Manager() 
+        
         if market_etf is not None and len(market_etf) > 1:
             etf_now = market_etf.iloc[-1]['close']; etf_prev = market_etf.iloc[-2]['close']
             self.mw.strategy_engine.market_return_1m = ((etf_now - etf_prev) / etf_prev) * 100.0
             etf_drop = ((etf_now - market_etf.iloc[0]['open']) / market_etf.iloc[0]['open']) * 100
-            try: crash_limit = float(self.local_db.get_shared_setting("TRADE", "CRASH_LIMIT", "-1.5"))
+            try: crash_limit = float(db_temp.get_shared_setting("TRADE", "CRASH_LIMIT", "-1.5"))
             except: crash_limit = -1.5
             
             if etf_drop <= crash_limit: 
@@ -360,12 +315,6 @@ class AutoTradeWorker(QThread):
                 profit_amt = (curr_price - buy_price) * buy_qty
                 
                 stock_details_str += f"  🔸 {stock_name}: 매입 {buy_price:,.2f} -> 현재 {curr_price:,.2f} ({profit_rate:+.2f}%)\n"
-
-                try:
-                    if not TradeData.order.df.empty and '수익률' in TradeData.order.df.columns:
-                        mask = (TradeData.order.df['종목코드'] == code) & (TradeData.order.df['주문종류'].str.contains('BUY|매수'))
-                        if mask.any(): TradeData.order.df.loc[mask, '수익률'] = f"{profit_rate:.2f}%"
-                except Exception: pass
                 
                 target_price, stop_price = self.mw.strategy_engine.get_dynamic_exit_prices(df, buy_price)
                 target_rate = ((target_price - buy_price) / buy_price) * 100
@@ -435,7 +384,7 @@ class AutoTradeWorker(QThread):
                 rsi_val = float(df.iloc[-1].get('RSI', 50.0))
                 strategy_rows.append({'종목코드': code, '종목명': stock_name, '상승확률': '-', 'MA_5': f"{ma5_val:.0f}", 'MA_20': f"{ma20_val:.0f}", 'RSI': f"{rsi_val:.1f}", 'MACD': f"{curr_macd:.2f}", '전략신호': '보유중'})
                 
-                try: self.local_db.update_realtime(code, curr_price, 0.0, "YES", status_msg)
+                try: db_temp.update_realtime(code, curr_price, 0.0, "YES", status_msg)
                 except: pass
             
             for code in sold_codes: 
@@ -461,7 +410,7 @@ class AutoTradeWorker(QThread):
                 self.sig_log.emit(briefing_msg, "info")
 
         current_count = len(self.mw.my_holdings)
-        try: max_stocks_setting = int(self.local_db.get_shared_setting("TRADE", "MAX_STOCKS", "10"))
+        try: max_stocks_setting = int(db_temp.get_shared_setting("TRADE", "MAX_STOCKS", "10"))
         except: max_stocks_setting = 10
         needed_count = max_stocks_setting - current_count 
         
@@ -476,7 +425,6 @@ class AutoTradeWorker(QThread):
             safe_holdings_values = list(self.mw.my_holdings.values())
             total_asset = my_cash + sum([info['price'] * info['qty'] for info in safe_holdings_values])
             
-            # 🔥 [혁신 포인트] 2500개 중 아무거나 100개가 아니라, 실시간으로 거래량 1~100위 녀석만 빼옵니다!
             scan_targets = self.get_realtime_hot_stocks(limit=100)
 
             for code in scan_targets:
@@ -492,7 +440,7 @@ class AutoTradeWorker(QThread):
                 stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code) 
                 scanned_log_list.append({'name': stock_name, 'prob': prob})
                 
-                try: ai_limit = float(self.local_db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
+                try: ai_limit = float(db_temp.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
                 except: ai_limit = 0.70
                 
                 if df_feat is not None and not df_feat.empty:
@@ -520,7 +468,7 @@ class AutoTradeWorker(QThread):
                 
                 if prob >= ai_limit: candidates.append({'code': code, 'prob': prob, 'price': curr_price})
                 
-                try: self.local_db.update_realtime(code, curr_price, prob*100, "NO", "탐색 및 분석 중...")
+                try: db_temp.update_realtime(code, curr_price, prob*100, "NO", "탐색 및 분석 중...")
                 except: pass
                 
                 time.sleep(0.05)
@@ -529,7 +477,7 @@ class AutoTradeWorker(QThread):
                 scanned_log_list = sorted(scanned_log_list, key=lambda x: x['prob'], reverse=True)
                 top_list = scanned_log_list[:3] 
                 top_msg = ", ".join([f"{x['name']}({x['prob']*100:.1f}%)" for x in top_list])
-                try: ai_limit_display = float(self.local_db.get_shared_setting("AI", "THRESHOLD", "70.0"))
+                try: ai_limit_display = float(db_temp.get_shared_setting("AI", "THRESHOLD", "70.0"))
                 except: ai_limit_display = 70.0
                 
                 if candidates: self.sig_log.emit(f"🔥 [실시간 랭커 스캔 완료] 시장 주도주 {len(scan_targets)}개 집중분석. TOP 3: {top_msg} 👉 기준 통과! 매수 진입", "send")
@@ -541,7 +489,7 @@ class AutoTradeWorker(QThread):
                     target = candidates[i]; code = target['code']; curr_price = float(target['price']); prob = target['prob']
                     stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code) 
                     
-                    try: buy_amount_setting = float(self.local_db.get_shared_setting("TRADE", "BUY_AMOUNT", "1000000"))
+                    try: buy_amount_setting = float(db_temp.get_shared_setting("TRADE", "BUY_AMOUNT", "1000000"))
                     except: buy_amount_setting = 1000000.0
 
                     if prob >= 0.85: weight = 0.20     
@@ -606,25 +554,31 @@ class AutoTradeWorker(QThread):
             self.sig_log.emit("🛑 [긴급 청산 완료] 모든 종목이 전량 매도되었습니다. 자동매매를 종료합니다.", "warning")
             self.panic_mode = False; self.is_running = False; self.sig_panic_done.emit()
 
+
 # =====================================================================
 # 🖥️ 메인 UI 클래스 (프로그램의 시작점)
 # =====================================================================
 class FormMain(QtWidgets.QMainWindow):
+    # 🔥 [핵심 수정 1] 백그라운드 스레드에서 직접 UI 타이머를 생성하지 못하도록, 
+    # 무조건 메인 큐를 통과하게 만드는 안전장치(Signal)를 신설합니다.
+    sig_safe_log = pyqtSignal(str, str)
+
     def __init__(self):
         super().__init__()
         self.KAKAO_TOKEN = "여기에_발급받은_카카오톡_REST_API_토큰을_입력하세요" 
 
+        # 로그 안전 신호 연결
+        self.sig_safe_log.connect(self._safe_append_log_sync)
+
         self.db = JubbyDB_Manager()
         self.db.cleanup_old_data() 
         
-        # 🔥 [핵심 추가] 프로그램이 켜질 때마다 어제 쓰던 낡은 표 데이터(Market, Account 등)를 싹 지웁니다.
-        # 이렇게 해야 C# 화면에서 켰을 때 유령 데이터가 표나 차트에 남지 않습니다!
         try:
-            cursor = self.db.conn.cursor()
-            cursor.execute("DELETE FROM MarketStatus")
-            cursor.execute("DELETE FROM AccountStatus")
-            cursor.execute("DELETE FROM StrategyStatus")
-            self.db.conn.commit()
+            conn = self.db._get_connection(self.db.shared_db_path)
+            conn.execute("DELETE FROM MarketStatus")
+            conn.execute("DELETE FROM AccountStatus")
+            conn.execute("DELETE FROM StrategyStatus")
+            conn.close()
             self.db.insert_log("INFO", "🧹 [시스템] 이전 실시간 DB 데이터를 성공적으로 초기화했습니다.")
         except Exception as e:
             if hasattr(self, 'db'):
@@ -641,8 +595,11 @@ class FormMain(QtWidgets.QMainWindow):
         sys.stderr = self.output_logger 
 
         try:
+            conn = self.db._get_connection(self.db.shared_db_path)
             query = f"SELECT symbol, symbol_name FROM target_stocks WHERE market_mode = '{SystemConfig.MARKET_MODE}'"
-            df_dict = pd.read_sql(query, self.db.conn)
+            df_dict = pd.read_sql(query, conn)
+            conn.close()
+            
             if SystemConfig.MARKET_MODE == "DOMESTIC":
                 self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str).str.zfill(6), df_dict['symbol_name']))
             else:
@@ -658,17 +615,19 @@ class FormMain(QtWidgets.QMainWindow):
         self.api_manager.start_api() 
         
         self.strategy_engine = JubbyStrategy(log_callback=self.add_log)
-        self.sync_config_to_cs()
 
         self.my_holdings = {}; self.last_known_cash = 0 
         self.trade_worker = AutoTradeWorker(main_window=self) 
         self.trade_worker.sig_log.connect(self.add_log)                                
-        self.trade_worker.sig_account_df.connect(self.update_account_table_slot)       
+        self.trade_worker.sig_account_df.connect(self.update_account_table_slot)        
         self.trade_worker.sig_strategy_df.connect(self.update_strategy_table_slot)     
         self.trade_worker.sig_sync_cs.connect(self.btnDataSendClickEvent)
         self.trade_worker.sig_order_append.connect(self.append_order_table_slot)            
         self.trade_worker.sig_market_df.connect(self.update_market_table_slot)   
         self.trade_worker.sig_panic_done.connect(self.panic_sell_done_slot)
+        
+        # 🔗 스레드가 종료되었을 때 UI를 안전하게 복구하는 슬롯 연결
+        self.trade_worker.finished.connect(self.check_worker_stopped)
 
         QtCore.QTimer.singleShot(3000, self.load_real_holdings) 
         
@@ -754,7 +713,6 @@ class FormMain(QtWidgets.QMainWindow):
         if self.tbOrder.rowCount() > 500: self.tbOrder.removeRow(0)
         self.tbOrder.scrollToBottom(); self.btnDataSendClickEvent()
 
-    # 💡 [TCP 제거 완료] 이제 이 함수는 통신(send_message)을 하지 않고 오직 DB에 기록(update_table)만 합니다.
     @QtCore.pyqtSlot() 
     def btnDataSendClickEvent(self):
         def clean_num(val): 
@@ -843,7 +801,6 @@ class FormMain(QtWidgets.QMainWindow):
             if col not in df.columns: df[col] = "0"
         TradeData.market.df = df[standard_cols]; self.update_table(self.tbMarket, TradeData.market.df)
 
-    # 🔥 [핵심 수정 1] 수동 잔고 조회 시, 화면에 완벽하게 브리핑!
     def load_real_holdings(self):
         try:
             self.my_holdings = self.api_manager.get_real_holdings()
@@ -884,11 +841,11 @@ class FormMain(QtWidgets.QMainWindow):
             TradeData.account.df = df_acc[acc_cols]
             QtCore.QTimer.singleShot(500, lambda: self.update_table(self.tbAccount, TradeData.account.df))
 
-    # 🔥 [UI 화면 세팅 완벽 복원]
     def initUI(self):
-        uic.loadUi("GUI/Main.ui", self)
+        ui_file_path = resource_path("GUI/Main.ui")
+        uic.loadUi(ui_file_path, self)
         
-        # 🔥 [핵심 수정] 쓸모없어진 TCP 통신 버튼을 화면에서 영구적으로 숨깁니다.
+        # 💡 TCP 연결 버튼 삭제!
         if hasattr(self, 'btnConnected'): self.btnConnected.hide()
         
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint); self.setGeometry(0, 0, 1920, 1080); self.centralwidget.setStyleSheet("background-color: rgb(5,5,15);") 
@@ -898,7 +855,6 @@ class FormMain(QtWidgets.QMainWindow):
         self.tbStrategy = QtWidgets.QTableWidget(self.centralwidget); self.tbStrategy.setGeometry(5, 785, 1420, 240); self._setup_table(self.tbStrategy, list(TradeData.strategy.df.columns))
         self.txtLog = QtWidgets.QPlainTextEdit(self.centralwidget); self.txtLog.setGeometry(1430, 95, 485, 930); self.txtLog.setReadOnly(True); self.txtLog.setStyleSheet("background-color: rgb(20, 30, 45); color: white; font-family: Consolas; font-size: 13px;")
         
-        # 버튼 텍스트 변경
         self.btnDataCreatTest = self._create_nav_button("데이터 자동생성 시작", 5)
         self.btnDataSendTest = self._create_nav_button("수동 DB 동기화", 310) 
         self.btnSimulDataTest = self._create_nav_button("계좌 잔고 조회", 615)
@@ -906,7 +862,12 @@ class FormMain(QtWidgets.QMainWindow):
         self.btnDataClearTest = self._create_nav_button("화면 데이터 초기화", 1225)
         self.btnClose = QtWidgets.QPushButton(" X ", self.centralwidget); self.btnClose.setGeometry(1875, 5, 40, 40); self.btnClose.setStyleSheet("background-color: rgb(5,5,15); color: Silver; border: 1px solid Silver;")
         
-        self.btnDataCreatTest.clicked.connect(self.btnDataCreatClickEvent); self.btnDataSendTest.clicked.connect(self.btnDataSendClickEvent); self.btnSimulDataTest.clicked.connect(self.btnSimulTestClickEvent); self.btnAutoDataTest.clicked.connect(self.btnAutoTradingSwitch); self.btnDataClearTest.clicked.connect(self.btnDataClearClickEvent); self.btnClose.clicked.connect(self.btnCloseClickEvent)
+        self.btnDataCreatTest.clicked.connect(self.btnDataCreatClickEvent)
+        self.btnDataSendTest.clicked.connect(self.btnDataSendClickEvent)
+        self.btnSimulDataTest.clicked.connect(self.btnSimulTestClickEvent)
+        self.btnAutoDataTest.clicked.connect(self.btnAutoTradingSwitch)
+        self.btnDataClearTest.clicked.connect(self.btnDataClearClickEvent)
+        self.btnClose.clicked.connect(self.btnCloseClickEvent)
         self.shortcut_sell = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Shift+W"), self); self.shortcut_sell.activated.connect(self.emergency_sell_event)
         self.hide()
 
@@ -981,11 +942,11 @@ class FormMain(QtWidgets.QMainWindow):
         try: self.db.set_shared_setting("SYSTEM", "MARKET_MODE", SystemConfig.MARKET_MODE)
         except: pass
         
-        self.sync_config_to_cs()
-
         try:
+            conn = self.db._get_connection(self.db.shared_db_path)
             query = f"SELECT symbol, symbol_name FROM target_stocks WHERE market_mode = '{SystemConfig.MARKET_MODE}'"
-            df_dict = pd.read_sql(query, self.db.conn)
+            df_dict = pd.read_sql(query, conn)
+            conn.close()
             
             if SystemConfig.MARKET_MODE == "DOMESTIC":
                 self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str).str.zfill(6), df_dict['symbol_name']))
@@ -1016,7 +977,6 @@ class FormMain(QtWidgets.QMainWindow):
         self.btnAutoDataTest.setText("자동 매매 가동 (GO)")
         self.btnAutoDataTest.setStyleSheet("background-color: rgb(5,5,15); color: Silver;")
 
-    # 🔥 [핵심 수정 3] quit() 명령을 완전히 제거하여 스레드 강제종료로 인한 튕김 현상 100% 방지!
     def btnAutoTradingSwitch(self):
         if not self.trade_worker.is_running: 
             if self.trade_worker.isRunning():
@@ -1028,14 +988,24 @@ class FormMain(QtWidgets.QMainWindow):
             self.btnAutoDataTest.setStyleSheet("background-color: rgb(70, 10, 10); color: Lime; font-weight: bold;")
             self.add_log("🚀 [주삐 엔진] 1분 단위 감시망 가동! 잠시 후 첫 브리핑이 시작됩니다.", "success")
         else: 
-            # 🛑 [안전 종료 로직] 깃발을 먼저 내려서 반복문이 자연스럽게 끝나게 만듭니다.
-            # 정지 버튼을 누르는 순간 즉시 팅기는 것을 방지하기 위해 is_running 플래그만 안전하게 수정합니다.
             if hasattr(self, 'trade_worker'):
                 self.trade_worker.is_running = False
-                
+            
+            self.btnAutoDataTest.setText("감시망 종료 중...")
+            self.btnAutoDataTest.setEnabled(False) 
+            self.btnAutoDataTest.setStyleSheet("background-color: rgb(40, 40, 40); color: Gray;")
+            self.add_log("🛑 [주삐 엔진] 감시망 종료 명령이 전달되었습니다. 스레드가 완전히 멈추면 복구됩니다.", "warning")
+
+    @QtCore.pyqtSlot()
+    def check_worker_stopped(self):
+        """스레드가 100% 안전하게 죽은 뒤에만 호출됩니다."""
+        if self.btnAutoDataTest.text() == "감시망 종료 중...":
             self.btnAutoDataTest.setText("자동 매매 가동 (GO)")
+            self.btnAutoDataTest.setEnabled(True)
             self.btnAutoDataTest.setStyleSheet("background-color: rgb(5,5,15); color: Silver;")
-            self.add_log("🛑 [주삐 엔진] 감시망 종료 명령이 전달되었습니다. 진행 중인 분석을 마치면 완전히 멈춥니다.", "warning")
+            self.add_log("✅ [주삐 엔진] 감시망이 안전하게 종료되었습니다.", "info")
+            try: self.db.update_system_status('TRADER', '감시망 중단 🔴', 0)
+            except: pass
 
     def save_manual_log(self):
         try:
@@ -1113,29 +1083,22 @@ class FormMain(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(object) 
     def update_strategy_table_slot(self, df): self.update_table(self.tbStrategy, df)
 
+    # 🔥 [핵심 수정 2] 백그라운드 스레드에서 QTimer 생성을 100% 방지하기 위해 
+    # 무조건 pyqtSignal(sig_safe_log)을 통해 메인 화면으로 던지도록 바꿨습니다!
     @QtCore.pyqtSlot(str, str) 
     def add_log(self, text, log_type="info"):
+        self.sig_safe_log.emit(text, log_type)
+
+    @QtCore.pyqtSlot(str, str)
+    def _safe_append_log_sync(self, text, log_type):
         color = {"info": "white", "success": "lime", "warning": "yellow", "error": "red", "send": "cyan", "recv": "orange", "buy": "#4B9CFF", "sell": "#FF4B4B"}.get(log_type, "white")
         formatted_text = text.replace('\n', '<br>&nbsp;&nbsp;&nbsp;&nbsp;')
-        html_message = f'<span style="color:{color}"><b>{datetime.now().strftime("[%H:%M:%S]")}</b> {formatted_text}</span>'
-        QtCore.QTimer.singleShot(0, lambda: self._safe_append_log(html_message))
-        
+        html_msg = f'<span style="color:{color}"><b>{datetime.now().strftime("[%H:%M:%S]")}</b> {formatted_text}</span>'
+        self.txtLog.appendHtml(html_msg)
+        self.txtLog.verticalScrollBar().setValue(self.txtLog.verticalScrollBar().maximum())
         try:
             if hasattr(self, 'db'): self.db.insert_log(log_type.upper(), text)
         except Exception: pass
-
-    def _safe_append_log(self, html_msg):
-        self.txtLog.appendHtml(html_msg); self.txtLog.verticalScrollBar().setValue(self.txtLog.verticalScrollBar().maximum())
-
-    def sync_config_to_cs(self):
-        current_config = {
-            'MARKET_MODE': SystemConfig.MARKET_MODE,
-            'IS_MOCK': str(self.api_manager.IS_MOCK),
-            'TARGET_COUNT': "1000",
-            'SERVER_STATUS': "CONNECTED"
-        }
-        try: self.db.broadcast_settings(current_config)
-        except: pass
 
     def _setup_table(self, table, columns): table.setColumnCount(len(columns)); table.setHorizontalHeaderLabels(columns); self.style_table(table)
     def style_table(self, table): table.setFont(QtGui.QFont("Noto Sans KR", 12)); table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch); table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows); table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection); table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers); table.setStyleSheet("QTableWidget { background-color: rgb(50,80,110); color: Black; selection-background-color: rgb(80, 120, 160); } QHeaderView::section { background-color: rgb(40,60,90); color: Black; font-weight: bold; }")
@@ -1168,3 +1131,12 @@ class FormMain(QtWidgets.QMainWindow):
         tableWidget.scrollToBottom(); tableWidget.setUpdatesEnabled(True)
         
     def btnDataClearClickEvent(self): self.tbAccount.setRowCount(0); self.tbStrategy.setRowCount(0); self.tbOrder.setRowCount(0); self.tbMarket.setRowCount(0)
+
+# =====================================================================
+# 🚀 파이썬 프로그램의 진짜 시작점! 
+# =====================================================================
+if __name__ == '__main__':
+    app = QtWidgets.QApplication(sys.argv)
+    mainWindow = FormMain()
+    mainWindow.show()
+    sys.exit(app.exec_())
