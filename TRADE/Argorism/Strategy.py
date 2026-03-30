@@ -29,20 +29,29 @@ class JubbyStrategy:
     def load_ai_brain(self):
         """ 미국장인지 한국장인지 파악해서 알맞은 뇌(Model)를 머리에 끼웁니다. """
         try:
-            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            
-            # 🔥 모드에 따른 분기 처리!
+
+            import sys, os
+            def get_smart_path(filename):
+                import sys, os
+                if getattr(sys, 'frozen', False): 
+                    return os.path.join(os.path.dirname(sys.executable), filename)
+                else:
+                    # 🔥 깊은 폴더에 있으므로 3칸 위로 뚫고 올라갑니다!
+                    base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+                    return os.path.join(base_path, filename)
+
+            # 🔥 모드에 따른 분기 처리 경로 변경!
             if SystemConfig.MARKET_MODE == "DOMESTIC":
-                model_path = os.path.join(root_dir, "jubby_brain.pkl")
+                model_path = get_smart_path("jubby_brain.pkl")
                 market_icon = "🇰🇷"
             elif SystemConfig.MARKET_MODE == "OVERSEAS":
-                model_path = os.path.join(root_dir, "jubby_brain_overseas.pkl")
+                model_path = get_smart_path("jubby_brain_overseas.pkl")
                 market_icon = "🌐"
             elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
-                model_path = os.path.join(root_dir, "jubby_brain_futures.pkl")
+                model_path = get_smart_path("jubby_brain_futures.pkl")
                 market_icon = "🚀"
             else:
-                model_path = os.path.join(root_dir, "jubby_brain.pkl")
+                model_path = get_smart_path("jubby_brain.pkl")
                 market_icon = "❓"
 
             if os.path.exists(model_path):

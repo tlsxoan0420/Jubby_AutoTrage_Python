@@ -30,17 +30,21 @@ from TRADE.Argorism.Strategy import JubbyStrategy
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning) # 불필요한 경고 메시지 숨김
 
-# =========================================================================
-# 📂 [경로 탐색기] EXE 파일 변환 시 리소스(UI 파일, 이미지 등) 절대 경로를 찾아주는 함수 
-# =========================================================================
+def get_smart_path(filename):
+    """ 외부 파일(DB, JSON, PKL)을 EXE 파일과 같은 폴더에서 찾습니다. """
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(sys.executable)
+        return os.path.join(base_path, filename)
+    else:
+        # 🔥 [수정] FormMain.py는 이미 최상단에 있으므로 한 번만 감싸줍니다.
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base_path, filename)
+
 def resource_path(relative_path):
-    try:
-        # PyInstaller에 의해 임시폴더에서 실행될 경우 임시폴더 경로를 반환
-        base_path = sys._MEIPASS
-    except Exception:
-        # 일반 파이썬 환경에서 실행될 경우 현재 작업 경로를 반환
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+    """ 내장된 파일(Main.ui 등)을 임시 폴더(_MEIPASS)에서 찾습니다. """
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 
 # =====================================================================
 # 🖥️ [로그 가로채기] 파이썬 검은 창(터미널)에 뜨는 글씨를 UI 화면으로 끌어오는 도구
@@ -168,7 +172,7 @@ class AITrainerWorker(QThread):
 
 
 # =====================================================================
-# 🤖 [일꾼 3호] 매매 관리자 (🔥 팅김 원인 100% 격리 및 1분마다 시장 스캔)
+# 🤖 [일꾼 3호] 매매 관리자 (🔥 팅김 원인 100% 격리 및 즉각 멈춤 브레이크 장착)
 # =====================================================================
 class AutoTradeWorker(QThread):
     # UI 화면(FormMain)과 데이터를 주고받기 위한 통신 신호탄들
@@ -178,10 +182,18 @@ class AutoTradeWorker(QThread):
     sig_panic_done = pyqtSignal()
 
     def __init__(self, main_window):
-        super().__init__()
-        self.mw = main_window; self.is_running = False; self.cumulative_realized_profit = 0 
+        super().__init__(main_window)
+        self.mw = main_window; self.is_running = False
+        
+        # 🔥 [DB 연동] 프로그램이 켜질 때 DB에서 기존 '누적 실현손익'을 불러옵니다!
+        try: 
+            db_temp = JubbyDB_Manager()
+            self.cumulative_realized_profit = float(db_temp.get_shared_setting("ACCOUNT", "CUMULATIVE_REALIZED_PROFIT", "0.0"))
+        except: 
+            self.cumulative_realized_profit = 0.0
+            
         self.panic_mode = False; self.closing_mode_notified = False; self.imminent_notified = False
-        self.was_crash_mode = False # 🔥 방금 전까지 급락장이었는지 기억하는 뇌세포!
+        self.was_crash_mode = False 
 
     def run(self):
         self.is_running = True
@@ -197,56 +209,52 @@ class AutoTradeWorker(QThread):
                 if not self.is_running: break 
                 time.sleep(0.5)
                 
-        # 🔥 스레드가 종료될 때는 조용히 루프만 빠져나옵니다. (강제 종료하면 팅김 유발)
         self.is_running = False
 
     # -------------------------------------------------------------------------
-    # 🛡️ 매도 절대 사수 함수 (초당 거래 초과 에러 방어)
+    # 🛡️ 매도 절대 사수 함수
     # -------------------------------------------------------------------------
     def execute_guaranteed_sell(self, code, qty, current_price):
         stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
-        max_retries = 10 # 튕기더라도 최대 10번까지 재시도
+        max_retries = 10 
         for i in range(max_retries):
             if self.mw.api_manager.sell(code, qty):
                 if i > 0: self.sig_log.emit(f"✅ [{stock_name}] {i}번의 끈질긴 재시도 끝에 매도 주문 접수 완료!", "success")
                 return True
             self.sig_log.emit(f"⚠️ [{stock_name}] 매도 실패! 즉시 재시도합니다... ({i+1}/{max_retries})", "warning")
-            time.sleep(1.5) # 서버가 화내면 1.5초 쉬었다가 다시 시도
-        self.sig_log.emit(f"🚨 [{stock_name}] 매도 {max_retries}회 연속 실패! 서버 장애 또는 미체결.", "error")
-        self.mw.send_kakao_msg(f"🚨 [주삐 긴급 SOS]\n종목: {stock_name}\n매도 주문이 {max_retries}회 연속 튕겨 나갔습니다!")
+            time.sleep(1.5) 
+            
+            if not self.is_running and not getattr(self, 'panic_mode', False): break
+            
+        if self.is_running or getattr(self, 'panic_mode', False):
+            self.sig_log.emit(f"🚨 [{stock_name}] 매도 {max_retries}회 연속 실패! 서버 장애 또는 미체결.", "error")
+            self.mw.send_kakao_msg(f"🚨 [주삐 긴급 SOS]\n종목: {stock_name}\n매도 주문이 {max_retries}회 연속 튕겨 나갔습니다!")
         return False
 
     # -------------------------------------------------------------------------
-    # 🛡️ 매수 절대 사수 함수 (AI 재판단 로직 추가 완료!)
+    # 🛡️ 매수 절대 사수 함수 (AI 재판단 로직 포함)
     # -------------------------------------------------------------------------
     def execute_guaranteed_buy(self, code, qty):
         stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
-        max_retries = 5 # 너무 늦게 사서 고점에 물리는 것을 막기 위해 매수는 최대 5번만 시도
+        max_retries = 5 
         
-        # 1차 시도 (방금 AI 분석을 마쳤으므로 바로 발송)
-        if self.mw.api_manager.buy_market_price(code, qty):
-            return True
+        if self.mw.api_manager.buy_market_price(code, qty): return True
             
         self.sig_log.emit(f"⚠️ [{stock_name}] 1차 매수 실패(서버 혼잡)! 1초 후 AI 최신 차트 재판단 후 재시도합니다...", "warning")
         time.sleep(1.0) 
         
-        # 2차 시도 ~ 루프 시작 (1초 사이 차트가 변했는지 AI에게 다시 물어봅니다)
         for i in range(1, max_retries):
-            # 🔥 [긴급 멈춤 스위치 1] 재시도 대기 중 사용자가 긴급 청산을 누르면 즉시 폐기!
-            if getattr(self, 'panic_mode', False):
-                self.sig_log.emit(f"🚨 [{stock_name}] 긴급 청산 발동 감지! 진행 중이던 매수 재시도를 즉각 폐기합니다.", "error")
+            if not self.is_running or getattr(self, 'panic_mode', False):
+                self.sig_log.emit(f"🚨 [{stock_name}] 자동매매 중지 발동! 진행 중이던 매수 재시도를 즉각 폐기합니다.", "error")
                 return False
 
-            # 1. 1초가 지난 현재 시점의 최신 1분봉 데이터 및 AI 확률 실시간 재요청
             try: prob, curr_price, df_feat = self.mw.get_ai_probability(code)
             except Exception: prob = -1.0; df_feat = None
             
-            # API 제한 등으로 차트를 못 가져오면 무리하지 않고 포기 (안전 제일)
             if prob == -1.0 or df_feat is None or df_feat.empty:
                 self.sig_log.emit(f"🛑 [{stock_name}] 통신 지연으로 최신 차트 확인 불가. 무리하지 않고 재매수를 포기합니다.", "error")
                 return False
                 
-            # 2. 전략 엔진 재검사 (돌파 자리나 AI 시그널이 아직 유효한지 확인)
             strat_signal = self.mw.strategy_engine.check_trade_signal(df_feat, code)
             
             if strat_signal != "BUY":
@@ -255,7 +263,6 @@ class AutoTradeWorker(QThread):
                 
             self.sig_log.emit(f"🔄 [{stock_name}] AI 재판단 통과! (여전히 강력 매수 자리) 다시 주문을 쏩니다!", "info")
             
-            # 3. 허락받았으니 다시 매수 주문 발송!
             if self.mw.api_manager.buy_market_price(code, qty):
                 self.sig_log.emit(f"✅ [{stock_name}] {i}번의 끈질긴 재시도 끝에 매수 주문 접수 완료!", "success")
                 return True
@@ -267,15 +274,40 @@ class AutoTradeWorker(QThread):
         return False
 
     # -------------------------------------------------------------------------
-    # 🔍 실시간 거래량 폭발 주도주 검색기
+    # 🔍 실시간 거래량 폭발 주도주 검색기 (DB 설정 기반 가격대별 싹쓸이 스캔!)
     # -------------------------------------------------------------------------
-    def get_realtime_hot_stocks(self, limit=100):
-        import requests, random
+    def get_realtime_hot_stocks(self): 
+        import requests, random, json
         pool = list(self.mw.DYNAMIC_STOCK_DICT.keys())
+        hot_list = []
+        db_temp = JubbyDB_Manager()
+        
+        # 1. DB에서 총 가져올 목표 개수 불러오기 (기본값: 60개)
+        try: target_limit = int(db_temp.get_shared_setting("TRADE", "HOT_STOCK_LIMIT", "60"))
+        except: target_limit = 60
+
+        # 2. DB에서 단계별 최대 수집 개수 불러오기 (기본값: 20개)
+        try: max_per_condition = int(db_temp.get_shared_setting("TRADE", "MAX_PER_CONDITION", "20"))
+        except: max_per_condition = 20
 
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             try:
-                # KIS API를 이용해 당일 거래량 급증 랭킹을 가져옵니다.
+                # 3. DB에서 검색 조건(가격대 구간)을 JSON 형태로 불러오기
+                default_conditions_json = '''[
+                    ["J", "1000", "10000"], ["Q", "1000", "10000"],
+                    ["J", "10000", "50000"], ["Q", "10000", "50000"],
+                    ["J", "50000", "100000"], ["Q", "50000", "100000"],
+                    ["J", "100000", "200000"], ["Q", "100000", "200000"],
+                    ["J", "200000", "400000"], ["Q", "200000", "400000"],
+                    ["J", "400000", "0"], ["Q", "400000", "0"]
+                ]'''
+                
+                try: 
+                    conditions_str = db_temp.get_shared_setting("TRADE", "SEARCH_CONDITIONS", default_conditions_json)
+                    search_conditions = json.loads(conditions_str)
+                except:
+                    search_conditions = json.loads(default_conditions_json)
+
                 api = self.mw.api_manager.api
                 url = f"{api.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
                 headers = {
@@ -286,29 +318,59 @@ class AutoTradeWorker(QThread):
                     "tr_id": "FHPST01710000",
                     "custtype": "P"
                 }
-                params = {
-                    "FID_COND_MRKT_DIV_CODE": "J", "FID_COND_SCR_DIV_CODE": "20171",
-                    "FID_INPUT_ISCD": "0000", "FID_DIV_CLS_CODE": "0", "FID_BLNG_CLS_CODE": "0",
-                    "FID_TRGT_CLS_CODE": "111111111", "FID_TRGT_EXLS_CLS_CODE": "0000000000",
-                    "FID_INPUT_PRICE_1": "1000", "FID_INPUT_PRICE_2": "0",
-                    "FID_VOL_CNT": "0", "FID_INPUT_DATE_1": ""
-                }
-                res = requests.get(url, headers=headers, params=params, timeout=3)
-                if res.status_code == 200 and res.json().get('rt_cd') == '0':
-                    data = res.json().get('output', [])
-                    hot_list = []
-                    for item in data:
-                        code = item.get('mksc_shrn_iscd') or item.get('stck_shrn_iscd')
-                        if code and code in pool:
-                            hot_list.append(code)
-                            if len(hot_list) >= limit: 
-                                break
-                    if hot_list: return hot_list
+
+                for mrkt, price1, price2 in search_conditions:
+                    if len(hot_list) >= target_limit: break # 총 목표치(60개 등)를 채우면 즉시 멈춤
+                    
+                    params = {
+                        "FID_COND_MRKT_DIV_CODE": mrkt, 
+                        "FID_COND_SCR_DIV_CODE": "20171",
+                        "FID_INPUT_ISCD": "0000", 
+                        "FID_DIV_CLS_CODE": "0", 
+                        "FID_BLNG_CLS_CODE": "0",
+                        "FID_TRGT_CLS_CODE": "111111111", 
+                        "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+                        "FID_INPUT_PRICE_1": price1, 
+                        "FID_INPUT_PRICE_2": price2,
+                        "FID_VOL_CNT": "0", 
+                        "FID_INPUT_DATE_1": ""
+                    }
+                    res = requests.get(url, headers=headers, params=params, timeout=3)
+                    
+                    if res.status_code == 200 and res.json().get('rt_cd') == '0':
+                        data = res.json().get('output', [])
+                        condition_count = 0 # 현재 구간에서 수집한 개수를 세는 카운터
+                        
+                        for item in data:
+                            vol = str(item.get('acml_vol', '0'))
+                            if vol == '0': continue # 거래량 0인 종목 컷!
+                            
+                            code = item.get('mksc_shrn_iscd') or item.get('stck_shrn_iscd')
+                            if code and code in pool and code not in hot_list:
+                                hot_list.append(code)
+                                condition_count += 1
+                                
+                                # 🔥 [비기] 각 단계별 최대 수집 개수(기본 20개)에 도달하면 현재 구간 멈추고 다음 구간으로!
+                                if condition_count >= max_per_condition:
+                                    break
+                                    
+                                # 총 목표 수집 개수(기본 60개)에 도달해도 멈춤
+                                if len(hot_list) >= target_limit: 
+                                    break
+                                    
+                    time.sleep(0.1) # 증권사 서버 보호용 딜레이
+
             except Exception as e:
                 self.sig_log.emit(f"🔥 실시간 랭킹 스캐너 일시적 통신 오류: {e}", "warning")
 
-        # 랭킹을 못 가져오면 DB 명단에서 무작위로 추출
-        return random.sample(pool, min(limit, len(pool))) if pool else []
+        # 해외 주식은 아직 랭킹 API가 없으므로 기존처럼 부족한 만큼 랜덤으로 가져옵니다.
+        if SystemConfig.MARKET_MODE != "DOMESTIC" and len(hot_list) < target_limit:
+            remaining_limit = target_limit - len(hot_list)
+            remaining_pool = [c for c in pool if c not in hot_list]
+            fill_list = random.sample(remaining_pool, min(remaining_limit, len(remaining_pool))) if remaining_pool else []
+            hot_list.extend(fill_list)
+
+        return hot_list
 
     # =========================================================================
     # 🧠 [메인 루프] 자동매매 핵심 판단 및 실행 로직 (1분마다 실행됨)
@@ -325,7 +387,6 @@ class AutoTradeWorker(QThread):
 
         is_closing_phase = False; is_safe_profit_close = False; is_imminent_close = False
 
-        # ⏰ 시장 모드별 장 마감 임박 시간 계산
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             if now.hour == 15 and now.minute >= 0: is_closing_phase = True
             if now.hour == 15 and 0 <= now.minute < 10: is_safe_profit_close = True
@@ -341,7 +402,6 @@ class AutoTradeWorker(QThread):
             if now.hour == 5 and now.minute >= 45: is_imminent_close = True
             if now.hour == 6: is_imminent_close = True 
 
-        # 장 마감 임박 시 강력 경고
         if is_imminent_close:
             if not getattr(self, 'imminent_notified', False):
                 self.sig_log.emit(f"⚠️ [마감 임박] 장 종료가 다가옵니다! 보유 중인 모든 종목을 시장가로 강제 청산합니다!", "error")
@@ -354,9 +414,6 @@ class AutoTradeWorker(QThread):
                 self.closing_mode_notified = True
         elif not is_closing_phase: self.closing_mode_notified = False
 
-        # -----------------------------------------------------------------
-        # 🚨 지수 급락 감지기 (시장 폭락 시 자동 매수 중단)
-        # -----------------------------------------------------------------
         market_crash_mode = False
         market_ticker = "069500" if SystemConfig.MARKET_MODE == "DOMESTIC" else ("QQQ" if SystemConfig.MARKET_MODE == "OVERSEAS" else "NQM26")
         market_etf = self.mw.api_manager.fetch_minute_data(market_ticker)
@@ -368,35 +425,32 @@ class AutoTradeWorker(QThread):
             self.mw.strategy_engine.market_return_1m = ((etf_now - etf_prev) / etf_prev) * 100.0
             etf_drop = ((etf_now - market_etf.iloc[0]['open']) / market_etf.iloc[0]['open']) * 100
             
-            # DB에서 급락 기준치 불러오기 (기본 -1.5%)
             try: crash_limit = float(db_temp.get_shared_setting("TRADE", "CRASH_LIMIT", "-1.5"))
             except: crash_limit = -1.5
             
             if etf_drop <= crash_limit: 
                 market_crash_mode = True
-                # 🔥 처음 급락선을 뚫었을 때 딱 1번만 경고하고 카톡을 보냅니다.
                 if not getattr(self, 'was_crash_mode', False): 
                     warn_msg = f"⚠️ [시장 경고] {market_ticker} 지수가 급락 중입니다({etf_drop:.2f}%). 신규 매수를 전면 차단합니다."
                     self.sig_log.emit(warn_msg, "warning")
                     self.mw.send_kakao_msg(warn_msg)
                     self.was_crash_mode = True 
             else:
-                # 🔥 방금 전까지 급락장이었다가 기준선 위로 회복한 경우!
                 if getattr(self, 'was_crash_mode', False): 
                     safe_msg = f"🌤️ [시장 안정] {market_ticker} 지수가 회복되었습니다({etf_drop:.2f}%). 신규 매수 탐색을 재개합니다!"
                     self.sig_log.emit(safe_msg, "success")
                     self.mw.send_kakao_msg(safe_msg)
-                    self.was_crash_mode = False # 기억 초기화
+                    self.was_crash_mode = False 
 
         stock_details_str = ""
         current_holdings = list(self.mw.my_holdings.items())
 
-        # -----------------------------------------------------------------
-        # 💼 1. 내 계좌 보유 종목 검사 (매도 타점 확인)
-        # -----------------------------------------------------------------
         if len(current_holdings) > 0: 
             sold_codes = []; hold_status_list = [] 
             for code, info in current_holdings: 
+                if not self.is_running and not getattr(self, 'panic_mode', False):
+                    break
+
                 if code not in self.mw.my_holdings: continue 
 
                 buy_price = info['price']; buy_qty = info['qty']; stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
@@ -416,7 +470,6 @@ class AutoTradeWorker(QThread):
                 target_rate = ((target_price - buy_price) / buy_price) * 100
                 stop_rate = ((stop_price - buy_price) / buy_price) * 100
 
-                # 최고점 갱신 시 트레일링 스탑 기준선 상향
                 if curr_price > high_watermark:
                     self.mw.my_holdings[code]['high_watermark'] = curr_price
                     high_watermark = curr_price
@@ -425,7 +478,6 @@ class AutoTradeWorker(QThread):
 
                 total_invested += (buy_price * buy_qty); total_current_val += (curr_price * buy_qty)
                 
-                # 차트 데이터를 C# DB로 보내기 위한 파싱
                 curr_open = float(df.iloc[-1]['open']); curr_high = float(df.iloc[-1]['high']); curr_low = float(df.iloc[-1]['low']); curr_vol = float(df.iloc[-1]['volume']) 
                 curr_macd = float(df.iloc[-1].get('MACD', 0.0)); curr_signal = float(df.iloc[-1].get('Signal_Line', 0.0))
                 ret_1m = float(df.iloc[-1].get('return', 0.0)); trade_amt = float(df.iloc[-1].get('Trade_Amount', (curr_price * curr_vol) / 1000000))
@@ -436,7 +488,6 @@ class AutoTradeWorker(QThread):
                 is_sell_all = False; is_sell_half = False; status_msg = ""; sell_qty = buy_qty
                 strat_signal = self.mw.strategy_engine.check_trade_signal(df, code)
 
-                # =================== 매도 로직 분기 ===================
                 if getattr(self, 'panic_mode', False): is_sell_all = True; status_msg = "🚨 긴급 전체 청산 (사용자 요청)"
                 elif is_imminent_close: is_sell_all = True; status_msg = "마감 임박 묻지마 시장가 청산"
                 elif is_safe_profit_close:
@@ -452,7 +503,6 @@ class AutoTradeWorker(QThread):
                     elif profit_rate >= 1.5 and curr_macd < curr_signal: is_sell_all = True; status_msg = "데드크로스 수익보존 탈출"
                     elif elapsed_mins >= 45 and (-1.0 <= profit_rate <= 1.0): is_sell_all = True; status_msg = f"타임아웃 ({int(elapsed_mins)}분 횡보) 탈출"
 
-                # 조건 만족 시 실제 매도 실행
                 if is_sell_half or is_sell_all:
                     if getattr(self, 'panic_mode', False): self.sig_log.emit(f"🔥 [긴급청산 진행] 👉 '{stock_name}' {sell_qty}주 전량 매도 프로세스 진입...", "warning")
 
@@ -464,6 +514,9 @@ class AutoTradeWorker(QThread):
                         
                         realized_profit = (curr_price - buy_price) * sell_qty
                         self.cumulative_realized_profit += realized_profit
+                        try: db_temp.set_shared_setting("ACCOUNT", "CUMULATIVE_REALIZED_PROFIT", str(self.cumulative_realized_profit))
+                        except: pass
+                        
                         my_cash += (curr_price * sell_qty); self.mw.last_known_cash = my_cash  
                         total_invested -= (buy_price * sell_qty); total_current_val -= (curr_price * sell_qty)
 
@@ -472,11 +525,9 @@ class AutoTradeWorker(QThread):
                         self.sig_log.emit(sell_msg, log_color) 
                         self.mw.send_kakao_msg(f"🔔 [주삐 매도 알림]\n종목: {stock_name}\n수익률: {profit_rate:.2f}%\n손익: {int(realized_profit):,}원\n사유: {status_msg}") 
                         
-                        # DB TradeHistory 용 신호
                         sell_type_str = '익절(SELL_PROFIT)' if profit_rate > 0 else '손절(SELL_LOSS)'
                         self.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': sell_type_str, '주문가격': f"{curr_price:,.2f}", '주문수량': sell_qty, '체결수량': sell_qty, '주문시간': now.strftime("%Y-%m-%d %H:%M:%S"), '상태': '체결완료', '수익률': f"{profit_rate:.2f}%"})
 
-                # 안 팔았으면 계좌 목록에 유지
                 if not is_sell_all:
                     if code not in self.mw.my_holdings: continue 
                     cur_qty = self.mw.my_holdings[code]['qty'] if is_sell_half else buy_qty
@@ -489,13 +540,9 @@ class AutoTradeWorker(QThread):
                 try: db_temp.update_realtime(code, curr_price, 0.0, "YES", status_msg)
                 except: pass
             
-            # 루프 종료 후 딕셔너리 정리
             for code in sold_codes: 
                 if code in self.mw.my_holdings: del self.mw.my_holdings[code]
 
-        # -----------------------------------------------------------------
-        # 📢 1분 브리핑 & 긴급 청산 메시지 처리
-        # -----------------------------------------------------------------
         if getattr(self, 'panic_mode', False):
             if len(self.mw.my_holdings) > 0:
                 remain_stocks = [self.mw.DYNAMIC_STOCK_DICT.get(c, c) for c in list(self.mw.my_holdings.keys())]
@@ -505,6 +552,11 @@ class AutoTradeWorker(QThread):
             total_unrealized_profit = total_current_val - total_invested 
             total_asset = my_cash + total_current_val 
             realized_profit = getattr(self, 'cumulative_realized_profit', 0) 
+            
+            try:
+                db_temp.set_shared_setting("ACCOUNT", "TOTAL_ASSET", str(total_asset))
+                db_temp.set_shared_setting("ACCOUNT", "UNREALIZED_PROFIT", str(total_unrealized_profit))
+            except: pass
             
             briefing_msg = f"📊 [주삐 1분 브리핑] {now.strftime('%H:%M')}\n💎 추정 총자산: {int(total_asset):,}원\n💰 누적 실현손익: {int(realized_profit):+,}원\n💸 보유주식 평가손익: {int(total_unrealized_profit):+,}원"
             if len(self.mw.my_holdings) > 0:
@@ -521,7 +573,7 @@ class AutoTradeWorker(QThread):
         needed_count = max_stocks_setting - current_count 
         
         # =================================================================
-        # 🛒 4. 신규 종목 스캔 (🔥 실시간 주도주 스캐너 발동!)
+        # 🛒 4. 신규 종목 스캔 (🔥 최소 스캔 개수 보장 로직 적용)
         # =================================================================
         candidates = []; scanned_log_list = []; scan_targets = []
 
@@ -531,32 +583,35 @@ class AutoTradeWorker(QThread):
             safe_holdings_values = list(self.mw.my_holdings.values())
             total_asset = my_cash + sum([info['price'] * info['qty'] for info in safe_holdings_values])
             
-            # 주도주 랭킹 추출
-            scan_targets = self.get_realtime_hot_stocks(limit=100)
+            # ✅ DB에서 최소 스캔 종목 수 가져오기 (기본값: 60개)
+            try: min_scan_stocks = int(db_temp.get_shared_setting("TRADE", "MIN_SCAN_STOCKS", "60"))
+            except: min_scan_stocks = 60
+            
+            # ✅ 괄호 안을 깔끔하게 비워줍니다! (개수는 이제 DB에서 알아서 가져옵니다)
+            scan_targets = self.get_realtime_hot_stocks()
 
             for code in scan_targets:
-                # 🔥 [긴급 멈춤 스위치 2] 스캔 도중 긴급 청산이 발동되면 남은 분석을 전면 중단!
-                if getattr(self, 'panic_mode', False): 
-                    self.sig_log.emit("🛑 스캔 중 긴급 청산 감지! 모든 신규 종목 탐색을 즉시 중단합니다.", "warning")
-                    break
+                if not self.is_running or getattr(self, 'panic_mode', False): 
+                    self.sig_log.emit("🛑 스캔 도중 자동매매 중지 감지! 남은 종목 분석을 즉시 중단합니다.", "warning")
+                    break 
 
                 if code in self.mw.my_holdings: continue 
 
                 prob = -1.0; curr_price = 0.0; df_feat = None
 
-                # 차트 데이터를 분석해 AI 예측 확률을 가져옵니다.
                 try: prob, curr_price, df_feat = self.mw.get_ai_probability(code)
                 except Exception as e: continue
                 
+                # 에러, 상장폐지, 데이터 부족 등으로 걸러지는 종목은 패스 (카운트하지 않음)
                 if prob == -1.0 or curr_price <= 0 or np.isnan(curr_price): continue 
 
+                # 정상적으로 분석된 종목만 리스트에 담습니다.
                 stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code) 
                 scanned_log_list.append({'name': stock_name, 'prob': prob})
                 
                 try: ai_limit = float(db_temp.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
                 except: ai_limit = 0.70
                 
-                # 시장 데이터 파싱
                 if df_feat is not None and not df_feat.empty:
                     strat_signal = self.mw.strategy_engine.check_trade_signal(df_feat, code)
                     
@@ -585,12 +640,14 @@ class AutoTradeWorker(QThread):
                 try: db_temp.update_realtime(code, curr_price, prob*100, "NO", "탐색 및 분석 중...")
                 except: pass
                 
-                # ✅ 스캔 속도 딜레이도 DB에서 조절할 수 있게 세팅 (기본 0.2초 = 1초에 5종목만 안전하게 검사)
                 try: scan_delay = float(db_temp.get_shared_setting("TRADE", "SCAN_DELAY", "0.2"))
                 except: scan_delay = 0.2
                 time.sleep(scan_delay)
+
+                # 🔥 [목표 달성 체크] 정상적으로 분석된 종목이 'MIN_SCAN_STOCKS' (60개)를 채우면 스캔 종료!
+                if len(scanned_log_list) >= min_scan_stocks:
+                    break
             
-            # 스캔 결과 요약
             if scanned_log_list:
                 scanned_log_list = sorted(scanned_log_list, key=lambda x: x['prob'], reverse=True)
                 top_list = scanned_log_list[:3] 
@@ -598,17 +655,17 @@ class AutoTradeWorker(QThread):
                 try: ai_limit_display = float(db_temp.get_shared_setting("AI", "THRESHOLD", "70.0"))
                 except: ai_limit_display = 70.0
                 
-                if candidates: self.sig_log.emit(f"🔥 [실시간 랭커 스캔 완료] 시장 주도주 {len(scan_targets)}개 집중분석. TOP 3: {top_msg} 👉 기준 통과! 매수 진입", "send")
-                else: self.sig_log.emit(f"🔎 [실시간 랭커 스캔 완료] 시장 주도주 {len(scan_targets)}개 집중분석. TOP 3: {top_msg} 👉 기준치({ai_limit_display}%) 미달", "warning")
+                # 🔥 스캔한 실제 종목 개수를 로그에 띄워줍니다!
+                actual_scanned_count = len(scanned_log_list)
+                if candidates: self.sig_log.emit(f"🔥 [실시간 랭커 스캔 완료] 시장 주도주 {actual_scanned_count}개 집중분석. TOP 3: {top_msg} 👉 기준 통과! 매수 진입", "send")
+                else: self.sig_log.emit(f"🔎 [실시간 랭커 스캔 완료] 시장 주도주 {actual_scanned_count}개 집중분석. TOP 3: {top_msg} 👉 기준치({ai_limit_display}%) 미달", "warning")
 
-            # 통과한 종목들 매수 진행
             if candidates:
                 candidates = sorted(candidates, key=lambda x: x['prob'], reverse=True)
                 for i in range(min(needed_count, len(candidates))):
-                    # 🔥 [긴급 멈춤 스위치 3] 실제 매수 주문을 쏘기 직전, 마지막으로 긴급 청산 여부 확인!
-                    if getattr(self, 'panic_mode', False): 
-                        self.sig_log.emit("🛑 매수 진입 직전 긴급 청산 감지! 주문 발송을 취소합니다.", "warning")
-                        break
+                    if not self.is_running or getattr(self, 'panic_mode', False): 
+                        self.sig_log.emit("🛑 매수 진입 직전 중지 감지! 발송을 취소합니다.", "warning")
+                        break 
 
                     target = candidates[i]; code = target['code']; curr_price = float(target['price']); prob = target['prob']
                     stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code) 
@@ -627,7 +684,6 @@ class AutoTradeWorker(QThread):
                         self.sig_log.emit(f"⚠️ [{stock_name}] 매수 자금 부족으로 스킵 (필요금액: {curr_price:,.0f}원 / 잔고: {my_cash:,.0f}원)", "warning")
                         continue
 
-                    # ✅ [수정 완료] 기존의 일반 매수 함수 대신, 방어막과 AI 재판단이 포함된 execute_guaranteed_buy 를 사용!
                     if buy_qty > 0 and self.execute_guaranteed_buy(code, buy_qty):
                         self.mw.my_holdings[code] = {'price': curr_price, 'qty': buy_qty, 'high_watermark': curr_price, 'buy_time': now, 'half_sold': False}
                         my_cash -= (curr_price * buy_qty) 
@@ -645,7 +701,6 @@ class AutoTradeWorker(QThread):
                         self.sig_account_df.emit(temp_df[acc_cols]) 
                         self.sig_sync_cs.emit()                     
 
-        # DB 업데이트를 위한 최종 데이터 정리 및 UI 시그널 전송
         if account_rows: account_rows[0]['주문가능금액'] = f"{my_cash:,}" 
         else: account_rows.append({'종목코드': '-', '종목명': '보유종목 없음', '보유수량': 0, '평균매입가': '0', '현재가': '0', '평가손익금': '0', '수익률': '0.00%', '주문가능금액': f"{my_cash:,}"})
         
@@ -671,13 +726,12 @@ class AutoTradeWorker(QThread):
                 if c not in df_str.columns: df_str[c] = "0"
             self.sig_strategy_df.emit(df_str[str_cols])
             
-        self.sig_sync_cs.emit() # C#으로 데이터를 넘기라는 신호
+        self.sig_sync_cs.emit() 
         self.sig_log.emit("📡 [시스템] DB 데이터 동기화 완료!", "info")
 
         if getattr(self, 'panic_mode', False) and len(self.mw.my_holdings) == 0:
             self.sig_log.emit("🛑 [긴급 청산 완료] 모든 종목이 전량 매도되었습니다. 자동매매를 종료합니다.", "warning")
             self.panic_mode = False; self.is_running = False; self.sig_panic_done.emit()
-
 
 # =====================================================================
 # 🖥️ 메인 UI 클래스 (프로그램의 시작점)
@@ -701,6 +755,10 @@ class FormMain(QtWidgets.QMainWindow):
             conn.execute("DELETE FROM MarketStatus")
             conn.execute("DELETE FROM AccountStatus")
             conn.execute("DELETE FROM StrategyStatus")
+            
+            # 🔥 [추가] 프로그램 켤 때 주문 영수증(TradeHistory)도 싹 지워줍니다!
+            conn.execute("DELETE FROM TradeHistory") 
+            conn.commit()
             conn.close()
             self.db.insert_log("INFO", "🧹 [시스템] 이전 실시간 DB 데이터를 성공적으로 초기화했습니다.")
         except Exception as e:
@@ -771,18 +829,11 @@ class FormMain(QtWidgets.QMainWindow):
         REST_API_KEY = self.db.get_shared_setting("KAKAO", "REST_API_KEY", "4cbe02304c893a129a812045d5f200a3")
 
         try:
-            import json, os, requests
-            gui_dir = os.path.dirname(os.path.abspath(__file__))
-            root_dir = os.path.dirname(gui_dir)
-            path_candidates = [os.path.join(gui_dir, "kakao_token.json"), os.path.join(root_dir, "kakao_token.json"), os.path.join(root_dir, "COMMON", "kakao_token.json")]
+            import json, requests
+            # 🔥 여기서 스마트 경로 호출!
+            token_path = get_smart_path("kakao_token.json")
             
-            token_path = None
-            for path in path_candidates:
-                if os.path.exists(path):
-                    token_path = path; break
-                    
-            if token_path is None: return False
-            
+            if not os.path.exists(token_path): return False
             with open(token_path, "r") as fp: tokens = json.load(fp)
             
             url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
@@ -848,11 +899,14 @@ class FormMain(QtWidgets.QMainWindow):
     def btnDataSendClickEvent(self):
         # 파이썬에서 계산된 데이터(표)들을 SQLite DB에 업데이트하는 함수
         def clean_num(val): 
+            # 모든 콤마(,)를 제거하여 순수 숫자 문자열로 만듭니다.
             v = str(val).replace(",", "").replace("%", "").strip()
             if v.lower() in ["", "nan", "inf", "-inf", "infinity"]: return "0.0"
             if v == "-": return "0.0" 
-            try: return str(float(v))
-            except ValueError: return "0.0"
+            try: 
+                return str(float(v)) # C#이 읽기 좋게 깨끗한 숫자로 반환
+            except ValueError: 
+                return "0.0"
 
         def get_symbol(row):
             sym = str(row.get("종목코드", ""))
@@ -1114,6 +1168,22 @@ class FormMain(QtWidgets.QMainWindow):
             if self.trade_worker.isRunning():
                 self.add_log("⚠️ 이전 감시망이 아직 안전하게 종료 중입니다. 잠시 후 다시 눌러주세요.", "warning")
                 return
+            
+            # 🔥 [추가] 자동매매 시작(GO) 버튼을 누를 때마다 이전 주문/매매 기록 싹 비우기
+            try:
+                conn = self.db._get_connection(self.db.shared_db_path)
+                conn.execute("DELETE FROM TradeHistory") # DB에서 영수증 삭제
+                conn.commit()
+                conn.close()
+                
+                # 파이썬 UI 화면의 표 데이터도 깔끔하게 초기화
+                TradeData.order.df = pd.DataFrame(columns=['종목코드','종목명','주문종류','주문가격','주문수량','체결수량','주문시간','상태','수익률'])
+                self.tbOrder.setRowCount(0)
+                
+                self.add_log("🧹 [시스템] 새로운 매매 시작! 이전 주문 기록(TradeHistory)을 깨끗하게 비웠습니다.", "info")
+            except Exception as e:
+                self.add_log(f"⚠️ 주문 기록 초기화 실패: {e}", "warning")
+
             self.trade_worker.panic_mode = False 
             self.trade_worker.start()
             self.btnAutoDataTest.setText("자동 매매 중단 (STOP)")

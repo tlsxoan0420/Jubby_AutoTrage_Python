@@ -37,7 +37,8 @@ def train_jubby_brain(log_callback=None):
 
     # 💡 위에서 불러온 글로벌 os 모듈을 정상적으로 사용합니다.
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    root_dir = os.path.dirname(os.path.dirname(current_dir))
+    # 🔥 3칸 위로 올라가서 Jubby Project를 가리키게 합니다.
+    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
     
     send_log("📡 SQL 데이터베이스에서 누적된 빅데이터를 불러오는 중입니다...", "INFO")
     db.update_system_status('TRAINER', 'DB 데이터 로드 중', 10)
@@ -179,8 +180,12 @@ def train_jubby_brain(log_callback=None):
     elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES": model_name = "jubby_brain_futures.pkl" 
     else: model_name = "jubby_brain_temp.pkl"
         
-    save_path = os.path.join(root_dir, model_name)
-    joblib.dump(ensemble_model, save_path) 
+    # 🔥 여기도 스마트 경로 적용!
+    import sys
+    if getattr(sys, 'frozen', False): save_path = os.path.join(os.path.dirname(sys.executable), model_name)
+    else: save_path = os.path.join(root_dir, model_name)
+    
+    joblib.dump(ensemble_model, save_path)
     
     send_log(f"💾 [저장 완료] 맞춤형 완벽한 뇌({model_name})가 이식되었습니다!", "SUCCESS")
     db.insert_ai_train_log(model_name=model_name, accuracy=final_accuracy, data_count=total_data_count)

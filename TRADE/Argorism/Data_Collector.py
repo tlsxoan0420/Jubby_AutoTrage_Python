@@ -13,10 +13,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # =====================================================================
 # 현재 파일의 위치를 기준으로 3단계 위(루트 폴더)를 시스템 경로에 추가합니다.
 # 이렇게 해야 COMMON 폴더 안의 모듈들을 에러 없이 불러올 수 있습니다.
-root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if root_dir not in sys.path:
     sys.path.append(root_dir)
-
+    
 import COMMON.KIS_Manager as KIS
 from COMMON.Flag import SystemConfig 
 from COMMON.DB_Manager import JubbyDB_Manager 
@@ -304,7 +304,13 @@ class UltraDataCollector:
         """
         [내부 함수] 발급받은 소중한 토큰을 23시간 동안 기억하도록 파일에 저장합니다.
         """
-        token_file = "kis_token_cache.json"
+        import sys, os
+        # 🔥 스마트 경로 적용: EXE 모드면 EXE 옆에, 아니면 프로젝트 최상단 폴더에 저장
+        if getattr(sys, 'frozen', False): 
+            token_file = os.path.join(os.path.dirname(sys.executable), "kis_token_cache.json")
+        else: 
+            token_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "kis_token_cache.json")
+        
         save_data = {
             "access_token": token,
             "expire_time": (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
@@ -320,7 +326,12 @@ class UltraDataCollector:
         [핵심 함수] 토큰을 파일에서 읽어오고, 실패하면 서버에 요청하되 
         1분 제한에 걸리면 죽지 않고 60초 기다렸다가 다시 가져오는 불사조 로직입니다.
         """
-        token_file = "kis_token_cache.json"
+        import sys, os
+        # 🔥 동일하게 스마트 경로 적용
+        if getattr(sys, 'frozen', False): 
+            token_file = os.path.join(os.path.dirname(sys.executable), "kis_token_cache.json")
+        else: 
+            token_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "kis_token_cache.json")
         
         # 1. 파일이 존재하는지 검사
         if os.path.exists(token_file):

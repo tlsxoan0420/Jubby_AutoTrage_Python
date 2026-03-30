@@ -2,34 +2,29 @@ import sqlite3
 import os
 import datetime
 import pandas as pd  
+import sys, os
 
+def get_smart_path(filename):
+    """ EXE 모드와 개발(Script) 모드를 자동으로 구분하여 경로를 반환합니다. """
+    import sys, os
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(sys.executable)
+        return os.path.join(base_path, filename)
+    else:
+        # 🔥 COMMON 폴더에 있으므로 2칸 위(Jubby Project)로 올라갑니다!
+        base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return os.path.join(base_path, filename)
+    
 class JubbyDB_Manager:
     def __init__(self):
-        """
-        [생성자] 주삐 투 트랙 DB 매니저
-        프로그램이 켜질 때 제일 먼저 실행되어, 주삐가 데이터를 기록할 '공책(DB)'을 준비합니다.
-        """
-        
-        # 🔥 하드코딩 완전 삭제! 현재 파일 위치를 기준으로 부모의 부모 폴더를 알아서 찾아갑니다.
-        # 1. os.path.abspath(__file__): 현재 파일(DB_Manager.py)의 절대 경로
-        # 2. dirname 1번: COMMON 폴더
-        # 3. dirname 2번: Jubby_AutoTrage_Python 폴더
-        # 4. dirname 3번: Jubby Project 폴더 (C#과 공유하는 최종 목표 폴더!)
-        
-        current_file_path = os.path.abspath(__file__)
-        common_dir = os.path.dirname(current_file_path)
-        python_project_dir = os.path.dirname(common_dir)
-        
-        self.base_path = os.path.dirname(python_project_dir) 
-        
-        if not os.path.exists(self.base_path):
-            os.makedirs(self.base_path)
-
-        self.shared_db_path = os.path.join(self.base_path, "jubby_shared.db")
-        self.python_db_path = os.path.join(self.base_path, "jubby_python.db")
+        """ [생성자] 주삐 투 트랙 DB 매니저 """
+        # 🔥 복잡한 os.path.dirname 싹 다 지우고 스마트 경로로 바로 연결!
+        self.shared_db_path = get_smart_path("jubby_shared.db")
+        self.python_db_path = get_smart_path("jubby_python.db")
 
         self._initialize_shared_db()
         self._initialize_python_db()
+        
     # =======================================================================
     # 🔌 외부 연결 통로 개방 (C#과의 락(Lock) 충돌 완벽 방지)
     # =======================================================================
