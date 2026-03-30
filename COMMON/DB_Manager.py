@@ -9,7 +9,18 @@ class JubbyDB_Manager:
         [생성자] 주삐 투 트랙 DB 매니저
         프로그램이 켜질 때 제일 먼저 실행되어, 주삐가 데이터를 기록할 '공책(DB)'을 준비합니다.
         """
-        self.base_path = r"C:\Users\atrjk\OneDrive\바탕 화면\Program\04.Taemoo\Jubby Project"
+        
+        # 🔥 하드코딩 완전 삭제! 현재 파일 위치를 기준으로 부모의 부모 폴더를 알아서 찾아갑니다.
+        # 1. os.path.abspath(__file__): 현재 파일(DB_Manager.py)의 절대 경로
+        # 2. dirname 1번: COMMON 폴더
+        # 3. dirname 2번: Jubby_AutoTrage_Python 폴더
+        # 4. dirname 3번: Jubby Project 폴더 (C#과 공유하는 최종 목표 폴더!)
+        
+        current_file_path = os.path.abspath(__file__)
+        common_dir = os.path.dirname(current_file_path)
+        python_project_dir = os.path.dirname(common_dir)
+        
+        self.base_path = os.path.dirname(python_project_dir) 
         
         if not os.path.exists(self.base_path):
             os.makedirs(self.base_path)
@@ -19,7 +30,6 @@ class JubbyDB_Manager:
 
         self._initialize_shared_db()
         self._initialize_python_db()
-
     # =======================================================================
     # 🔌 외부 연결 통로 개방 (C#과의 락(Lock) 충돌 완벽 방지)
     # =======================================================================
@@ -100,8 +110,9 @@ class JubbyDB_Manager:
             conn.execute("DELETE FROM AccountStatus")
             conn.executemany('INSERT INTO AccountStatus (symbol, symbol_name, quantity, avg_price, current_price, pnl_amt, pnl_rate, available_cash) VALUES (:symbol, :symbol_name, :quantity, :avg_price, :current_price, :pnl_amt, :pnl_rate, :available_cash)', data_list)
             conn.execute("COMMIT;")
-        except Exception:
+        except Exception as e: # 🚨 'as e' 를 추가!
             conn.execute("ROLLBACK;")
+            print(f"🔥 Account DB 에러: {e}") # 🚨 에러 내용을 파이썬 창에 띄우도록 추가!
         finally:
             conn.close()
 

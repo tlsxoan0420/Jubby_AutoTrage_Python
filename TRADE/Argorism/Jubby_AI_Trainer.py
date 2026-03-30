@@ -71,13 +71,13 @@ def train_jubby_brain(log_callback=None):
     # =========================================================================
     # 🔥 [핵심 고도화] 극단적 쫄보 현상(데이터 불균형)을 해결하는 스케일링 가중치 계산
     # =========================================================================
-    num_pos = sum(y_train == 1) # V자 반등이 일어난 희귀한 데이터 개수
-    num_neg = sum(y_train == 0) # 아무 일도 안 일어난 일반 데이터 개수
-    
-    # 반등(1) 맞추기에 주는 보너스 점수 배율 계산 (AI의 공격성을 높입니다)
+    num_pos = sum(y_train == 1) # 스캘핑 성공(10분 내 1.5% 급등) 희귀 데이터 개수
+    num_neg = sum(y_train == 0) # 일반 데이터 개수
+        
+    # 스캘핑 타점(1) 맞추기에 주는 보너스 점수 배율 계산 (AI의 공격성을 높입니다)
     scale_weight = num_neg / num_pos if num_pos > 0 else 1.0
-    send_log(f"⚖️ [AI 스케일링 보정] V자 반등 포착 가중치({scale_weight:.2f}배) 장착 완료!", "SUCCESS")
-
+    send_log(f"⚖️ [AI 스케일링 보정] 초단타 스캘핑 포착 가중치({scale_weight:.2f}배) 장착 완료!", "SUCCESS")
+    
     # =========================================================================
     # 🤖 [Phase 1] Optuna: XGBoost 튜닝
     # =========================================================================
@@ -100,8 +100,13 @@ def train_jubby_brain(log_callback=None):
         model.fit(X_train, y_train, verbose=False)
         return accuracy_score(y_test, model.predict(X_test))
 
+    # ✅ DB에 값이 없으면 "20"을 DB에 자동으로 저장하고 가져옵니다.
+    try: xgb_trials = int(db.get_shared_setting("AI_TRAIN", "XGB_TRIALS", "20"))
+    except: xgb_trials = 20
+
     xgb_study = optuna.create_study(direction='maximize')
-    xgb_study.optimize(xgb_objective, n_trials=20) 
+    xgb_study.optimize(xgb_objective, n_trials=xgb_trials) 
+    
     best_xgb_params = xgb_study.best_params 
     best_xgb_params['tree_method'] = 'hist'
     best_xgb_params['device'] = 'cuda'
@@ -136,8 +141,13 @@ def train_jubby_brain(log_callback=None):
         model.fit(X_train, y_train)
         return accuracy_score(y_test, model.predict(X_test))
 
+    # ✅ DB에 값이 없으면 "20"을 DB에 자동으로 저장하고 가져옵니다.
+    try: lgb_trials = int(db.get_shared_setting("AI_TRAIN", "LGB_TRIALS", "20"))
+    except: lgb_trials = 20
+
     lgb_study = optuna.create_study(direction='maximize')
-    lgb_study.optimize(lgb_objective, n_trials=20)
+    lgb_study.optimize(lgb_objective, n_trials=lgb_trials)
+    
     best_lgb_params = lgb_study.best_params
     best_lgb_params['n_jobs'] = -1
     best_lgb_params['verbose'] = -1
@@ -175,10 +185,6 @@ def train_jubby_brain(log_callback=None):
     send_log(f"💾 [저장 완료] 맞춤형 완벽한 뇌({model_name})가 이식되었습니다!", "SUCCESS")
     db.insert_ai_train_log(model_name=model_name, accuracy=final_accuracy, data_count=total_data_count)
     db.update_system_status('TRAINER', '학습 완료!', 100)
-
-    # 🔥 프로그램 종료 시 팅김(메모리 락 충돌) 방지를 위한 깔끔한 퇴근 명령
-    # 위에 이미 import os가 있으므로 바로 강제 종료를 호출합니다.
-    os._exit(0)
 
 if __name__ == "__main__":
     train_jubby_brain()

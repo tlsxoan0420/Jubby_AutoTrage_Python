@@ -145,20 +145,30 @@ class JubbyStrategy:
     # =====================================================================
     def get_dynamic_exit_prices(self, df, avg_buy_price):
         """ 스캘핑(초단타)에 맞게 익절은 1.2%, 손절은 -1.0%로 매우 짧게 잡아 회전율을 극대화합니다. """
+        
+        # ✅ DB에 없으면 기존 세팅값인 1.2, 1.0, 1.5, 1.0을 DB에 자동 등록합니다!
+        try:
+            profit_rate = float(self.db.get_shared_setting("TRADE", "PROFIT_RATE", "1.2")) / 100.0
+            stop_rate = float(self.db.get_shared_setting("TRADE", "STOP_RATE", "1.0")) / 100.0
+            atr_target_multi = float(self.db.get_shared_setting("TRADE", "ATR_TARGET_MULTI", "1.5"))
+            atr_stop_multi = float(self.db.get_shared_setting("TRADE", "ATR_STOP_MULTI", "1.0"))
+        except:
+            profit_rate, stop_rate = 0.012, 0.010
+            atr_target_multi, atr_stop_multi = 1.5, 1.0
+
         if len(df) == 0 or avg_buy_price <= 0:
-            return avg_buy_price * 1.012, avg_buy_price * 0.990 
+            return avg_buy_price * (1.0 + profit_rate), avg_buy_price * (1.0 - stop_rate)
 
         current = df.iloc[-1]
         atr = current['ATR']
 
-        # 초단타 기본 마지노선: 익절 +1.2%, 손절 -1.0%
-        target_price = avg_buy_price * 1.012
-        stop_price = avg_buy_price * 0.990
+        target_price = avg_buy_price * (1.0 + profit_rate)
+        stop_price = avg_buy_price * (1.0 - stop_rate)
         
         # 시장 변동성(ATR)이 미쳐 날뛸 때만 위아래 폭을 살짝 넓혀줍니다.
         if atr > avg_buy_price * 0.01:
-            target_price = avg_buy_price + (atr * 1.5)
-            stop_price = avg_buy_price - (atr * 1.0)
+            target_price = avg_buy_price + (atr * atr_target_multi)
+            stop_price = avg_buy_price - (atr * atr_stop_multi)
             
         return target_price, stop_price
 
@@ -183,6 +193,8 @@ class JubbyStrategy:
             features = self.get_ai_features(df)
             if features is not None:
                 ai_prob = self.ai_model.predict_proba(features)[0][1]
+                
+                # ✅ AI 임계값 DB 연동
                 try: ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
                 except: ai_threshold = 0.70
                 
@@ -190,9 +202,16 @@ class JubbyStrategy:
                     self.send_log(f"🤖 [AI 시그널] {code} 떡상 징후 포착! (상승 확률: {ai_prob*100:.1f}% / 기준: {ai_threshold*100:.0f}%) -> 강력 매수!", "buy")
                     buy_signal = True
         
-        # 2. [전략 A & B] 아날로그 돌파/추세 매매 로직 (AI가 못 잡는 급등 초입 낚아채기)
-        # 조건: 거래량이 5분 평균 대비 2배 이상 터지고(Vol_Energy >= 2.0) + 세력 평단가(VWAP)를 뚫고 올라갈 때!
-        if not buy_signal and current['Vol_Energy'] >= 2.0 and curr_price > current['VWAP'] and current['return'] > 0.5:
+        # 2. [전략 A & B] 아날로그 돌파/추세 매매 로직 (DB에서 기준값 로드)
+        # ✅ DB에 돌파 기준값이 없으면 기존값인 거래량 2.0배, 등락률 0.5%를 등록합니다.
+        try:
+            breakout_vol = float(self.db.get_shared_setting("TRADE", "BREAKOUT_VOL", "2.0")) 
+            breakout_ret = float(self.db.get_shared_setting("TRADE", "BREAKOUT_RET", "0.5")) 
+        except:
+            breakout_vol, breakout_ret = 2.0, 0.5
+
+        # 조건: 거래량이 평균 대비 돌파 배수 이상 터지고 + 세력 평단가(VWAP) 뚫고 + 기준 % 이상 오를 때
+        if not buy_signal and current['Vol_Energy'] >= breakout_vol and curr_price > current['VWAP'] and current['return'] > breakout_ret:
             self.send_log(f"🔥 [돌파 매매] {code} 거래량 폭발 & 세력선(VWAP) 돌파 포착! -> 추격 매수!", "buy")
             buy_signal = True
 
@@ -212,11 +231,16 @@ class JubbyStrategy:
         if current['MACD'] < current['Signal_Line'] and curr_price < current['MA5']:
             return "SELL"
             
+        # ✅ 매도 폭탄 감지를 위한 RSI 과열 기준치 DB 연동 (기존 75.0)
+        try: sell_rsi = float(self.db.get_shared_setting("TRADE", "SELL_RSI", "75.0"))
+        except: sell_rsi = 75.0
+
         # 2. 거래량이 말라버린 채로 긴 윗꼬리를 달고 내려꽂을 때 (매도 폭탄)
         body_size = abs(current['open'] - current['close'])
         is_heavy_selling_pressure = current['High_Tail'] > body_size and current['High_Tail'] > 0
-        if current['RSI'] >= 75 and is_heavy_selling_pressure:
-            self.send_log(f"💡 [전략엔진] {code} 고점 매도 폭탄(긴 윗꼬리) 발생 -> 긴급 탈출!", "sell")
+        if current['RSI'] >= sell_rsi and is_heavy_selling_pressure:
+            # 💡 텍스트를 스캔/보유 상황 모두 어울리게 변경합니다.
+            self.send_log(f"💡 [전략엔진] {code} 고점 매도 폭탄(긴 윗꼬리) 차트 감지 -> 매수 차단 및 탈출 신호!", "sell")
             return "SELL"
-            
+        
         return "WAIT"

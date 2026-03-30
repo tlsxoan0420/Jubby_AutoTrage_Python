@@ -350,19 +350,24 @@ class KIS_Manager:
         """ 매니저 클래스: 복잡한 API 통신 로직을 감싸서 밖에서는 편하게 함수만 부를 수 있게 해줍니다. """
         self.ui = ui_main 
         
-        self.APP_KEY = "PSargEXRJo0zf5vOG1HAAKr7bKX9VKDzBhjy"
-        self.APP_SECRET = "3IS6VELZscyON3lhpinnbWf9I6+oCfFR+k5+XyreSvnwgi1IFaOFlN4M35ZL8IvTidXiSWws+qCe8Y015l/w2VN8kVC/BHmncRwLBVZUxICBE6RcVt3JsPp/xlHyjo1meR0XWqU8yqlIUkOcib3HfSamhnpiCKFalhlVeyYcgU3uP/1UWP8="
+        # 🔥 [DB 연동] 설정값을 DB에서 불러옵니다. (없으면 기본값으로 DB에 자동 생성됨)
+        self.db = JubbyDB_Manager()
         
-        # 🔥 [수정] 모드에 따라 사용하는 계좌번호를 다르게 셋팅합니다!
+        self.APP_KEY = self.db.get_shared_setting("KIS_API", "APP_KEY", "PSargEXRJo0zf5vOG1HAAKr7bKX9VKDzBhjy")
+        self.APP_SECRET = self.db.get_shared_setting("KIS_API", "APP_SECRET", "3IS6VELZscyON3lhpinnbWf9I6+oCfFR+k5+XyreSvnwgi1IFaOFlN4M35ZL8IvTidXiSWws+qCe8Y015l/w2VN8kVC/BHmncRwLBVZUxICBE6RcVt3JsPp/xlHyjo1meR0XWqU8yqlIUkOcib3HfSamhnpiCKFalhlVeyYcgU3uP/1UWP8=")
+        
+        # 모의투자 여부 (DB에는 문자열로 저장되므로 TRUE/FALSE로 비교)
+        is_mock_str = self.db.get_shared_setting("KIS_API", "IS_MOCK", "TRUE")
+        self.IS_MOCK = True if is_mock_str.upper() == "TRUE" else False
+        
+        # 🔥 모드에 따라 사용하는 계좌번호를 DB에서 다르게 셋팅합니다!
         if SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
-            self.ACCOUNT_NO = "60039684" # 🚀 해외선물옵션 전용 계좌
+            self.ACCOUNT_NO = self.db.get_shared_setting("KIS_API", "FUTURES_ACCOUNT", "60039684")
         else:
-            self.ACCOUNT_NO = "50172151" # 🇰🇷/🌐 주식 전용 계좌
+            self.ACCOUNT_NO = self.db.get_shared_setting("KIS_API", "STOCK_ACCOUNT", "50172151")
             
-        self.IS_MOCK = True # 현재 모의투자 상태
-        
         # 위에서 만든 API 통신 전담 직원을 고용합니다.
-        self.api = KIS_API(self.APP_KEY, self.APP_SECRET, self.ACCOUNT_NO, is_mock=self.IS_MOCK, log_callback=self._log)
+        self.api = KIS_API(self.APP_KEY, self.APP_SECRET, self.ACCOUNT_NO, is_mock=self.IS_MOCK, log_callback=self._log)    
 
     def start_api(self):
         self._log("🎫 KIS API 접속 시도 중...", "info")
