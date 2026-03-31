@@ -180,10 +180,8 @@ def train_jubby_brain(log_callback=None):
     elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES": model_name = "jubby_brain_futures.pkl" 
     else: model_name = "jubby_brain_temp.pkl"
         
-    # 🔥 여기도 스마트 경로 적용!
-    import sys
-    if getattr(sys, 'frozen', False): save_path = os.path.join(os.path.dirname(sys.executable), model_name)
-    else: save_path = os.path.join(root_dir, model_name)
+    # 🟢 [수정] 무조건 자동 탐색된 공통 최상위 폴더에 AI 뇌를 저장합니다!
+    save_path = os.path.join(SystemConfig.PROJECT_ROOT, model_name)
     
     joblib.dump(ensemble_model, save_path)
     

@@ -4,6 +4,13 @@ import datetime
 import pandas as pd  
 import sys, os
 
+# 방금 만든 공통 경로를 불러옵니다.
+from COMMON.Flag import SystemConfig 
+
+def get_smart_path(filename):
+    """ 하드코딩 없이 무조건 최상위 경로(SystemConfig.PROJECT_ROOT)를 바라봄 """
+    return os.path.join(SystemConfig.PROJECT_ROOT, filename)
+
 def get_smart_path(filename):
     """ EXE 모드와 개발(Script) 모드를 자동으로 구분하여 경로를 반환합니다. """
     import sys, os

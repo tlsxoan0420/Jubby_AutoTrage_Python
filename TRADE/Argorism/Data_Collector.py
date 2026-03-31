@@ -341,11 +341,7 @@ class UltraDataCollector:
         1분 제한에 걸리면 죽지 않고 60초 기다렸다가 다시 가져오는 불사조 로직입니다.
         """
         import sys, os
-        # 🔥 동일하게 스마트 경로 적용
-        if getattr(sys, 'frozen', False): 
-            token_file = os.path.join(os.path.dirname(sys.executable), "kis_token_cache.json")
-        else: 
-            token_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "kis_token_cache.json")
+        token_file = os.path.join(SystemConfig.PROJECT_ROOT, "kis_token_cache.json")
         
         # 1. 파일이 존재하는지 검사
         if os.path.exists(token_file):

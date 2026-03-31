@@ -31,15 +31,10 @@ class JubbyStrategy:
         try:
 
             import sys, os
+            
             def get_smart_path(filename):
-                import sys, os
-                if getattr(sys, 'frozen', False): 
-                    return os.path.join(os.path.dirname(sys.executable), filename)
-                else:
-                    # 🔥 깊은 폴더에 있으므로 3칸 위로 뚫고 올라갑니다!
-                    base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-                    return os.path.join(base_path, filename)
-
+                return os.path.join(SystemConfig.PROJECT_ROOT, filename)
+            
             # 🔥 모드에 따른 분기 처리 경로 변경!
             if SystemConfig.MARKET_MODE == "DOMESTIC":
                 model_path = get_smart_path("jubby_brain.pkl")
@@ -60,7 +55,9 @@ class JubbyStrategy:
                 self.send_log(msg, "success")
             else:
                 self.ai_model = None
-                msg = f"⚠️ {market_icon} 맞춤형 AI 뇌 파일이 없습니다. (Jubby AI Trainer를 먼저 돌려주세요!)"
+                
+                # 🟢 [핵심 수정] 도대체 어디서 찾고 있는지 'model_path'를 로그에 직접 찍어봅니다!
+                msg = f"⚠️ {market_icon} AI 뇌 파일 없음!\n👉 찾는 위치: {model_path}"
                 self.send_log(msg, "warning")
                 
         except Exception as e:
@@ -158,22 +155,26 @@ class JubbyStrategy:
     # 🤖 2. [AI 입력용 데이터 변환기] (학습기와 피처 순서 100% 일치 필수)
     # =====================================================================
     def get_ai_features(self, df):
-        if len(df) == 0: return None
+        if df is None or len(df) == 0: return None
         
-        # 🔥 [핵심 수정] 새롭게 추가된 3가지 지표를 AI 입력값 명단에 추가합니다.
-        # 주의: Trainer.py와 Data_Collector.py에도 동일한 순서로 있어야 합니다.
         features = [
             'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
             'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
             'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
-            'Disparity_60', 'Disparity_120', 'Macro_Trend' # 🟢 추가된 3인방
+            'Disparity_60', 'Disparity_120', 'Macro_Trend'
         ]
         
+        # 🟢 [핵심 추가] 데이터에 AI가 필요로 하는 18개 컬럼이 모두 정상적으로 있는지 검사합니다.
+        # (아직 120봉이 안 모여서 지표 계산이 스킵된 종목은 에러를 뿜지 않고 조용히 패스합니다!)
+        if not all(col in df.columns for col in features):
+            return None
+            
         try:
             current_data = df.iloc[-1][features].values.astype(float)
             return current_data.reshape(1, -1)
         except Exception as e:
-            self.send_log(f"🚨 AI 피처 변환 에러 (피처 개수 불일치 가능성): {e}", "error")
+            # 진짜 알 수 없는 심각한 에러일 때만 로그를 띄웁니다.
+            self.send_log(f"🚨 AI 피처 변환 에러: {e}", "error")
             return None
 
     # =====================================================================
@@ -192,7 +193,8 @@ class JubbyStrategy:
             profit_rate, stop_rate = 0.012, 0.010
             atr_target_multi, atr_stop_multi = 1.5, 1.0
 
-        if len(df) == 0 or avg_buy_price <= 0:
+        # 🟢 [수정] 거시 지표를 위해 최소 120봉이 필요하므로 조건을 맞춤
+        if len(df) < 120 or avg_buy_price <= 0:
             return avg_buy_price * (1.0 + profit_rate), avg_buy_price * (1.0 - stop_rate)
 
         current = df.iloc[-1]
@@ -213,7 +215,8 @@ class JubbyStrategy:
     # =====================================================================
     def check_trade_signal(self, df, code):
         """ 실시간 데이터를 보고 매수/매도할지 결정하는 가장 중요한 두뇌입니다. """
-        if len(df) < 26: return "WAIT"
+        # 🟢 [수정] MA120 지표 계산을 위해 최소 120개의 데이터가 찰 때까지 기다립니다.
+        if len(df) < 120: return "WAIT"
         
         current = df.iloc[-1]
         curr_price = float(current['close']) 
