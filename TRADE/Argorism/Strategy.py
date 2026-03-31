@@ -78,42 +78,44 @@ class JubbyStrategy:
     # 📊 1. [초단타 퀀트 지표] VWAP, 거래량 돌파 에너지 등 실시간 계산
     # =====================================================================
     def calculate_indicators(self, df):
-        """ 실시간 1분봉 데이터를 받아 초단타에 특화된 15개 지표를 계산합니다. """
-        if df is None or len(df) < 30: return df
-        df = df.copy() # 원본 훼손 방지
+        """ 실시간 1분봉 데이터를 받아 초단타에 특화된 지표를 계산합니다. """
+        if df is None or len(df) < 120: return df # 🌳 거시 지표(MA120) 계산을 위해 최소 120봉 확보
+        df = df.copy() 
         
         try:
+            # --- [기존 지표 계산 로직 시작] ---
             df['return'] = df['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) * 100 
             
-            # 🌊 [전략 B] VWAP (거래량 가중 평균가 = 세력/당일 평단가) 추가
+            # VWAP (세력 평단가)
             df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
             df['TP_Volume'] = df['Typical_Price'] * df['volume']
             df['VWAP'] = df['TP_Volume'].cumsum() / (df['volume'].cumsum() + 1e-9)
 
-            # 🚀 [전략 A] 거래량 터짐(떡상) 에너지 지표 추가
+            # 거래량 에너지
             df['MA5_Vol'] = df['volume'].rolling(window=5).mean()
-            df['Vol_Energy'] = df['volume'] / (df['MA5_Vol'] + 1e-9) # 현재 거래량이 5분 평균의 몇 배인가?
+            df['Vol_Energy'] = df['volume'] / (df['MA5_Vol'] + 1e-9)
             df['vol_change'] = df['volume'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) 
 
-            # 기존 지표들
+            # RSI, MACD
             delta = df['close'].diff()
             up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
             rs = up.ewm(com=13).mean() / (down.ewm(com=13).mean() + 1e-9)
             df['RSI'] = 100 - (100 / (1 + rs))
-            
             df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
             df['Signal_Line'] = df['MACD'].ewm(span=9).mean()
             
+            # 이동평균선 및 볼린저 밴드
             df['MA5'] = df['close'].rolling(5).mean()
             df['MA20'] = df['close'].rolling(20).mean()
-            
             df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
             df['BB_Lower'] = df['MA20'] - (df['close'].rolling(20).std() * 2)
             df['BB_Width'] = ((df['BB_Upper'] - df['BB_Lower']) / (df['MA20'] + 1e-9)) * 100
             
+            # 이격도
             df['Disparity_5'] = (df['close'] / (df['MA5'] + 1e-9)) * 100
             df['Disparity_20'] = (df['close'] / (df['MA20'] + 1e-9)) * 100
 
+            # OBV 및 ATR
             direction = np.where(df['close'] > df['close'].shift(1), 1, -1)
             direction = np.where(df['close'] == df['close'].shift(1), 0, direction)
             obv = (df['volume'] * direction).cumsum()
@@ -124,11 +126,28 @@ class JubbyStrategy:
             tr3 = (df['low'] - df['close'].shift(1)).abs()
             df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
+            # 꼬리 및 매수압력 분석
             df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1)
             df['Low_Tail'] = df[['open', 'close']].min(axis=1) - df['low']
             df['Buying_Pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-9)
             
-            df['Market_Return_1m'] = getattr(self, 'market_return_1m', 0.0)
+            # --- [기존 지표 계산 로직 끝] ---
+
+            # =========================================================================
+            # 🟢 [Step 3 핵심 추가] 다중 시간대(Multi-Timeframe) 거시 추세 피처
+            # =========================================================================
+            # 1분봉 60개(1시간), 120개(2시간)의 이동평균선 계산
+            df['MA60'] = df['close'].rolling(60).mean()   # 1시간 추세 (큰 숲)
+            df['MA120'] = df['close'].rolling(120).mean() # 2시간 추세 (더 큰 숲)
+            
+            # 장기 이격도 (AI가 '현재 주가가 거시적으로 과열되었는가'를 판단함)
+            df['Disparity_60'] = (df['close'] / (df['MA60'] + 1e-9)) * 100
+            df['Disparity_120'] = (df['close'] / (df['MA120'] + 1e-9)) * 100
+            
+            # 거시 추세 정배열 점수 (1: 상승 추세, 0: 하락/역배열 추세)
+            # 💡 AI는 이 점수를 통해 '역배열 하락장 속 속임수 반등'을 필터링하게 됩니다.
+            df['Macro_Trend'] = np.where((df['close'] > df['MA60']) & (df['MA60'] > df['MA120']), 1, 0)
+            # =========================================================================
 
             return df.fillna(0)
         except Exception as e:
@@ -136,18 +155,26 @@ class JubbyStrategy:
             return df
 
     # =====================================================================
-    # 🤖 2. [AI 입력용 데이터 변환기] (AI 뇌와 차트 지표의 톱니바퀴 맞추기)
+    # 🤖 2. [AI 입력용 데이터 변환기] (학습기와 피처 순서 100% 일치 필수)
     # =====================================================================
     def get_ai_features(self, df):
         if len(df) == 0: return None
-        # 주의: 여기서 뽑아주는 15개 지표는 Trainer.py에서 학습할 때 쓴 지표와 '순서/이름'이 100% 동일해야 함
+        
+        # 🔥 [핵심 수정] 새롭게 추가된 3가지 지표를 AI 입력값 명단에 추가합니다.
+        # 주의: Trainer.py와 Data_Collector.py에도 동일한 순서로 있어야 합니다.
         features = [
             'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
             'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
-            'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m'
+            'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
+            'Disparity_60', 'Disparity_120', 'Macro_Trend' # 🟢 추가된 3인방
         ]
-        current_data = df.iloc[-1][features].values.astype(float)
-        return current_data.reshape(1, -1)
+        
+        try:
+            current_data = df.iloc[-1][features].values.astype(float)
+            return current_data.reshape(1, -1)
+        except Exception as e:
+            self.send_log(f"🚨 AI 피처 변환 에러 (피처 개수 불일치 가능성): {e}", "error")
+            return None
 
     # =====================================================================
     # 🛡️ 3. [초단타 특화 방어막] 매우 짧고 굵은 익절/손절가 세팅

@@ -194,6 +194,7 @@ class AutoTradeWorker(QThread):
             
         self.panic_mode = False; self.closing_mode_notified = False; self.imminent_notified = False
         self.was_crash_mode = False 
+        self.loss_streak_cnt = 0 # 🟢 [추가] 연속 손절 횟수를 기억하는 변수
 
     def run(self):
         self.is_running = True
@@ -442,6 +443,23 @@ class AutoTradeWorker(QThread):
                     self.mw.send_kakao_msg(safe_msg)
                     self.was_crash_mode = False 
 
+        # =========================================================================
+        # 🟢 [추가] DB에서 고급 퀀트 설정(트레일링스탑, 시간제한, 연패, 골든타임) 로드
+        # =========================================================================
+        try:
+            use_trailing = db_temp.get_shared_setting("TRADE", "USE_TRAILING", "Y") == "Y"
+            ts_start = float(db_temp.get_shared_setting("TRADE", "TRAILING_START_YIELD", "1.5"))
+            ts_gap = float(db_temp.get_shared_setting("TRADE", "TRAILING_STOP_GAP", "0.8"))
+            max_hold_min = int(db_temp.get_shared_setting("TRADE", "MAX_HOLDING_TIME", "20"))
+            loss_limit_cnt = int(db_temp.get_shared_setting("TRADE", "LOSS_STREAK_LIMIT", "5")) # 디폴트 5번!
+            time_filter_start = db_temp.get_shared_setting("TRADE", "TIME_FILTER_START", "090000")
+            time_filter_end = db_temp.get_shared_setting("TRADE", "TIME_FILTER_END", "152000")
+        except:
+            use_trailing, ts_start, ts_gap = True, 1.5, 0.8
+            max_hold_min, loss_limit_cnt = 20, 5
+            time_filter_start, time_filter_end = "090000", "152000"
+        # =========================================================================
+
         stock_details_str = ""
         current_holdings = list(self.mw.my_holdings.items())
 
@@ -504,20 +522,27 @@ class AutoTradeWorker(QThread):
                     elif profit_rate > 0.0 and curr_macd < curr_signal: is_sell_all = True; status_msg = "마감 전 추세꺾임 탈출"
                     elif profit_rate <= stop_rate: is_sell_all = True; status_msg = "마감 전 기계적 손절"
                 else:
-                    if strat_signal == "SELL" and profit_rate > 0.5: is_sell_all = True; status_msg = "전략엔진 매도 신호 (수익 보존)"
+                    # 💡 [핵심 교체] 트레일링 스탑 및 시간 제한 로직 적용
+                    if use_trailing and profit_rate >= ts_start and trail_drop_rate >= ts_gap:
+                        is_sell_all = True; status_msg = f"트레일링 스탑 발동 (최고점 대비 {ts_gap}% 하락)"
+                    elif elapsed_mins >= max_hold_min:
+                        is_sell_all = True; status_msg = f"시간 제한 청산 ({max_hold_min}분 경과)"
+                    elif strat_signal == "SELL" and profit_rate > 0.5: is_sell_all = True; status_msg = "전략엔진 매도 신호 (수익 보존)"
                     elif strat_signal == "SELL" and profit_rate <= stop_rate: is_sell_all = True; status_msg = "전략엔진 매도 신호 (리스크 최소화)"
                     elif profit_rate >= target_rate and not half_sold: is_sell_half = True; sell_qty = max(1, int(buy_qty // 2)); status_msg = f"목표가({target_rate:.1f}%) 도달 1차 익절"
-                    elif half_sold and trail_drop_rate >= 0.5: is_sell_all = True; status_msg = "트레일링 스탑 (나머지 전량 익절)"
                     elif profit_rate <= stop_rate: is_sell_all = True; status_msg = f"손절라인({stop_rate:.1f}%) 이탈"
                     elif profit_rate >= 1.5 and curr_macd < curr_signal: is_sell_all = True; status_msg = "데드크로스 수익보존 탈출"
-                    elif elapsed_mins >= 45 and (-1.0 <= profit_rate <= 1.0): is_sell_all = True; status_msg = f"타임아웃 ({int(elapsed_mins)}분 횡보) 탈출"
 
                 if is_sell_half or is_sell_all:
                     if getattr(self, 'panic_mode', False): self.sig_log.emit(f"🔥 [긴급청산 진행] 👉 '{stock_name}' {sell_qty}주 전량 매도 프로세스 진입...", "warning")
 
                     if self.execute_guaranteed_sell(code, sell_qty, curr_price): 
+                        # 🟢 [추가] 연패(Loss Streak) 차단 카운터 업데이트
+                        if profit_rate < 0 and is_sell_all: self.loss_streak_cnt += 1
+                        elif profit_rate > 0: self.loss_streak_cnt = 0 # 익절 시 연패 기록 초기화
+                        
                         if is_sell_all: sold_codes.append(code) 
-                        else: 
+                        else:
                             self.mw.my_holdings[code]['qty'] -= sell_qty
                             self.mw.my_holdings[code]['half_sold'] = True
                         
@@ -586,8 +611,21 @@ class AutoTradeWorker(QThread):
         # =================================================================
         candidates = []; scanned_log_list = []; scan_targets = []
 
+        # 🟢 [추가] 골든타임 필터 로직
+        now_time_int = int(now.strftime("%H%M%S"))
+        start_time_int = int(time_filter_start)
+        end_time_int = int(time_filter_end)
+        is_golden_time = start_time_int <= now_time_int <= end_time_int
+
         if is_closing_phase: pass 
         elif market_crash_mode: pass 
+        elif self.loss_streak_cnt >= loss_limit_cnt:
+            # 5번 연속 손절 시, 오늘은 운이 없는 날이므로 신규 탐색 완전 차단
+            if now.minute % 5 == 0: # 5분마다 한 번씩만 경고 출력
+                self.sig_log.emit(f"🛑 [리스크 관리] {loss_limit_cnt}연속 손절 발생! 뇌동매매 방지를 위해 신규 스캔을 일시 중단합니다.", "error")
+        elif not is_golden_time:
+            # 설정한 거래 시간(예: 09:00 ~ 15:20)이 아니면 패스
+            pass
         elif needed_count > 0 and not getattr(self, 'panic_mode', False):
             safe_holdings_values = list(self.mw.my_holdings.values())
             total_asset = my_cash + sum([info['price'] * info['qty'] for info in safe_holdings_values])
@@ -664,6 +702,8 @@ class AutoTradeWorker(QThread):
                     curr_vol_energy = float(df_feat.iloc[-1].get('Vol_Energy', 1.0)); curr_disp = float(df_feat.iloc[-1].get('Disparity_20', 100.0))
                     curr_macd = float(df_feat.iloc[-1].get('MACD', 0.0)); curr_rsi = float(df_feat.iloc[-1].get('RSI', 50.0))
                     ma5_val = float(df_feat.iloc[-1].get('MA5', curr_price)); ma20_val = float(df_feat.iloc[-1].get('MA20', curr_price))
+                    # 🟢 [추가] 리스크 관리를 위해 ATR 값도 빼옵니다!
+                    curr_atr = float(df_feat.iloc[-1].get('ATR', 0.0))
                 else: 
                     curr_open = curr_high = curr_low = curr_price; curr_vol = ret_1m = trade_amt = 0.0
                     curr_disp = 100.0; curr_vol_energy = 1.0; curr_macd = 0.0; curr_rsi = 50.0
@@ -677,12 +717,13 @@ class AutoTradeWorker(QThread):
                 if df_feat is not None: 
                     strategy_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '상승확률': f"{prob*100:.1f}%", 'MA_5': f"{ma5_val:.0f}", 'MA_20': f"{ma20_val:.0f}", 'RSI': f"{curr_rsi:.1f}", 'MACD': f"{curr_macd:.2f}", '전략신호': "BUY 🟢" if prob >= ai_limit else "WAIT 🟡"})
                 
-                # 🔥 [수정] 나중에 매수할 때 쓰기 위해 후보 리스트에 불타기 정보도 함께 담아둡니다.
+                # 🔥 [수정] 후보 리스트에 불타기 정보와 함께 atr 값도 담아둡니다.
                 if prob >= ai_limit: 
                     candidates.append({
                         'code': code, 'prob': prob, 'price': curr_price, 'stock_name': stock_name,
                         'is_pyramiding': is_pyramiding, 'current_invested': current_invested_in_stock,
-                        'holding_qty': holding_qty, 'holding_price': holding_price, 'max_allowed': max_allowed_for_stock
+                        'holding_qty': holding_qty, 'holding_price': holding_price, 'max_allowed': max_allowed_for_stock,
+                        'atr': curr_atr  # 🟢 [추가]
                     })
                 
                 try: db_temp.update_realtime(code, curr_price, prob*100, "NO", "탐색 및 분석 중...")
@@ -738,18 +779,39 @@ class AutoTradeWorker(QThread):
                         try: pyramiding_rate = float(db_temp.get_shared_setting("TRADE", "PYRAMIDING_RATE", "50.0"))
                         except: pyramiding_rate = 50.0
                         
-                        # [조건 3] 기존에 들어간 돈 * 50% 만 추가 예산으로 산정
                         target_budget = cand['current_invested'] * (pyramiding_rate / 100.0)
-                        
-                        # [조건 2] 30% 몰빵 한도를 넘지 않도록 제한
                         max_remaining_for_stock = cand['max_allowed'] - cand['current_invested']
                         target_budget = min(target_budget, max_remaining_for_stock)
                     else:
+                        # 기본 매수 비중 설정 (AI 확률 기반)
                         if prob >= 0.85: weight = 0.20     
                         elif prob >= 0.70: weight = 0.10   
                         else: weight = 0.05                
-                        target_budget = float(total_asset * weight)
-                    
+                        base_target_budget = float(total_asset * weight)
+                        
+                        # 🛡️ [핵심 추가] DB 연동 ATR 기반 동적 비중 조절 (Position Sizing)
+                        try:
+                            atr_high_limit = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_LIMIT", "5.0"))
+                            atr_high_ratio = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_RATIO", "50.0")) / 100.0
+                            atr_mid_limit  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_LIMIT", "2.5"))
+                            atr_mid_ratio  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_RATIO", "70.0")) / 100.0
+                        except:
+                            atr_high_limit, atr_high_ratio = 5.0, 0.5
+                            atr_mid_limit, atr_mid_ratio = 2.5, 0.7
+                            
+                        # 변동성(%) 계산: (현재 캔들 평균 변동폭 / 현재가) * 100
+                        current_atr = cand['atr']
+                        volatility_pct = (current_atr / curr_price) * 100 if curr_price > 0 else 0
+                        
+                        if volatility_pct >= atr_high_limit:
+                            target_budget = base_target_budget * atr_high_ratio
+                            self.sig_log.emit(f"🚨 [리스크 관리] {stock_name} 변동성 극심({volatility_pct:.1f}%)! 매수금을 {atr_high_ratio*100:.0f}% 수준으로 대폭 축소합니다.", "warning")
+                        elif volatility_pct >= atr_mid_limit:
+                            target_budget = base_target_budget * atr_mid_ratio
+                            self.sig_log.emit(f"🛡️ [리스크 관리] {stock_name} 변동성 높음({volatility_pct:.1f}%). 매수금을 {atr_mid_ratio*100:.0f}% 수준으로 축소합니다.", "warning")
+                        else:
+                            target_budget = base_target_budget
+
                     budget = min(target_budget, available_trading_budget)
                     buy_qty = int(budget // curr_price) 
                     if buy_qty * curr_price > my_cash: 
@@ -1361,10 +1423,10 @@ class FormMain(QtWidgets.QMainWindow):
                 self.add_log("⚠️ 이전 감시망이 아직 안전하게 종료 중입니다. 잠시 후 다시 눌러주세요.", "warning")
                 return
             
-            # 🔥 [추가] 자동매매 시작(GO) 버튼을 누를 때마다 이전 주문/매매 기록 싹 비우기
+            # 자동매매 시작(GO) 버튼을 누를 때마다 이전 주문/매매 기록 싹 비우기
             try:
                 conn = self.db._get_connection(self.db.shared_db_path)
-                conn.execute("DELETE FROM TradeHistory") # DB에서 영수증 삭제
+                conn.execute("DELETE FROM TradeHistory") 
                 conn.commit()
                 conn.close()
                 
@@ -1385,10 +1447,17 @@ class FormMain(QtWidgets.QMainWindow):
             if hasattr(self, 'trade_worker'):
                 self.trade_worker.is_running = False
             
-            self.btnAutoDataTest.setText("감시망 종료 중...")
-            self.btnAutoDataTest.setEnabled(False) 
-            self.btnAutoDataTest.setStyleSheet("background-color: rgb(40, 40, 40); color: Gray;")
+            # 🔥 [핵심 튕김 방지] 마우스 클릭 도중에 버튼을 끄고 색을 바꾸면 엔진이 뻗어버립니다.
+            # 0.1초(100ms) 뒤에 화면 상태를 바꾸도록 예약하여 메모리 충돌을 완벽 차단합니다!
+            QtCore.QTimer.singleShot(100, self._apply_stop_ui)
             self.add_log("🛑 [주삐 엔진] 감시망 종료 명령이 전달되었습니다. 스레드가 완전히 멈추면 복구됩니다.", "warning")
+
+    # 🔥 튕김 방지를 위해 분리해 낸 UI 안전 변환 함수 (새로 추가됨)
+    @QtCore.pyqtSlot()
+    def _apply_stop_ui(self):
+        self.btnAutoDataTest.setText("감시망 종료 중...")
+        self.btnAutoDataTest.setEnabled(False) 
+        self.btnAutoDataTest.setStyleSheet("background-color: rgb(40, 40, 40); color: Gray;")
 
     @QtCore.pyqtSlot()
     def check_worker_stopped(self):

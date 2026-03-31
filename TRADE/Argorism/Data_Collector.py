@@ -222,6 +222,20 @@ def calculate_indicators_logic(df, market_dict, future_window=10, profit_target=
     df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
     df['MA5'] = df['close'].rolling(5).mean()
     df['MA20'] = df['close'].rolling(20).mean()
+
+    # =========================================================================
+    # 🟢 [핵심 추가] 다중 시간대(Multi-Timeframe) 거시 추세 피처
+    # =========================================================================
+    df['MA60'] = df['close'].rolling(60).mean()   # 1시간 추세 (큰 숲)
+    df['MA120'] = df['close'].rolling(120).mean() # 2시간 추세 (더 큰 숲)
+    
+    # 장기 이격도 (현재 주가가 1~2시간 평균치보다 얼마나 높은가/낮은가)
+    df['Disparity_60'] = (df['close'] / (df['MA60'] + 1e-9)) * 100
+    df['Disparity_120'] = (df['close'] / (df['MA120'] + 1e-9)) * 100
+    
+    # 거시 추세 정배열 점수 (1: 완벽한 상승장, 0: 하락장/역배열)
+    df['Macro_Trend'] = np.where((df['close'] > df['MA60']) & (df['MA60'] > df['MA120']), 1, 0)
+    # =========================================================================
     
     # 4. 볼린저 밴드 (주가의 변동폭을 그물처럼 감싸는 지표)
     df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
