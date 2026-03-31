@@ -6,7 +6,7 @@ import numpy as np
 import requests
 import time
 from datetime import datetime, timedelta # 토큰 유효기간 계산을 위한 모듈 추가
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =====================================================================
 # [환경 설정] 프로젝트 루트 경로 설정
@@ -413,26 +413,49 @@ class UltraDataCollector:
         shared_token = self.access_token
         shared_base_url = self.api.base_url
 
-        with ProcessPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(
-                collect_worker, 
-                code, 
-                self.app_key, 
-                self.app_secret, 
-                shared_token, 
-                shared_base_url, 
-                self.market_dict
-            ): code for code in stock_list}
-            
-            for idx, future in enumerate(as_completed(futures)):
-                code = futures[future]
-                try:
-                    rows = future.result()
-                    accumulated_rows += rows
-                    progress = int(((idx + 1) / total_stocks) * 100)
-                    self.send_log(f"💾 [{idx+1}/{total_stocks}] '{code}' 수집 완료 (누적 {accumulated_rows:,}줄)", "INFO")
-                    self.db.update_system_status('COLLECTOR', 'DB 적재 중...', progress)
-                except: pass
+        # =====================================================================
+        # 🚀 [핵심 수정] 10개 스레드 + 15개 묶음 초고속 멀티스레딩 (디도스 방어막 포함)
+        # =====================================================================
+        batch_size = 15  # 증권사 1초 20회 제한 방어 -> 15개씩 묶어서 던짐
+        max_workers = 10 # 10명의 스레드(작업자) 동시 고용
+        processed_count = 0
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 전체 주식 리스트를 15개 단위로 쪼개서 작업
+            for i in range(0, total_stocks, batch_size):
+                start_time = time.time() # ⏱️ 현재 묶음 작업 시작 시간 기록
+                batch_codes = stock_list[i : i + batch_size]
+                
+                # 10명의 작업자에게 15개 종목을 동시에 할당
+                futures = {executor.submit(
+                    collect_worker, 
+                    code, 
+                    self.app_key, 
+                    self.app_secret, 
+                    shared_token, 
+                    shared_base_url, 
+                    self.market_dict
+                ): code for code in batch_codes}
+                
+                # 데이터가 수집되는 족족 결과물 처리
+                for future in as_completed(futures):
+                    code = futures[future]
+                    processed_count += 1
+                    try:
+                        rows = future.result()
+                        accumulated_rows += rows
+                        progress = int((processed_count / total_stocks) * 100)
+                        self.send_log(f"💾 [{processed_count}/{total_stocks}] '{code}' 수집 완료 (누적 {accumulated_rows:,}줄)", "INFO")
+                        self.db.update_system_status('COLLECTOR', 'DB 적재 중...', progress)
+                    except Exception as e:
+                        pass
+                
+                # 🛡️ [완벽한 디도스 차단 방어막]
+                # 15개를 다 긁어오는 데 1.05초가 안 걸렸다면? 남은 시간 동안 억지로 대기!
+                elapsed_time = time.time() - start_time
+                if elapsed_time < 1.05:
+                    time.sleep(1.05 - elapsed_time)
+        # =====================================================================
 
         self.db.update_system_status('COLLECTOR', '수집 및 DB 적재 완료!', 100)
         self.send_log(f"💎 총 {accumulated_rows:,}줄 적재 완료!", "SUCCESS")
