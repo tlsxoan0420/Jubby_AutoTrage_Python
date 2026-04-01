@@ -2,10 +2,11 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
+import sys
 
 # 🌐 시장 모드(DOMESTIC/OVERSEAS) 및 DB 매니저 가져오기
 from COMMON.Flag import SystemConfig
-from COMMON.DB_Manager import JubbyDB_Manager # 🔥 [DB 연동] 추가
+from COMMON.DB_Manager import JubbyDB_Manager 
 
 class JubbyStrategy:
     """
@@ -16,10 +17,8 @@ class JubbyStrategy:
         self.log_callback = log_callback
         self.market_return_1m = 0.0 
         
-        # 🔥 [DB 연동] DB 객체 생성
         self.db = JubbyDB_Manager()
         
-        # 🧠 프로그램이 켜질 때 AI 뇌를 자동으로 불러옵니다!
         self.ai_model = None
         self.load_ai_brain()
 
@@ -29,13 +28,9 @@ class JubbyStrategy:
     def load_ai_brain(self):
         """ 미국장인지 한국장인지 파악해서 알맞은 뇌(Model)를 머리에 끼웁니다. """
         try:
-
-            import sys, os
-            
             def get_smart_path(filename):
                 return os.path.join(SystemConfig.PROJECT_ROOT, filename)
             
-            # 🔥 모드에 따른 분기 처리 경로 변경!
             if SystemConfig.MARKET_MODE == "DOMESTIC":
                 model_path = get_smart_path("jubby_brain.pkl")
                 market_icon = "🇰🇷"
@@ -55,8 +50,6 @@ class JubbyStrategy:
                 self.send_log(msg, "success")
             else:
                 self.ai_model = None
-                
-                # 🟢 [핵심 수정] 도대체 어디서 찾고 있는지 'model_path'를 로그에 직접 찍어봅니다!
                 msg = f"⚠️ {market_icon} AI 뇌 파일 없음!\n👉 찾는 위치: {model_path}"
                 self.send_log(msg, "warning")
                 
@@ -75,25 +68,20 @@ class JubbyStrategy:
     # 📊 1. [초단타 퀀트 지표] VWAP, 거래량 돌파 에너지 등 실시간 계산
     # =====================================================================
     def calculate_indicators(self, df):
-        """ 실시간 1분봉 데이터를 받아 초단타에 특화된 지표를 계산합니다. """
-        if df is None or len(df) < 120: return df # 🌳 거시 지표(MA120) 계산을 위해 최소 120봉 확보
+        if df is None or len(df) < 26: return df
         df = df.copy() 
         
         try:
-            # --- [기존 지표 계산 로직 시작] ---
             df['return'] = df['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) * 100 
             
-            # VWAP (세력 평단가)
             df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
             df['TP_Volume'] = df['Typical_Price'] * df['volume']
             df['VWAP'] = df['TP_Volume'].cumsum() / (df['volume'].cumsum() + 1e-9)
 
-            # 거래량 에너지
             df['MA5_Vol'] = df['volume'].rolling(window=5).mean()
             df['Vol_Energy'] = df['volume'] / (df['MA5_Vol'] + 1e-9)
             df['vol_change'] = df['volume'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) 
 
-            # RSI, MACD
             delta = df['close'].diff()
             up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
             rs = up.ewm(com=13).mean() / (down.ewm(com=13).mean() + 1e-9)
@@ -101,18 +89,15 @@ class JubbyStrategy:
             df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
             df['Signal_Line'] = df['MACD'].ewm(span=9).mean()
             
-            # 이동평균선 및 볼린저 밴드
             df['MA5'] = df['close'].rolling(5).mean()
             df['MA20'] = df['close'].rolling(20).mean()
             df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
             df['BB_Lower'] = df['MA20'] - (df['close'].rolling(20).std() * 2)
             df['BB_Width'] = ((df['BB_Upper'] - df['BB_Lower']) / (df['MA20'] + 1e-9)) * 100
             
-            # 이격도
             df['Disparity_5'] = (df['close'] / (df['MA5'] + 1e-9)) * 100
             df['Disparity_20'] = (df['close'] / (df['MA20'] + 1e-9)) * 100
 
-            # OBV 및 ATR
             direction = np.where(df['close'] > df['close'].shift(1), 1, -1)
             direction = np.where(df['close'] == df['close'].shift(1), 0, direction)
             obv = (df['volume'] * direction).cumsum()
@@ -123,28 +108,16 @@ class JubbyStrategy:
             tr3 = (df['low'] - df['close'].shift(1)).abs()
             df['ATR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
-            # 꼬리 및 매수압력 분석
             df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1)
             df['Low_Tail'] = df[['open', 'close']].min(axis=1) - df['low']
             df['Buying_Pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-9)
             
-            # --- [기존 지표 계산 로직 끝] ---
-
-            # =========================================================================
-            # 🟢 [Step 3 핵심 추가] 다중 시간대(Multi-Timeframe) 거시 추세 피처
-            # =========================================================================
-            # 1분봉 60개(1시간), 120개(2시간)의 이동평균선 계산
-            df['MA60'] = df['close'].rolling(60).mean()   # 1시간 추세 (큰 숲)
-            df['MA120'] = df['close'].rolling(120).mean() # 2시간 추세 (더 큰 숲)
-            
-            # 장기 이격도 (AI가 '현재 주가가 거시적으로 과열되었는가'를 판단함)
+            # 다중 시간대(Multi-Timeframe) 거시 추세 피처
+            df['MA60'] = df['close'].rolling(60).mean()   
+            df['MA120'] = df['close'].rolling(120).mean() 
             df['Disparity_60'] = (df['close'] / (df['MA60'] + 1e-9)) * 100
             df['Disparity_120'] = (df['close'] / (df['MA120'] + 1e-9)) * 100
-            
-            # 거시 추세 정배열 점수 (1: 상승 추세, 0: 하락/역배열 추세)
-            # 💡 AI는 이 점수를 통해 '역배열 하락장 속 속임수 반등'을 필터링하게 됩니다.
             df['Macro_Trend'] = np.where((df['close'] > df['MA60']) & (df['MA60'] > df['MA120']), 1, 0)
-            # =========================================================================
 
             return df.fillna(0)
         except Exception as e:
@@ -152,10 +125,10 @@ class JubbyStrategy:
             return df
 
     # =====================================================================
-    # 🤖 2. [AI 입력용 데이터 변환기] (학습기와 피처 순서 100% 일치 필수)
+    # 🤖 2. [AI 입력용 데이터 변환기] 
     # =====================================================================
     def get_ai_features(self, df):
-        if df is None or len(df) == 0: return None
+        if df is None or len(df) < 26: return None
         
         features = [
             'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
@@ -164,16 +137,24 @@ class JubbyStrategy:
             'Disparity_60', 'Disparity_120', 'Macro_Trend'
         ]
         
-        # 🟢 [핵심 추가] 데이터에 AI가 필요로 하는 18개 컬럼이 모두 정상적으로 있는지 검사합니다.
-        # (아직 120봉이 안 모여서 지표 계산이 스킵된 종목은 에러를 뿜지 않고 조용히 패스합니다!)
-        if not all(col in df.columns for col in features):
+        if 'Disparity_60' not in df.columns: df['Disparity_60'] = 100.0
+        if 'Disparity_120' not in df.columns: df['Disparity_120'] = 100.0
+        if 'Macro_Trend' not in df.columns: df['Macro_Trend'] = 0.0
+        
+        if 'Market_Return_1m' not in df.columns:
+            df['Market_Return_1m'] = getattr(self, 'market_return_1m', 0.0)
+            
+        df = df.bfill().fillna(0.0)
+
+        missing_cols = [col for col in features if col not in df.columns]
+        if missing_cols:
+            self.send_log(f"🚨 [AI 변환 실패] AI가 요구한 데이터 중 다음이 누락되었습니다: {missing_cols}", "error")
             return None
             
         try:
             current_data = df.iloc[-1][features].values.astype(float)
             return current_data.reshape(1, -1)
         except Exception as e:
-            # 진짜 알 수 없는 심각한 에러일 때만 로그를 띄웁니다.
             self.send_log(f"🚨 AI 피처 변환 에러: {e}", "error")
             return None
 
@@ -181,9 +162,6 @@ class JubbyStrategy:
     # 🛡️ 3. [초단타 특화 방어막] 매우 짧고 굵은 익절/손절가 세팅
     # =====================================================================
     def get_dynamic_exit_prices(self, df, avg_buy_price):
-        """ 스캘핑(초단타)에 맞게 익절은 1.2%, 손절은 -1.0%로 매우 짧게 잡아 회전율을 극대화합니다. """
-        
-        # ✅ DB에 없으면 기존 세팅값인 1.2, 1.0, 1.5, 1.0을 DB에 자동 등록합니다!
         try:
             profit_rate = float(self.db.get_shared_setting("TRADE", "PROFIT_RATE", "1.2")) / 100.0
             stop_rate = float(self.db.get_shared_setting("TRADE", "STOP_RATE", "1.0")) / 100.0
@@ -193,8 +171,7 @@ class JubbyStrategy:
             profit_rate, stop_rate = 0.012, 0.010
             atr_target_multi, atr_stop_multi = 1.5, 1.0
 
-        # 🟢 [수정] 거시 지표를 위해 최소 120봉이 필요하므로 조건을 맞춤
-        if len(df) < 120 or avg_buy_price <= 0:
+        if len(df) < 26 or avg_buy_price <= 0:
             return avg_buy_price * (1.0 + profit_rate), avg_buy_price * (1.0 - stop_rate)
 
         current = df.iloc[-1]
@@ -203,7 +180,6 @@ class JubbyStrategy:
         target_price = avg_buy_price * (1.0 + profit_rate)
         stop_price = avg_buy_price * (1.0 - stop_rate)
         
-        # 시장 변동성(ATR)이 미쳐 날뛸 때만 위아래 폭을 살짝 넓혀줍니다.
         if atr > avg_buy_price * 0.01:
             target_price = avg_buy_price + (atr * atr_target_multi)
             stop_price = avg_buy_price - (atr * atr_stop_multi)
@@ -214,72 +190,69 @@ class JubbyStrategy:
     # 🚀 4. 실전 매수/매도 타점 판독 (AI 예측 + 돌파 알고리즘 결합)
     # =====================================================================
     def check_trade_signal(self, df, code):
-        """ 실시간 데이터를 보고 매수/매도할지 결정하는 가장 중요한 두뇌입니다. """
-        # 🟢 [수정] MA120 지표 계산을 위해 최소 120개의 데이터가 찰 때까지 기다립니다.
-        if len(df) < 120: return "WAIT"
+        if len(df) < 26: return "WAIT"
         
         current = df.iloc[-1]
         curr_price = float(current['close']) 
         ai_prob = 0.0 
-        
-        # -------------------------------------------------------------
-        # 💰 [매수 조건] : AI 확률 통과 OR 확실한 거래량 돌파(스캘핑 타점)
-        # -------------------------------------------------------------
         buy_signal = False
+        features = None
         
-        # 1. AI 뇌의 예측 (확률)
+        # 1. AI 뇌의 예측 (확률 계산)
         if self.ai_model is not None:
             features = self.get_ai_features(df)
-            if features is not None:
-                ai_prob = self.ai_model.predict_proba(features)[0][1]
+            
+            # 🔥 [안전장치 1] 데이터 누락으로 AI 분석이 불가능하면 묻지마 매수 방지!
+            if features is None:
+                return "WAIT"
                 
-                # ✅ AI 임계값 DB 연동
-                try: ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
-                except: ai_threshold = 0.70
-                
-                if ai_prob >= ai_threshold:
-                    self.send_log(f"🤖 [AI 시그널] {code} 떡상 징후 포착! (상승 확률: {ai_prob*100:.1f}% / 기준: {ai_threshold*100:.0f}%) -> 강력 매수!", "buy")
-                    buy_signal = True
+            ai_prob = self.ai_model.predict_proba(features)[0][1]
+            try: ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
+            except: ai_threshold = 0.70
+            
+            if ai_prob >= ai_threshold:
+                self.send_log(f"🤖 [AI 시그널] {code} 떡상 징후 포착! (상승 확률: {ai_prob*100:.1f}%) -> 강력 매수!", "buy")
+                buy_signal = True
         
-        # 2. [전략 A & B] 아날로그 돌파/추세 매매 로직 (DB에서 기준값 로드)
-        # ✅ DB에 돌파 기준값이 없으면 기존값인 거래량 2.0배, 등락률 0.5%를 등록합니다.
+        # 2. [전략 A & B] 아날로그 돌파/추세 매매 로직
         try:
             breakout_vol = float(self.db.get_shared_setting("TRADE", "BREAKOUT_VOL", "2.0")) 
             breakout_ret = float(self.db.get_shared_setting("TRADE", "BREAKOUT_RET", "0.5")) 
+            # 🟢 [핵심 추가] 돌파 신호 발생 시 AI가 허락해 주는 '최소 컷트라인' DB 연동! (기본 50%)
+            ai_min_pass = float(self.db.get_shared_setting("AI", "MIN_PASS_RATE", "50.0")) / 100.0
         except:
             breakout_vol, breakout_ret = 2.0, 0.5
+            ai_min_pass = 0.50
 
-        # 조건: 거래량이 평균 대비 돌파 배수 이상 터지고 + 세력 평단가(VWAP) 뚫고 + 기준 % 이상 오를 때
         if not buy_signal and current['Vol_Energy'] >= breakout_vol and curr_price > current['VWAP'] and current['return'] > breakout_ret:
-            self.send_log(f"🔥 [돌파 매매] {code} 거래량 폭발 & 세력선(VWAP) 돌파 포착! -> 추격 매수!", "buy")
-            buy_signal = True
+            # 🔥 [수정] 하드코딩된 0.50 대신 DB에서 가져온 ai_min_pass 변수를 사용합니다!
+            if self.ai_model is not None and ai_prob < ai_min_pass:
+                self.send_log(f"💡 [{code}] 전략엔진은 돌파 매수를 추천이나, AI 확신도 미달({ai_prob*100:.1f}% < {ai_min_pass*100:.0f}%)로 스킵", "info")
+            else:
+                self.send_log(f"🔥 [돌파 매매] {code} 거래량 폭발 & 세력선(VWAP) 돌파 포착! -> 추격 매수!", "buy")
+                buy_signal = True
 
         if buy_signal:
             try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "강력 매수 신호 발생!")
             except: pass
             return "BUY"
 
-        # 화면 업데이트용 데이터 전송
         try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "탐색 및 분석 중...")
         except: pass
 
         # -------------------------------------------------------------
         # 💸 [매도 조건] : 초단타에 맞게 위험 신호 발생 시 즉각 던집니다.
         # -------------------------------------------------------------
-        # 1. 데드크로스 발생 시 무조건 칼손절 (추세 꺾임)
         if current['MACD'] < current['Signal_Line'] and curr_price < current['MA5']:
             return "SELL"
             
-        # ✅ 매도 폭탄 감지를 위한 RSI 과열 기준치 DB 연동 (기존 75.0)
         try: sell_rsi = float(self.db.get_shared_setting("TRADE", "SELL_RSI", "75.0"))
         except: sell_rsi = 75.0
 
-        # 2. 거래량이 말라버린 채로 긴 윗꼬리를 달고 내려꽂을 때 (매도 폭탄)
         body_size = abs(current['open'] - current['close'])
         is_heavy_selling_pressure = current['High_Tail'] > body_size and current['High_Tail'] > 0
         if current['RSI'] >= sell_rsi and is_heavy_selling_pressure:
-            # 💡 텍스트를 스캔/보유 상황 모두 어울리게 변경합니다.
-            self.send_log(f"💡 [전략엔진] {code} 고점 매도 폭탄(긴 윗꼬리) 차트 감지 -> 매수 차단 및 탈출 신호!", "sell")
+            self.send_log(f"💡 [전략엔진] {code} 고점 매도 폭탄(긴 윗꼬리) 차트 감지 -> 탈출 신호!", "sell")
             return "SELL"
         
         return "WAIT"

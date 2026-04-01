@@ -57,12 +57,14 @@ def train_jubby_brain(log_callback=None):
     df.dropna(inplace=True)
     
     total_data_count = len(df)
-    send_log(f"📊 총 {total_data_count:,}개의 15지표 1분봉 데이터를 DB에서 성공적으로 불러왔습니다.", "SUCCESS")
+    send_log(f"📊 총 {total_data_count:,}개의 1분봉 데이터를 DB에서 성공적으로 불러왔습니다.", "SUCCESS")
 
+    # 🟢 [핵심 수정] 실전(Strategy.py)과 동일하게 18개의 지표를 모두 교재에 넣습니다!
     features = [
         'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
         'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
-        'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m'
+        'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
+        'Disparity_60', 'Disparity_120', 'Macro_Trend'  # 🔥 새롭게 추가된 3대장
     ]
     
     X = df[features]

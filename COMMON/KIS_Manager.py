@@ -334,12 +334,14 @@ class KIS_API:
                 df.columns = ['open', 'high', 'low', 'close', 'volume']
                 df = df.apply(pd.to_numeric)
                 
-                # 시간 역순(최신이 맨 앞)으로 오는 데이터를 과거->최신 순으로 뒤집기
                 df = df.iloc[::-1].reset_index(drop=True)
                 return df
             else:
+                # 🔥 [핵심 추가] 증권사가 데이터를 안 주면, 왜 안 주는지 로그를 화면에 띄웁니다!
+                self._log_msg(f"⚠️ [{stock_code}] 차트 수신 거절: {data.get('msg1')}", "warning")
                 return None
-        except Exception:
+        except Exception as e:
+            self._log_msg(f"🚨 [{stock_code}] 차트 통신 에러: {e}", "error")
             return None
 
 # =====================================================================

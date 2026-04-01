@@ -2,30 +2,18 @@ import sqlite3
 import os
 import datetime
 import pandas as pd  
-import sys, os
 
 # 방금 만든 공통 경로를 불러옵니다.
 from COMMON.Flag import SystemConfig 
 
+# 🟢 [수정 1] 중복 선언된 함수 삭제 및 깔끔하게 하나로 통일!
 def get_smart_path(filename):
     """ 하드코딩 없이 무조건 최상위 경로(SystemConfig.PROJECT_ROOT)를 바라봄 """
     return os.path.join(SystemConfig.PROJECT_ROOT, filename)
 
-def get_smart_path(filename):
-    """ EXE 모드와 개발(Script) 모드를 자동으로 구분하여 경로를 반환합니다. """
-    import sys, os
-    if getattr(sys, 'frozen', False):
-        base_path = os.path.dirname(sys.executable)
-        return os.path.join(base_path, filename)
-    else:
-        # 🔥 COMMON 폴더에 있으므로 2칸 위(Jubby Project)로 올라갑니다!
-        base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        return os.path.join(base_path, filename)
-    
 class JubbyDB_Manager:
     def __init__(self):
         """ [생성자] 주삐 투 트랙 DB 매니저 """
-        # 🔥 복잡한 os.path.dirname 싹 다 지우고 스마트 경로로 바로 연결!
         self.shared_db_path = get_smart_path("jubby_shared.db")
         self.python_db_path = get_smart_path("jubby_python.db")
 
@@ -56,12 +44,12 @@ class JubbyDB_Manager:
     def _initialize_shared_db(self):
         conn = self._get_connection(self.shared_db_path)
         try:
-            # 🔥 [버그 수정] DB 환경설정(PRAGMA)은 매번 쓰지 않고 맨 처음 켤 때 딱 1번만!
-            # 이렇게 해야 C#이 0.5초마다 읽을 때 락이 걸리지 않습니다.
+            # 🔥 DB 환경설정(PRAGMA)
             conn.execute('PRAGMA journal_mode = WAL;')  
             conn.execute('PRAGMA synchronous = NORMAL;')
             conn.execute('PRAGMA busy_timeout = 5000;') 
 
+            # 테이블 생성
             conn.execute('''CREATE TABLE IF NOT EXISTS SharedSettings (category TEXT, key TEXT, value TEXT, PRIMARY KEY (category, key))''')
             conn.execute('''CREATE TABLE IF NOT EXISTS SystemStatus (module TEXT PRIMARY KEY, status TEXT, progress INTEGER, last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             conn.execute('''CREATE TABLE IF NOT EXISTS MarketStatus (symbol TEXT PRIMARY KEY, symbol_name TEXT, last_price REAL, open_price REAL, high_price REAL, low_price REAL, return_1m REAL, trade_amount REAL, vol_energy REAL, disparity REAL, volume REAL)''')
@@ -71,6 +59,26 @@ class JubbyDB_Manager:
             conn.execute('''CREATE TABLE IF NOT EXISTS SharedLogs (id INTEGER PRIMARY KEY AUTOINCREMENT, log_level TEXT, message TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             conn.execute('''CREATE TABLE IF NOT EXISTS PriceHistory (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, price REAL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             conn.execute('''CREATE TABLE IF NOT EXISTS target_stocks (symbol TEXT, symbol_name TEXT, market_mode TEXT)''')
+
+            # 🟢 [수정 2] DB가 처음 생성될 때, C# 화면에서 조작할 수 있도록 기본 설정값들을 자동으로 깔아줍니다!
+            # (INSERT OR IGNORE: 이미 개발자님이 수정한 값이 있다면 덮어쓰지 않고 유지합니다)
+            default_settings = [
+                ("TRADE", "RANKING_SCAN_COUNT", "50"),      # 스캔 종목 개수 (기본 50개)
+                ("TRADE", "USE_TRAILING", "Y"),             # 트레일링 스탑 사용 여부
+                ("TRADE", "TRAILING_START_YIELD", "1.5"),   # 트레일링 스탑 발동 수익률
+                ("TRADE", "TRAILING_STOP_GAP", "0.8"),      # 고점 대비 하락 허용치
+                ("TRADE", "MAX_HOLDING_TIME", "20"),        # 최대 보유 시간 (분)
+                ("TRADE", "LOSS_STREAK_LIMIT", "5"),        # 연패 차단 횟수
+                ("TRADE", "ATR_HIGH_LIMIT", "5.0"),         # 널뛰기 테마주 감지 기준(%)
+                ("TRADE", "ATR_HIGH_RATIO", "30.0"),        # 테마주 진입 시 예산 축소 비율(%)
+                ("TRADE", "TIME_START_DOM", "0900"),        # 주간장 스캔 시작 시간
+                ("TRADE", "TIME_CLOSE_DOM", "1500"),        # 주간장 마감 방어 모드 시간
+                ("TRADE", "TIME_IMMINENT_DOM", "1515"),     # 묻지마 시장가 강제 청산 시간
+                ("TRADE", "TIME_END_DOM", "1530")           # 주간장 종료 시간
+            ]
+            for category, key, val in default_settings:
+                conn.execute("INSERT OR IGNORE INTO SharedSettings (category, key, value) VALUES (?, ?, ?)", (category, key, val))
+
         except Exception as e:
             print(f"DB 초기화 에러: {e}")
         finally:
@@ -112,9 +120,9 @@ class JubbyDB_Manager:
             conn.execute("DELETE FROM AccountStatus")
             conn.executemany('INSERT INTO AccountStatus (symbol, symbol_name, quantity, avg_price, current_price, pnl_amt, pnl_rate, available_cash) VALUES (:symbol, :symbol_name, :quantity, :avg_price, :current_price, :pnl_amt, :pnl_rate, :available_cash)', data_list)
             conn.execute("COMMIT;")
-        except Exception as e: # 🚨 'as e' 를 추가!
+        except Exception as e: 
             conn.execute("ROLLBACK;")
-            print(f"🔥 Account DB 에러: {e}") # 🚨 에러 내용을 파이썬 창에 띄우도록 추가!
+            print(f"🔥 Account DB 에러: {e}") 
         finally:
             conn.close()
 
@@ -142,13 +150,11 @@ class JubbyDB_Manager:
         finally:
             conn.close()
 
-    # 🔥 여기가 에러났던 부분! 락 방어 코드로 완벽 세팅
     def insert_log(self, log_level, message):
         conn = self._get_connection(self.shared_db_path)
         try:
             conn.execute("INSERT INTO SharedLogs (log_level, message) VALUES (?, ?)", (log_level, message))
         except sqlite3.OperationalError as e:
-            # 혹시라도 아주 찰나의 순간에 락이 걸려도 무시하고 넘어갑니다 (프로그램 팅김 방지)
             print(f"로그 기록 중 DB 락 발생 무시됨: {e}")
         finally:
             conn.close()
@@ -156,7 +162,6 @@ class JubbyDB_Manager:
     def insert_trade_history(self, symbol, trade_type, price, qty, yield_rate=0.0, ai_score=0.0):
         conn = self._get_connection(self.shared_db_path)
         try:
-            # C#에서 받아오는 데이터명과 일치하게 수정
             conn.execute('''INSERT INTO TradeHistory (symbol, symbol_name, order_type, order_price, order_quantity, filled_quantity, order_time, Status, order_yield) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
                          (symbol, "-", trade_type, price, qty, qty, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "체결완료", f"{yield_rate}%"))
         except sqlite3.OperationalError:

@@ -8,17 +8,15 @@ import sys
 # 🌐 [완벽 통합] 시스템 전역 설정 및 하드코딩 탈피 자동 경로 탐색기
 # =========================================================================
 class SystemConfig:
-    # 기본값은 "DOMESTIC"(국내)으로 설정합니다.
-    # 사용 가능 값: "DOMESTIC", "OVERSEAS", "OVERSEAS_FUTURES"
     MARKET_MODE = "DOMESTIC"
     
-    # 🔥 클래스 내부에서 켜지자마자 경로를 장전해버립니다. (에러 원천 차단)
     if getattr(sys, 'frozen', False):
-        # 파이썬이 EXE로 빌드되어 실행된 경우
+        # 1. 파이썬이 EXE로 빌드되어 실행된 경우 (EXE가 있는 현재 폴더)
         PROJECT_ROOT = os.path.dirname(sys.executable)
     else:
-        # 스크립트로 실행된 경우 (Flag.py 기준 2칸 위)
-        PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # 2. 스크립트로 실행된 경우 (🔥 3칸 위로 올라가야 진짜 Jubby Project가 됩니다!)
+        # 1칸(COMMON) -> 2칸(Jubby_AutoTrage_Python) -> 3칸(Jubby Project)
+        PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class TradeData:
     # =========================================================================
