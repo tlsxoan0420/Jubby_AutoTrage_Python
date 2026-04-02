@@ -614,8 +614,10 @@ class AutoTradeWorker(QThread):
                     else:
                         del self.cooldown_dict[code] # 쿨타임 지났으니 수첩에서 삭제
 
-                # 🔥 [기능 3 적용] API 호출 딜레이 무조건 지키기 (에러 원천 차단)
-                time.sleep(global_api_delay)
+                # 🟢 [수정됨] 스캔할 때는 너무 빠르면 KIS 서버가 차단하므로 SCAN_DELAY(0.3초)를 적용합니다!
+                try: scan_delay = float(db_temp.get_shared_setting("TRADE", "SCAN_DELAY", "0.3"))
+                except: scan_delay = 0.3
+                time.sleep(scan_delay)
 
                 try: prob, curr_price, df_feat = self.mw.get_ai_probability(code)
                 except Exception as e: continue
@@ -849,6 +851,11 @@ class FormMain(QtWidgets.QMainWindow):
         self.api_manager = KIS_Manager(ui_main=self)
         self.api_manager.start_api() 
         self.strategy_engine = JubbyStrategy(log_callback=self.add_log)
+
+        # =========================================================
+        # 🔥 [핵심 수정] 전략 엔진이 '생성된 직후'에 명단을 쥐어줍니다!
+        self.strategy_engine.set_stock_dict(self.DYNAMIC_STOCK_DICT)
+        # =========================================================
 
         self.my_holdings = {}; self.last_known_cash = 0 
         
@@ -1088,7 +1095,6 @@ class FormMain(QtWidgets.QMainWindow):
             ("TRADE", "MAX_STOCKS", "30", "계좌 내 최대 동시 보유 가능 종목 개수"),
             ("TRADE", "MIN_SCAN_STOCKS", "60", "한 사이클(1분)당 스캔할 주도주 개수 (속도 최적화용)"),
             ("TRADE", "USE_FUNDS_PERCENT", "100", "총 자산 중 자동매매에 사용할 금액 비중 (%)"),
-            ("TRADE", "MAX_INVEST_PER_STOCK", "30.0", "한 종목에 들어갈 수 있는 최대 자산 비중 (%)"),
             ("TRADE", "PYRAMIDING_YIELD", "3.0", "불타기(추가 매수)를 시도할 최소 수익률 (%)"),
             ("TRADE", "PYRAMIDING_RATE", "50.0", "불타기 시 기존 투자금 대비 추가 진입할 금액 비율 (%)"),
             
@@ -1102,8 +1108,6 @@ class FormMain(QtWidgets.QMainWindow):
             ("TRADE", "BUDGET_WEIGHT_HIGH", "12.0", "AI 확신도 최상일 때 진입 비중 (12%)"),
             ("TRADE", "BUDGET_WEIGHT_MID", "7.0", "AI 확신도 중간일 때 진입 비중 (7%)"),
             ("TRADE", "BUDGET_WEIGHT_LOW", "4.0", "AI 확신도 커트라인 통과 시 기본 비중 (4%)"),
-            ("TRADE", "MAX_INVEST_PER_STOCK", "20.0", "한 종목당 최대 투자 한도 (%)"),
-
             ("TRADE", "MAX_INVEST_PER_STOCK", "20.0", "한 종목당 최대 투자 한도 (%)"),
             
             # 🔥 [핵심 추가] 실전 3대장 방어막 세팅
