@@ -39,11 +39,13 @@ class TradeData:
 
             self.last_mock_price = 70000 
 
-            dtColumns =  ['종목코드','종목명','현재가','시가','고가','저가','매수호가','매도호가','매수잔량','매도잔량','거래량']
+            # 🔥 [수정] '시간'을 제일 첫 번째 컬럼으로 배치
+            dtColumns =  ['시간','종목코드','종목명','현재가','시가','고가','저가','매수호가','매도호가','매수잔량','매도잔량','거래량']
             self.df = pd.DataFrame(columns=dtColumns, dtype=object)
 
         def update_df(self):
             new_row = {
+                '시간': datetime.now().strftime("%H:%M:%S"), # 🔥 시간 자동 주입!
                 '종목코드' : self.symbol, '종목명' : self.symbol_name, '현재가': self.last_price,
                 '시가': self.open_price, '고가': self.high_price, '저가': self.low_price,
                 '매수호가': self.bid_price, '매도호가': self.ask_price, '매수잔량': self.bid_size,
@@ -71,6 +73,7 @@ class TradeData:
                 low_p = min(price, open_p) - random.randint(0, 100)
                 
                 rows.append({
+                    '시간': datetime.now().strftime("%H:%M:%S"), # 🔥 시간 자동 주입!
                     '종목코드': code, '종목명': name, '현재가': price,
                     '시가': open_p, '고가': high_p, '저가': low_p,
                     '매수호가': price - 100, '매도호가': price + 100,
@@ -85,12 +88,14 @@ class TradeData:
     class Account:
         def __init__(self):
             self.update_count = 0
-            dtColumns = ['종목코드','종목명','보유수량','평균매입가','평가손익','주문가능금액']
+            # 🔥 [수정] '시간'을 제일 첫 번째 컬럼으로 배치
+            dtColumns = ['시간','종목코드','종목명','보유수량','평균매입가','평가손익','주문가능금액']
             self.df = pd.DataFrame(columns=dtColumns, dtype=object)
 
         def generate_mock_data(self):
             self.df = pd.DataFrame(columns=self.df.columns)
             new_row = {
+                '시간': datetime.now().strftime("%H:%M:%S"), # 🔥 시간 자동 주입!
                 '종목코드': '005930', '종목명': '삼성전자', '보유수량': 100,
                 '평균매입가': '70,000', '평가손익': '2.50%', '주문가능금액': '5,000,000'
             }
@@ -102,16 +107,17 @@ class TradeData:
     class Strategy:
         def __init__(self):
             self.update_count = 0
-            # 💡 [핵심 수정] 이미지에 맞춰 '상승확률' 컬럼 추가 완료!
-            dtColumns = ['종목코드','종목명','상승확률','MA_5','MA_20','RSI','MACD','전략신호']
+            # 🔥 [수정] '시간'을 제일 첫 번째 컬럼으로 배치
+            dtColumns = ['시간','종목코드','종목명','상승확률','MA_5','MA_20','RSI','MACD','전략신호']
             self.df = pd.DataFrame(columns=dtColumns, dtype=object)
 
         def generate_mock_data(self):
             self.df = pd.DataFrame(columns=self.df.columns)
             prob = random.uniform(0.1, 0.9)
             new_row = {
+                '시간': datetime.now().strftime("%H:%M:%S"), # 🔥 시간 자동 주입!
                 '종목코드': '005930', '종목명': '삼성전자', 
-                '상승확률': f"{prob*100:.1f}%", # 추가된 컬럼 더미 데이터
+                '상승확률': f"{prob*100:.1f}%", 
                 'MA_5': 71000, 'MA_20': 70000, 
                 'RSI': f"{random.randint(20, 80)}", 
                 'MACD': f"{random.uniform(-1.0, 1.0):.2f}", 
@@ -124,16 +130,16 @@ class TradeData:
     # =========================================================================
     class Order:
         def __init__(self):
-            # 💡 [핵심 수정] 이미지에 맞춰 한글 8개 컬럼명 지정 완료!
-            dtColumns = ['종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '주문시간', '상태']
+            # 🔥 [수정] '주문시간'을 맨 앞 '시간'으로 통일하여 배치
+            dtColumns = ['시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태']
             self.df = pd.DataFrame(columns=dtColumns, dtype=object)
             
         def generate_mock_data(self):
             self.df = pd.DataFrame(columns=self.df.columns)
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now = datetime.now().strftime("%H:%M:%S")
             rows = [
-                {'종목코드': '005930', '종목명': '삼성전자', '주문종류': '매수(BUY)', '주문가격': '75,000', '주문수량': '10', '체결수량': '10', '주문시간': now, '상태': '체결완료'},
-                {'종목코드': '000660', '종목명': 'SK하이닉스', '주문종류': '매도(SELL)', '주문가격': '150,000', '주문수량': '5', '체결수량': '5', '주문시간': now, '상태': '체결완료'}
+                {'시간': now, '종목코드': '005930', '종목명': '삼성전자', '주문종류': '매수(BUY)', '주문가격': '75,000', '주문수량': '10', '체결수량': '10', '상태': '체결완료'},
+                {'시간': now, '종목코드': '000660', '종목명': 'SK하이닉스', '주문종류': '매도(SELL)', '주문가격': '150,000', '주문수량': '5', '체결수량': '5', '상태': '체결완료'}
             ]
             self.df = pd.concat([self.df, pd.DataFrame(rows)], ignore_index=True)
 
@@ -145,6 +151,7 @@ class TradeData:
         result_list = []
         for _, row in self.market.df.iterrows():
             result_list.append({
+                "time": str(row.get('시간', '')), # 🔥 C#에 시간 전달
                 "symbol": str(row.get('종목코드', '')),
                 "symbol_name": str(row.get('종목명', '')),
                 "last_price": str(row.get('현재가', '0')),
@@ -164,6 +171,7 @@ class TradeData:
         result_list = []
         for _, row in self.account.df.iterrows():
             result_list.append({
+                "time": str(row.get('시간', '')), # 🔥 C#에 시간 전달
                 "symbol": str(row.get('종목코드', '')),
                 "symbol_name": str(row.get('종목명', '')),
                 "quantity": str(row.get('보유수량', '0')),
@@ -178,9 +186,10 @@ class TradeData:
         result_list = []
         for _, row in self.strategy.df.iterrows():
             result_list.append({
+                "time": str(row.get('시간', '')), # 🔥 C#에 시간 전달
                 "symbol": str(row.get('종목코드', '')),
                 "symbol_name": str(row.get('종목명', '')),
-                "ai_prob": str(row.get('상승확률', '0%')), # C# 변환기에도 상승확률 추가
+                "ai_prob": str(row.get('상승확률', '0%')), 
                 "ma_5": str(row.get('MA_5', '')),
                 "ma_20": str(row.get('MA_20', '')),
                 "rsi": str(row.get('RSI', '')),
@@ -191,11 +200,10 @@ class TradeData:
         return result_list
 
     def order_dict(self):
-        # 💡 [핵심 수정] 빈 배열만 보내던 것을 한글 컬럼을 읽어 보내도록 고쳤습니다.
         result_list = []
         for _, row in self.order.df.iterrows():
             result_list.append({
-                "time": str(row.get('주문시간', '')),
+                "time": str(row.get('시간', '')), # 🔥 C#에 시간 전달
                 "symbol": str(row.get('종목코드', '')),
                 "symbol_name": str(row.get('종목명', '')),
                 "type": str(row.get('주문종류', '')),

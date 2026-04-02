@@ -161,7 +161,7 @@ class AITrainerWorker(QThread):
 
 
 # =====================================================================
-# 🤖 [일꾼 3호] 매매 관리자 (🔥 초고속 1분 사이클 & 팅김 원천 차단)
+# 🤖 [일꾼 3호] 매매 관리자 (🔥 스마트 지정가 + 10분 쿨타임 + API 교통정리 적용)
 # =====================================================================
 class AutoTradeWorker(QThread):
     sig_log = pyqtSignal(str, str); sig_account_df = pyqtSignal(object)        
@@ -180,6 +180,9 @@ class AutoTradeWorker(QThread):
             
         self.panic_mode = False; self.closing_mode_notified = False; self.imminent_notified = False
         self.was_crash_mode = False; self.loss_streak_cnt = 0 
+        
+        # 🔥 [기능 2] 매도한 종목을 기억하는 10분 쿨타임 수첩 생성
+        self.cooldown_dict = {}
 
     def run(self):
         self.is_running = True
@@ -192,46 +195,82 @@ class AutoTradeWorker(QThread):
             except Exception as e: 
                 self.sig_log.emit(f"🚨 매매 분석 중 일시적 오류 발생: {e}", "error")
                 
-            # 🔥 다음 탐색까지 쉬는 시간 조절 (100 = 10초, 50 = 5초)
-            # 10초만 쉬고 곧바로 다시 주도주를 탐색하러 돌아갑니다!
-            for _ in range(150):
+            try: cycle_wait_count = int(JubbyDB_Manager().get_shared_setting("TRADE", "CYCLE_WAIT_COUNT", "100"))
+            except: cycle_wait_count = 100
+            
+            for _ in range(cycle_wait_count):
                 if not self.is_running: break 
                 time.sleep(0.1)
                 
-        # 스레드가 죽기 직전 메모리 충돌을 막기 위한 안전장치
         time.sleep(0.5)
 
     def execute_guaranteed_sell(self, code, qty, current_price):
         stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
-        max_retries = 10 
+        db_temp = JubbyDB_Manager()
+        
+        try: max_retries = int(db_temp.get_shared_setting("API", "SELL_MAX_RETRY", "10"))
+        except: max_retries = 10
+        try: retry_delay = float(db_temp.get_shared_setting("API", "SELL_RETRY_DELAY", "1.0"))
+        except: retry_delay = 1.0
+        
+        # 🔥 [기능 1] 스마트 지정가 세팅 확인
+        use_smart = db_temp.get_shared_setting("TRADE", "USE_SMART_LIMIT", "Y") == "Y"
+        
         for i in range(max_retries):
-            if self.mw.api_manager.sell(code, qty):
+            # KIS_Manager에 지정가 기능이 있으면 지정가, 없으면 시장가로 융통성 있게 작동
+            if use_smart and hasattr(self.mw.api_manager, 'sell_limit_order'):
+                success = self.mw.api_manager.sell_limit_order(code, qty, current_price)
+            else:
+                success = self.mw.api_manager.sell(code, qty)
+                
+            if success:
                 if i > 0: self.sig_log.emit(f"✅ [{stock_name}] {i}번의 재시도 끝에 매도 접수 완료!", "success")
+                
+                # 🔥 [기능 2 적용] 매도 완료 시 수첩에 현재 시간 기록!
+                self.cooldown_dict[code] = datetime.now()
                 return True
+                
             self.sig_log.emit(f"⚠️ [{stock_name}] 매도 실패! 즉시 재시도합니다... ({i+1}/{max_retries})", "warning")
-            time.sleep(1.0) 
+            time.sleep(retry_delay) 
             if not self.is_running and not getattr(self, 'panic_mode', False): break
             
         if self.is_running or getattr(self, 'panic_mode', False):
             self.sig_log.emit(f"🚨 [{stock_name}] 매도 {max_retries}회 연속 실패!", "error")
         return False
 
-    def execute_guaranteed_buy(self, code, qty):
+    def execute_guaranteed_buy(self, code, qty, current_price):
         stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
-        max_retries = 5 
-        if self.mw.api_manager.buy_market_price(code, qty): return True
+        db_temp = JubbyDB_Manager()
+
+        try: max_retries = int(db_temp.get_shared_setting("API", "SELL_MAX_RETRY", "10"))
+        except: max_retries = 10
+        try: retry_delay = float(db_temp.get_shared_setting("API", "SELL_RETRY_DELAY", "1.0"))
+        except: retry_delay = 1.0
+
+        # 🔥 [기능 1] 스마트 지정가 세팅 확인
+        use_smart = db_temp.get_shared_setting("TRADE", "USE_SMART_LIMIT", "Y") == "Y"
+
+        if use_smart and hasattr(self.mw.api_manager, 'buy_limit_order'):
+            success = self.mw.api_manager.buy_limit_order(code, qty, current_price)
+        else:
+            success = self.mw.api_manager.buy_market_price(code, qty)
+
+        if success: return True
             
         self.sig_log.emit(f"⚠️ [{stock_name}] 1차 매수 실패! 1초 후 AI 재판단 후 재시도...", "warning")
-        time.sleep(1.0) 
+        time.sleep(retry_delay) 
         
         for i in range(1, max_retries):
             if not self.is_running or getattr(self, 'panic_mode', False): return False
-            try: prob, curr_price, df_feat = self.mw.get_ai_probability(code)
+            try: prob, new_price, df_feat = self.mw.get_ai_probability(code)
             except: return False
             if prob == -1.0 or df_feat is None or df_feat.empty: return False
             if self.mw.strategy_engine.check_trade_signal(df_feat, code) != "BUY": return False
             
-            if self.mw.api_manager.buy_market_price(code, qty): return True
+            if use_smart and hasattr(self.mw.api_manager, 'buy_limit_order'):
+                if self.mw.api_manager.buy_limit_order(code, qty, new_price): return True
+            else:
+                if self.mw.api_manager.buy_market_price(code, qty): return True
             time.sleep(0.5) 
         return False
 
@@ -240,6 +279,10 @@ class AutoTradeWorker(QThread):
         pool = list(self.mw.DYNAMIC_STOCK_DICT.keys())
         hot_list = []
         db_temp = JubbyDB_Manager()
+        
+        # 🔥 [기능 3] API 딜레이 불러오기
+        try: global_api_delay = float(db_temp.get_shared_setting("API", "GLOBAL_API_DELAY", "0.06"))
+        except: global_api_delay = 0.06
         
         try: target_limit = int(db_temp.get_shared_setting("TRADE", "HOT_STOCK_LIMIT", "300"))
         except: target_limit = 300
@@ -267,6 +310,8 @@ class AutoTradeWorker(QThread):
                 for mrkt, price1, price2 in search_conditions:
                     if len(hot_list) >= target_limit: break 
                     params = {"FID_COND_MRKT_DIV_CODE": mrkt, "FID_COND_SCR_DIV_CODE": "20171", "FID_INPUT_ISCD": "0000", "FID_DIV_CLS_CODE": "0", "FID_BLNG_CLS_CODE": "0", "FID_TRGT_CLS_CODE": "111111111", "FID_TRGT_EXLS_CLS_CODE": "0000000000", "FID_INPUT_PRICE_1": price1, "FID_INPUT_PRICE_2": price2, "FID_VOL_CNT": "0", "FID_INPUT_DATE_1": ""}
+                    
+                    time.sleep(global_api_delay) # 교통정리
                     res = requests.get(url, headers=headers, params=params, timeout=3)
                     
                     if res.status_code == 200 and res.json().get('rt_cd') == '0':
@@ -280,7 +325,6 @@ class AutoTradeWorker(QThread):
                                 condition_count += 1
                                 if condition_count >= max_per_condition: break
                                 if len(hot_list) >= target_limit: break
-                    time.sleep(0.2) 
             except Exception: pass
 
         if len(hot_list) < 20: 
@@ -293,7 +337,6 @@ class AutoTradeWorker(QThread):
         return hot_list
 
     def process_trading(self):
-        # 🔥 [안전장치 1] 중지 버튼을 누르면 이 함수 시작부터 진입을 막습니다.
         if not self.is_running: return 
         
         now = datetime.now(); now_hm = int(now.strftime("%H%M")) 
@@ -317,6 +360,10 @@ class AutoTradeWorker(QThread):
         is_safe_profit_close = in_time(now_hm, t_close, t_imminent - 1)    
         is_imminent_close    = in_time(now_hm, t_imminent, t_end)          
 
+        # 🔥 [기능 3] API 트래픽 제어 딜레이 로드
+        try: global_api_delay = float(db_temp.get_shared_setting("API", "GLOBAL_API_DELAY", "0.06"))
+        except: global_api_delay = 0.06
+
         api_cash = self.mw.api_manager.get_balance()
         my_cash = api_cash if api_cash is not None else getattr(self.mw, 'last_known_cash', 0)
         self.mw.last_known_cash = my_cash; cash_str = f"{my_cash:,}" 
@@ -335,8 +382,9 @@ class AutoTradeWorker(QThread):
         market_crash_mode = False
         market_ticker = "069500" if SystemConfig.MARKET_MODE == "DOMESTIC" else ("QQQ" if SystemConfig.MARKET_MODE == "OVERSEAS" else "NQM26")
         
-        if not self.is_running: return # 🔥 [안전장치 2] 즉시 탈출
+        if not self.is_running: return 
         
+        time.sleep(global_api_delay) # 교통정리
         market_etf = self.mw.api_manager.fetch_minute_data(market_ticker)
         if market_etf is not None and len(market_etf) > 1:
             etf_now = market_etf.iloc[-1]['close']; etf_prev = market_etf.iloc[-2]['close']
@@ -372,14 +420,13 @@ class AutoTradeWorker(QThread):
         if len(current_holdings) > 0: 
             sold_codes = []
             for code, info in current_holdings: 
-                # 🔥 [안전장치 3] 여기서부터 핵심입니다. '중지' 버튼이 눌리면 루프를 부수고 데이터를 화면에 쏘지 않은 채 완전 퇴근합니다.
                 if not self.is_running: 
                     self.sig_log.emit("🛑 보유 종목 검사 중단 (사용자 요청)", "warning")
                     return 
 
                 if code not in self.mw.my_holdings: continue 
 
-                time.sleep(0.2) # 보유 종목 통신 안정화
+                time.sleep(global_api_delay) # 교통정리
 
                 buy_price = info['price']; buy_qty = info['qty']; stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
                 high_watermark = info.get('high_watermark', buy_price); buy_time = info.get('buy_time', now); half_sold = info.get('half_sold', False) 
@@ -419,20 +466,27 @@ class AutoTradeWorker(QThread):
                 is_sell_all = False; is_sell_half = False; status_msg = ""; sell_qty = buy_qty
                 strat_signal = self.mw.strategy_engine.check_trade_signal(df, code)
 
+                try: safe_profit_rate = float(db_temp.get_shared_setting("TRADE", "SAFE_PROFIT_RATE", "0.3"))
+                except: safe_profit_rate = 0.3
+                try: strat_profit_preserve = float(db_temp.get_shared_setting("TRADE", "STRAT_PROFIT_PRESERVE", "0.5"))
+                except: strat_profit_preserve = 0.5
+                try: deadcross_escape_rate = float(db_temp.get_shared_setting("TRADE", "DEADCROSS_ESCAPE_RATE", "1.5"))
+                except: deadcross_escape_rate = 1.5
+
                 if getattr(self, 'panic_mode', False): is_sell_all = True; status_msg = "🚨 긴급 전체 청산"
                 elif is_imminent_close: is_sell_all = True; status_msg = "마감 임박 시장가 청산"
                 elif is_safe_profit_close:
-                    if profit_rate >= 0.3: is_sell_all = True; status_msg = "방어 마감 익절"
+                    if profit_rate >= safe_profit_rate: is_sell_all = True; status_msg = "방어 마감 익절" 
                     elif profit_rate > 0.0 and curr_macd < curr_signal: is_sell_all = True; status_msg = "추세꺾임 탈출"
                     elif profit_rate <= stop_rate: is_sell_all = True; status_msg = "기계적 손절"
                 else:
                     if use_trailing and profit_rate >= ts_start and trail_drop_rate >= ts_gap: is_sell_all = True; status_msg = f"트레일링 스탑 ({ts_gap}% 하락)"
                     elif elapsed_mins >= max_hold_min: is_sell_all = True; status_msg = f"시간 제한 ({max_hold_min}분)"
-                    elif strat_signal == "SELL" and profit_rate > 0.5: is_sell_all = True; status_msg = "매도 신호 (수익 보존)"
+                    elif strat_signal == "SELL" and profit_rate > strat_profit_preserve: is_sell_all = True; status_msg = "매도 신호 (수익 보존)" 
                     elif strat_signal == "SELL" and profit_rate <= stop_rate: is_sell_all = True; status_msg = "매도 신호 (손절)"
                     elif profit_rate >= target_rate and not half_sold: is_sell_half = True; sell_qty = max(1, int(buy_qty // 2)); status_msg = f"목표가({target_rate:.1f}%) 1차 익절"
                     elif profit_rate <= stop_rate: is_sell_all = True; status_msg = f"손절라인({stop_rate:.1f}%) 이탈"
-                    elif profit_rate >= 1.5 and curr_macd < curr_signal: is_sell_all = True; status_msg = "데드크로스 탈출"
+                    elif profit_rate >= deadcross_escape_rate and curr_macd < curr_signal: is_sell_all = True; status_msg = "데드크로스 탈출" 
 
                 if is_sell_half or is_sell_all:
                     if self.execute_guaranteed_sell(code, sell_qty, curr_price): 
@@ -453,7 +507,9 @@ class AutoTradeWorker(QThread):
                         total_invested -= (buy_price * sell_qty); total_current_val -= (curr_price * sell_qty)
 
                         log_icon, log_color = ("🟢", "success") if profit_rate > 0 else ("🔴", "sell")
-                        sell_msg = (f"{log_icon} [매도 완료] {stock_name} | {curr_price:,.2f}원 | 손익: {int(realized_profit):,}원 ({profit_rate:.2f}%)")
+                        sell_type_str = "1차 익절(절반)" if is_sell_half else "전량 청산"
+
+                        sell_msg = (f"{log_icon} [{sell_type_str}] {stock_name} | {curr_price:,.2f}원 | 매도수량: {sell_qty}주 | 손익: {int(realized_profit):,}원 ({profit_rate:.2f}%)")
                         self.sig_log.emit(sell_msg, log_color) 
                         self.mw.send_kakao_msg(f"🔔 [주삐 매도]\n종목: {stock_name}\n수익률: {profit_rate:.2f}%\n손익: {int(realized_profit):,}원\n사유: {status_msg}") 
                         sell_type_str = '익절' if profit_rate > 0 else '손절'
@@ -472,7 +528,7 @@ class AutoTradeWorker(QThread):
             for code in sold_codes: 
                 if code in self.mw.my_holdings: del self.mw.my_holdings[code]
 
-        if not self.is_running: return # 🔥 [안전장치 4] 즉시 탈출
+        if not self.is_running: return 
 
         if getattr(self, 'panic_mode', False):
             if len(self.mw.my_holdings) > 0:
@@ -490,6 +546,26 @@ class AutoTradeWorker(QThread):
             else: briefing_msg += "\n[보유 주식] 없음"
             self.sig_log.emit(briefing_msg, "info")
 
+        if not hasattr(self.mw, 'accumulated_account'): self.mw.accumulated_account = {}
+        for row in account_rows: self.mw.accumulated_account[row['종목코드']] = row
+        
+        for ac_code in list(self.mw.accumulated_account.keys()):
+            if ac_code not in self.mw.my_holdings:
+                self.mw.accumulated_account[ac_code]['보유수량'] = "0 (매도됨)"
+                self.mw.accumulated_account[ac_code]['평가손익금'] = "매도완료"
+                self.mw.accumulated_account[ac_code]['현재가'] = "-"
+                self.mw.accumulated_account[ac_code]['수익률'] = "-"
+                
+        temp_acc_rows = list(self.mw.accumulated_account.values())
+        if temp_acc_rows:
+            temp_acc_rows[0]['주문가능금액'] = f"{my_cash:,.0f}" 
+            df_acc_temp = pd.DataFrame(temp_acc_rows)
+            acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','주문가능금액']
+            for c in acc_cols:
+                if c not in df_acc_temp.columns: df_acc_temp[c] = ""
+            self.sig_account_df.emit(df_acc_temp[acc_cols].copy())
+            self.sig_sync_cs.emit()
+
         current_count = len(self.mw.my_holdings)
         try: max_stocks_setting = int(db_temp.get_shared_setting("TRADE", "MAX_STOCKS", "10"))
         except: max_stocks_setting = 10
@@ -497,30 +573,49 @@ class AutoTradeWorker(QThread):
         
         candidates = []; scanned_log_list = []; scan_targets = []
 
-        if is_closing_phase or market_crash_mode: pass 
+        if is_closing_phase or market_crash_mode:
+            pass 
+
         elif self.loss_streak_cnt >= loss_limit_cnt:
-            if now.minute % 5 == 0: self.sig_log.emit(f"🛑 {loss_limit_cnt}연패 리스크 관리! 신규 스캔 중단.", "error")
-        elif not is_golden_time: pass 
+            if now.minute % 5 == 0 and getattr(self, 'last_loss_log', -1) != now.minute:
+                self.sig_log.emit(f"🛑 {loss_limit_cnt}연패 리스크 관리! 신규 종목 탐색을 일시 중단합니다.", "error")
+                self.last_loss_log = now.minute 
+
+        elif not is_golden_time:
+            current_hm = now.strftime("%H:%M") 
+            if getattr(self, 'last_idle_log', '') != current_hm and now.minute % 1 == 0:
+                self.sig_log.emit(f"💤 [대기중] 현재는 자동매매 가동 시간이 아닙니다. (현재시간: {current_hm})", "info")
+                self.last_idle_log = current_hm 
+            pass 
+
         elif needed_count > 0 and not getattr(self, 'panic_mode', False):
             safe_holdings_values = list(self.mw.my_holdings.values())
             total_asset = my_cash + sum([info['price'] * info['qty'] for info in safe_holdings_values])
             
-            # 🔥 [1분 보장 최적화] 대상 개수를 60개로 대폭 줄여서 스캔 속도를 10초 이내로 단축시킵니다!
             try: min_scan_stocks = int(db_temp.get_shared_setting("TRADE", "MIN_SCAN_STOCKS", "60"))
             except: min_scan_stocks = 60
+            
+            # 🔥 [기능 2] 쿨타임 수치 불러오기
+            try: cooldown_min = int(db_temp.get_shared_setting("TRADE", "COOLDOWN_MINUTES", "10"))
+            except: cooldown_min = 10
             
             scan_targets = self.get_realtime_hot_stocks()
 
             for code in scan_targets:
-                # 🔥 [안전장치 5] 검색 도중 중지 명령을 받으면 아무 신호도 쏘지 말고 조용히 함수를 빠져나갑니다 (return).
                 if not self.is_running: 
                     self.sig_log.emit("🛑 신규 탐색 중단 (사용자 요청)", "warning")
                     return 
 
-                # ✅ 여기를 0.4으로 수정하세요! (DB 설정이 없을 때의 기본값도 0.4으로 변경)
-                try: scan_delay = float(db_temp.get_shared_setting("TRADE", "SCAN_DELAY", "0.4"))
-                except: scan_delay = 0.4
-                time.sleep(scan_delay)
+                # 🔥 [기능 2 적용] 최근에 팔았던 종목이면 10분 쿨타임 검사 (연속 뺨 맞기 방지!)
+                if code in self.cooldown_dict:
+                    elapsed_cooldown = (datetime.now() - self.cooldown_dict[code]).total_seconds() / 60.0
+                    if elapsed_cooldown < cooldown_min:
+                        continue # 10분이 안 지났으므로 과감히 패스!
+                    else:
+                        del self.cooldown_dict[code] # 쿨타임 지났으니 수첩에서 삭제
+
+                # 🔥 [기능 3 적용] API 호출 딜레이 무조건 지키기 (에러 원천 차단)
+                time.sleep(global_api_delay)
 
                 try: prob, curr_price, df_feat = self.mw.get_ai_probability(code)
                 except Exception as e: continue
@@ -569,7 +664,7 @@ class AutoTradeWorker(QThread):
 
                 if len(scanned_log_list) >= min_scan_stocks: break
             
-            if not self.is_running: return # 🔥 [안전장치 6] 스캔 직후 체크
+            if not self.is_running: return 
 
             if scanned_log_list:
                 scanned_log_list = sorted(scanned_log_list, key=lambda x: x['prob'], reverse=True)
@@ -585,7 +680,7 @@ class AutoTradeWorker(QThread):
             if candidates:
                 candidates = sorted(candidates, key=lambda x: x['prob'], reverse=True)
                 for i in range(min(needed_count, len(candidates))):
-                    if not self.is_running: return # 🔥 [안전장치 7] 매수 진입 직전 체크
+                    if not self.is_running: return 
 
                     cand = candidates[i]; code = cand['code']; prob = cand['prob']; curr_price = cand['price']; stock_name = cand['stock_name']; is_pyramiding = cand['is_pyramiding']
 
@@ -600,9 +695,17 @@ class AutoTradeWorker(QThread):
                         except: pyramiding_rate = 50.0
                         target_budget = cand['current_invested'] * (pyramiding_rate / 100.0); max_remaining_for_stock = cand['max_allowed'] - cand['current_invested']; target_budget = min(target_budget, max_remaining_for_stock)
                     else:
-                        if prob >= 0.85: weight = 0.20     
-                        elif prob >= 0.70: weight = 0.10   
-                        else: weight = 0.05                
+                        try: weight_high = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_HIGH", "20.0")) / 100.0
+                        except: weight_high = 0.20
+                        try: weight_mid = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_MID", "10.0")) / 100.0
+                        except: weight_mid = 0.10
+                        try: weight_low = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_LOW", "5.0")) / 100.0
+                        except: weight_low = 0.05
+                        
+                        if prob >= 0.85: weight = weight_high     
+                        elif prob >= 0.70: weight = weight_mid   
+                        else: weight = weight_low                
+                        
                         base_target_budget = float(total_asset * weight)
                         try: atr_high_limit = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_LIMIT", "5.0")); atr_high_ratio = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_RATIO", "50.0")) / 100.0; atr_mid_limit  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_LIMIT", "2.5")); atr_mid_ratio  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_RATIO", "70.0")) / 100.0
                         except: atr_high_limit, atr_high_ratio = 5.0, 0.5; atr_mid_limit, atr_mid_ratio = 2.5, 0.7
@@ -616,7 +719,8 @@ class AutoTradeWorker(QThread):
                     if buy_qty * curr_price > my_cash: buy_qty = int(my_cash // curr_price)
                     if buy_qty == 0: continue
 
-                    if buy_qty > 0 and self.execute_guaranteed_buy(code, buy_qty):
+                    # 🔥 [기능 1 적용] 매수 실행 함수에 현재가(limit_price) 전달
+                    if buy_qty > 0 and self.execute_guaranteed_buy(code, buy_qty, curr_price):
                         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         if is_pyramiding:
                             old_qty = cand['holding_qty']; old_price = cand['holding_price']; new_total_qty = old_qty + buy_qty; new_avg_price = ((old_price * old_qty) + (curr_price * buy_qty)) / new_total_qty
@@ -638,11 +742,8 @@ class AutoTradeWorker(QThread):
                             if c not in temp_df.columns: temp_df[c] = ""
                         self.sig_account_df.emit(temp_df[acc_cols].copy()); self.sig_sync_cs.emit()
 
-        if not self.is_running: return # 🔥 [안전장치 8] 표를 렌더링하기 전에도 죽었는지 묻습니다.
+        if not self.is_running: return 
 
-        # =========================================================================
-        # 🔥 실시간 데이터 보존 (마지막까지 살아서 여기까지 온 경우에만 실행됩니다!)
-        # =========================================================================
         if not hasattr(self.mw, 'accumulated_market'): self.mw.accumulated_market = {}
         if not hasattr(self.mw, 'accumulated_strategy'): self.mw.accumulated_strategy = {}
         if not hasattr(self.mw, 'accumulated_account'): self.mw.accumulated_account = {}
@@ -692,7 +793,6 @@ class AutoTradeWorker(QThread):
             self.sig_log.emit("🛑 긴급 청산 완료", "warning")
             self.panic_mode = False; self.is_running = False; self.sig_panic_done.emit()
 
-
 # =====================================================================
 # 🖥️ 메인 UI 클래스
 # =====================================================================
@@ -701,45 +801,50 @@ class FormMain(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
+
+        # 🔥 [핵심 수정] 실수로 삭제되었던 UI 도화지 렌더링 코드를 다시 채워 넣습니다!
+        self.initUI()
+
         self.sig_safe_log.connect(self._safe_append_log_sync)
 
         self.db = JubbyDB_Manager()
         self.db.cleanup_old_data() 
-        
-        try:
-            conn = self.db._get_connection(self.db.shared_db_path)
-            conn.execute("DELETE FROM MarketStatus"); conn.execute("DELETE FROM AccountStatus")
-            conn.execute("DELETE FROM StrategyStatus"); conn.execute("DELETE FROM TradeHistory") 
-            conn.commit(); conn.close()
-            self.db.insert_log("INFO", "🧹 [시스템] 이전 실시간 DB 데이터를 성공적으로 초기화했습니다.")
-        except Exception as e:
-            if hasattr(self, 'db'): self.db.insert_log("WARNING", f"⚠️ DB 실시간 데이터 초기화 실패: {e}")
-        
-        db_mode = self.db.get_shared_setting("SYSTEM", "MARKET_MODE", "DOMESTIC")
-        SystemConfig.MARKET_MODE = db_mode
-        self.db.insert_log("INFO", f"⚙️ 시스템 초기화 완료 (모드: {db_mode})")
 
-        self.initUI() 
+        self.init_default_settings()
         
-        self.output_logger = OutputLogger()
-        self.output_logger.emit_log.connect(self.sys_print_to_log)
-        sys.stdout = self.output_logger
-        sys.stderr = self.output_logger 
-
+        # -------------------------------------------------------------
+        # 📖 [여기서부터 찾으세요!] DB에서 종목 명단 불러오는 구간
+        # -------------------------------------------------------------
         try:
             conn = self.db._get_connection(self.db.shared_db_path)
             query = f"SELECT symbol, symbol_name FROM target_stocks WHERE market_mode = '{SystemConfig.MARKET_MODE}'"
             df_dict = pd.read_sql(query, conn)
             conn.close()
             
-            if SystemConfig.MARKET_MODE == "DOMESTIC": self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str).str.zfill(6), df_dict['symbol_name']))
-            else: self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str), df_dict['symbol_name']))
-                
+            # 1. 먼저 딕셔너리를 생성합니다.
+            if SystemConfig.MARKET_MODE == "DOMESTIC": 
+                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str).str.zfill(6), df_dict['symbol_name']))
+            else: 
+                self.DYNAMIC_STOCK_DICT = dict(zip(df_dict['symbol'].astype(str), df_dict['symbol_name']))
+            
+            # ---------------------------------------------------------
+            # 🔥 [여기가 정확한 삽입 위치입니다!]
+            # 위에서 만든 '명단(딕셔너리)'을 전략 엔진에게 배달해줍니다.
+            # ---------------------------------------------------------
+            if hasattr(self, 'strategy_engine'):
+                self.strategy_engine.set_stock_dict(self.DYNAMIC_STOCK_DICT)
+            # ---------------------------------------------------------
+
             if not self.DYNAMIC_STOCK_DICT: raise ValueError("DB 명단이 비어 있습니다.")
             self.add_log(f"📖 DB에서 {len(self.DYNAMIC_STOCK_DICT)}개 종목 명단을 불러왔습니다!", "info")
+
         except Exception as e:
             self.add_log(f"⚠️ DB 명단 로드 실패: {e}", "warning")
             self.DYNAMIC_STOCK_DICT = {"005930": "삼성전자"}
+            
+            # 실패했을 때도 최소한의 정보를 전달
+            if hasattr(self, 'strategy_engine'):
+                self.strategy_engine.set_stock_dict(self.DYNAMIC_STOCK_DICT)
 
         self.api_manager = KIS_Manager(ui_main=self)
         self.api_manager.start_api() 
@@ -949,6 +1054,82 @@ class FormMain(QtWidgets.QMainWindow):
         self.shortcut_sell = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Shift+W"), self); self.shortcut_sell.activated.connect(self.emergency_sell_event)
         self.hide()
 
+    # =====================================================================
+    # ⚙️ [핵심 추가] 환경설정 기본값 DB 자동 세팅 및 관리 함수
+    # =====================================================================
+    def init_default_settings(self):
+        """
+        프로그램 최초 실행 시, 사용할 모든 알고리즘 및 대기시간 변수를 DB에 
+        자동으로 등록해주는 함수입니다. 
+        이후 사용자는 DB(SQLite DB Browser 등)를 열어 SharedSettings 테이블의 값만 수정하면 
+        프로그램 코드 수정 없이 실시간으로 설정이 반영됩니다.
+        """
+        # (그룹명, 키값, 기본값, 설명)
+        default_settings = [
+            # 🕒 [시간 설정] (HHMM 형식) - 장 시작/마감 시간
+            ("TRADE", "TIME_START_DOM", "0900", "국내 주식 자동매매 시작 시간"),
+            ("TRADE", "TIME_CLOSE_DOM", "1520", "국내 주식 신규매수 차단 및 방어 익절 시작 시간"),
+            ("TRADE", "TIME_IMMINENT_DOM", "1525", "국내 주식 마감 임박 (강제 전체 청산 시간)"),
+            ("TRADE", "TIME_END_DOM", "1530", "국내 주식 장 종료 시간"),
+            ("TRADE", "TIME_START_OVS", "2230", "해외 주식 자동매매 시작 시간"),
+            ("TRADE", "TIME_CLOSE_OVS", "0430", "해외 주식 마감 임박 시작 시간"),
+            
+            # 💸 [리스크 및 컷오프(손/익절) 설정]
+            ("TRADE", "CRASH_LIMIT", "-1.5", "시장(ETF) 폭락 감지 기준 (%) - 도달 시 매수 정지"),
+            ("TRADE", "LOSS_STREAK_LIMIT", "5", "연속 손절 허용 횟수 - 이 횟수만큼 손절나면 당일 매수 일시 중단"),
+            ("TRADE", "USE_TRAILING", "Y", "트레일링 스탑 기능 사용 여부 (Y/N)"),
+            ("TRADE", "TRAILING_START_YIELD", "1.5", "트레일링 스탑이 켜지는 최소 수익률 (%)"),
+            ("TRADE", "TRAILING_STOP_GAP", "0.8", "최고점 대비 하락 허용 폭 (%) - 이만큼 떨어지면 즉시 익절"),
+            ("TRADE", "MAX_HOLDING_TIME", "20", "최대 보유 시간 (분) - 이 시간이 지나면 기계적 청산"),
+            
+            # 📊 [비중 및 탐색 알고리즘 설정]
+            ("AI", "THRESHOLD", "70.0", "AI 매수 추천 최소 확신도 커트라인 (%)"),
+            ("TRADE", "SCAN_DELAY", "0.4", "API 호출 딜레이 (초) - 증권사 초당 호출 제한 방어용"),
+            ("TRADE", "MAX_STOCKS", "30", "계좌 내 최대 동시 보유 가능 종목 개수"),
+            ("TRADE", "MIN_SCAN_STOCKS", "60", "한 사이클(1분)당 스캔할 주도주 개수 (속도 최적화용)"),
+            ("TRADE", "USE_FUNDS_PERCENT", "100", "총 자산 중 자동매매에 사용할 금액 비중 (%)"),
+            ("TRADE", "MAX_INVEST_PER_STOCK", "30.0", "한 종목에 들어갈 수 있는 최대 자산 비중 (%)"),
+            ("TRADE", "PYRAMIDING_YIELD", "3.0", "불타기(추가 매수)를 시도할 최소 수익률 (%)"),
+            ("TRADE", "PYRAMIDING_RATE", "50.0", "불타기 시 기존 투자금 대비 추가 진입할 금액 비율 (%)"),
+            
+            # 📈 [ATR(변동성) 기반 비중 조절 설정]
+            ("TRADE", "ATR_HIGH_LIMIT", "5.0", "변동성(ATR) 극심함 판단 기준 (%)"),
+            ("TRADE", "ATR_HIGH_RATIO", "50.0", "변동성 극심할 때 매수 비중 축소 비율 (%)"),
+            ("TRADE", "ATR_MID_LIMIT", "2.5", "변동성(ATR) 다소 높음 판단 기준 (%)"),
+            ("TRADE", "ATR_MID_RATIO", "70.0", "변동성 높을 때 매수 비중 축소 비율 (%)"),
+
+            # 💰 [30종목용 공격적 비중 설정]
+            ("TRADE", "BUDGET_WEIGHT_HIGH", "12.0", "AI 확신도 최상일 때 진입 비중 (12%)"),
+            ("TRADE", "BUDGET_WEIGHT_MID", "7.0", "AI 확신도 중간일 때 진입 비중 (7%)"),
+            ("TRADE", "BUDGET_WEIGHT_LOW", "4.0", "AI 확신도 커트라인 통과 시 기본 비중 (4%)"),
+            ("TRADE", "MAX_INVEST_PER_STOCK", "20.0", "한 종목당 최대 투자 한도 (%)"),
+
+            ("TRADE", "MAX_INVEST_PER_STOCK", "20.0", "한 종목당 최대 투자 한도 (%)"),
+            
+            # 🔥 [핵심 추가] 실전 3대장 방어막 세팅
+            ("TRADE", "COOLDOWN_MINUTES", "10", "매도(청산) 후 재진입 금지 시간 (분) - 복수혈전 방지"),
+            ("TRADE", "USE_SMART_LIMIT", "Y", "시장가 대신 스마트 지정가 사용 여부 (Y/N) - 슬리피지 방어"),
+            ("API", "GLOBAL_API_DELAY", "0.05", "API 초당 호출 제한 방어용 딜레이 (초) - 트래픽 교통정리"),
+        ]
+
+        try:
+            inserted_count = 0
+            # 위에서 정의한 기본값 리스트를 반복하며 DB에 없는 녀석만 밀어 넣습니다.
+            for group, key, val, desc in default_settings:
+                # DB에서 현재 값을 가져와 봅니다.
+                current_val = self.db.get_shared_setting(group, key, default_value=None)
+                
+                # DB에 세팅값이 등록되어 있지 않다면 (최초 실행)
+                if current_val is None:
+                    # 기본값을 DB에 써줍니다.
+                    self.db.set_shared_setting(group, key, val)
+                    inserted_count += 1
+                    
+            if inserted_count > 0:
+                self.add_log(f"⚙️ [초기화] {inserted_count}개의 기본 환경설정이 DB에 등록되었습니다. 이제 DB에서 직접 수정 가능합니다.", "info")
+        except Exception as e:
+            self.add_log(f"⚠️ [오류] 환경설정 기본값 세팅 중 에러 발생: {e}", "error")
+
     @QtCore.pyqtSlot()
     def show_python_ui(self):
         self.show() 
@@ -1103,15 +1284,31 @@ class FormMain(QtWidgets.QMainWindow):
         try:
             selected_ranges = self.tbAccount.selectedRanges() 
             if not selected_ranges: return
-            row = selected_ranges[0].topRow(); item = self.tbAccount.item(row, 0)
+            
+            # 🔥 [핵심 수정] 0번째 칸은 '시간'이므로, 1번째 칸('종목코드')을 읽어오도록 수정!
+            row = selected_ranges[0].topRow()
+            item = self.tbAccount.item(row, 1)  # <--- 숫자 0을 1로 변경했습니다!
+            
             if item is None: return
             code = item.text().strip() 
             if code == "-" or not code: return
+            
             if code in self.my_holdings:
-                qty = self.my_holdings[code]['qty']; stock_name = self.DYNAMIC_STOCK_DICT.get(code, code)
+                qty = self.my_holdings[code]['qty']
+                stock_name = self.DYNAMIC_STOCK_DICT.get(code, code)
                 if self.api_manager.sell(code, qty):
-                    del self.my_holdings[code]; self.tbAccount.removeRow(row)
-                    if hasattr(self, 'trade_worker'): self.trade_worker.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': '비상(SELL_LOSS)', '주문가격': '시장가', '주문수량': qty, '체결수량': qty, '주문시간': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), '상태': '비상청산완료', '수익률': "0.00%"})
+                    del self.my_holdings[code]
+                    self.tbAccount.removeRow(row)
+                    
+                    if hasattr(self, 'trade_worker'): 
+                        self.trade_worker.sig_order_append.emit({
+                            '종목코드': code, '종목명': stock_name, 
+                            '주문종류': '비상(SELL_LOSS)', '주문가격': '시장가', 
+                            '주문수량': qty, '체결수량': qty, 
+                            '주문시간': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                            '상태': '비상청산완료', '수익률': "0.00%"
+                        })
+                        self.add_log(f"🚨 [비상탈출] {stock_name} 수동 청산 완료!", "sell")
         except Exception: pass
 
     def get_ai_probability(self, code):
@@ -1124,10 +1321,16 @@ class FormMain(QtWidgets.QMainWindow):
             if features is not None: prob = self.strategy_engine.ai_model.predict_proba(features)[0][1]
         return prob, curr_price, df
 
+    # ▼▼▼ [아래 코드로 교체하세요] ▼▼▼
     @QtCore.pyqtSlot(object) 
-    def update_account_table_slot(self, df): self.update_table(self.tbAccount, df)
+    def update_account_table_slot(self, df): 
+        TradeData.account.df = df  # 🔥 핵심 패치: 백그라운드 데이터를 갱신해야 C# DB로 넘어갑니다!
+        self.update_table(self.tbAccount, df)
+        
     @QtCore.pyqtSlot(object) 
-    def update_strategy_table_slot(self, df): self.update_table(self.tbStrategy, df)
+    def update_strategy_table_slot(self, df): 
+        TradeData.strategy.df = df # 🔥 핵심 패치: 백그라운드 데이터를 갱신해야 C# DB로 넘어갑니다!
+        self.update_table(self.tbStrategy, df)
 
     @QtCore.pyqtSlot(str, str) 
     def add_log(self, text, log_type="info"):
@@ -1138,6 +1341,12 @@ class FormMain(QtWidgets.QMainWindow):
         color = {"info": "white", "success": "lime", "warning": "yellow", "error": "red", "send": "cyan", "recv": "orange", "buy": "#4B9CFF", "sell": "#FF4B4B"}.get(log_type, "white")
         formatted_text = text.replace('\n', '<br>&nbsp;&nbsp;&nbsp;&nbsp;')
         html_msg = f'<span style="color:{color}"><b>{datetime.now().strftime("[%H:%M:%S]")}</b> {formatted_text}</span>'
+        
+        # 🔥 [핵심 추가] txtLog가 아직 생성되기 전에 날아온 초기 로그면 팅기지 않게 방어합니다!
+        if not hasattr(self, 'txtLog'):
+            print(f"[{log_type.upper()}] {text}") # 화면 대신 까만 터미널 창에만 출력
+            return
+            
         self.txtLog.appendHtml(html_msg)
         
         # 🔥 [핵심 수정 2] 팅김을 유발하던 스크롤 조작 코드를 가장 튼튼하고 안전한 방식으로 변경했습니다.

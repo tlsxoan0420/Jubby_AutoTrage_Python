@@ -190,20 +190,24 @@ class KIS_API:
             
         return holdings
     
+   # =====================================================================
+    # 🛒 시장가 및 지정가 매수/매도 주문 (스마트 지정가 호환 패치 완료)
     # =====================================================================
-    # 🛒 시장가 매수/매도 주문
-    # =====================================================================
-    def order_stock(self, stock_code, qty, is_buy=True):
+    def order_stock(self, stock_code, qty, is_buy=True, limit_price=0):
         """ 한국투자증권에 실제로 '이거 사줘!', '이거 팔아줘!' 라고 명령을 보냅니다. """
         time.sleep(0.2)
+        
+        # 🔥 [핵심 추가] limit_price가 0이면 시장가(01), 0보다 크면 지정가(00)로 셋팅
+        ord_dvsn = "01" if limit_price == 0 else "00"
+        price_str = "0" if limit_price == 0 else str(int(limit_price))
         
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
             tr_id = ("VTTC0802U" if is_buy else "VTTC0801U") if self.is_mock else ("TTTC0802U" if is_buy else "TTTC0801U")
             payload = {
                 "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01",
-                "PDNO": str(stock_code), "ORD_DVSN": "01", 
-                "ORD_QTY": str(int(qty)), "ORD_UNPR": "0",
+                "PDNO": str(stock_code), "ORD_DVSN": ord_dvsn, # 🔥 지정가/시장가 유동적 적용
+                "ORD_QTY": str(int(qty)), "ORD_UNPR": price_str, # 🔥 가격 유동적 적용
                 "CTAC_TLNO": "", "PRSR_DVSN": "", "ALGO_NO": ""
             }
             
@@ -213,21 +217,22 @@ class KIS_API:
             payload = {
                 "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01",
                 "OVRS_EXCG_CD": "NASD", "PDNO": str(stock_code),
-                "ORD_QTY": str(int(qty)), "OVRS_ORD_UNPR": "0", 
-                "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": "00" 
+                "ORD_QTY": str(int(qty)), "OVRS_ORD_UNPR": price_str, 
+                "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": "00" # 해외는 기본 지정가 방식 
             }
 
-        # 🔥 [치명적 버그 수정] 해외선물 매수/매도 주문 로직 추가!
         elif SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES":
             if self.is_mock:
                 self._log_msg("⚠️ 모의투자는 해외선물 주문 API를 지원하지 않습니다.", "warning")
                 return False
             url = f"{self.base_url}/uapi/overseas-futureoption/v1/trading/order"
-            tr_id = "JTFF1002U" if is_buy else "JTFF1006U" # 선물 실전 매수/매도 TR_ID
+            tr_id = "JTFF1002U" if is_buy else "JTFF1006U" 
+            # 해선: 시장가는 01, 지정가는 02
+            fut_ord_dvsn = "01" if limit_price == 0 else "02" 
             payload = {
                 "CANO": self.account_no[:8], "ACNT_PRDT_CD": "04",
                 "PDNO": str(stock_code), "ORD_QTY": str(int(qty)),
-                "ORD_DVSN": "01", "ORD_UNPR": "0" # 01: 시장가
+                "ORD_DVSN": fut_ord_dvsn, "ORD_UNPR": price_str 
             }
         else:
             return False
@@ -255,7 +260,8 @@ class KIS_API:
         except Exception as e:
             self._log_msg(f"🚨 주문 통신 오류: {e}")
             return False
-   # =====================================================================
+        
+    # =====================================================================
     # 📈 최근 1분봉 데이터 120개 조회 (AI 분석용)
     # =====================================================================
     def fetch_minute_data(self, stock_code):
@@ -322,6 +328,10 @@ class KIS_API:
                 df = pd.DataFrame(output)
                 cols = df.columns.tolist()
                 
+                # 🔥 [핵심 수정] 증권사가 주는 날짜와 시간 컬럼을 찾아냅니다!
+                c_date = next((c for c in ['stck_bsop_date', 'xymd', 'date'] if c in cols), None)
+                c_time = next((c for c in ['stck_cntg_hour', 'xhms', 'xhm', 'time'] if c in cols), None)
+                
                 c_open = next((c for c in ['stck_oprc', 'open', 'oprc'] if c in cols), None)
                 c_high = next((c for c in ['stck_hgpr', 'high', 'hgpr'] if c in cols), None)
                 c_low = next((c for c in ['stck_lwpr', 'low', 'lwpr'] if c in cols), None)
@@ -330,12 +340,29 @@ class KIS_API:
                 
                 if None in [c_open, c_high, c_low, c_close, c_vol]: return None
 
-                df = df[[c_open, c_high, c_low, c_close, c_vol]]
-                df.columns = ['open', 'high', 'low', 'close', 'volume']
-                df = df.apply(pd.to_numeric)
+                # 🔥 [핵심 수정] 날짜와 시간이 존재하면 버리지 않고 리스트에 챙깁니다.
+                sel_cols = []
+                fin_cols = []
                 
+                if c_date: 
+                    sel_cols.append(c_date)
+                    fin_cols.append('date')
+                if c_time: 
+                    sel_cols.append(c_time)
+                    fin_cols.append('time')
+                    
+                sel_cols.extend([c_open, c_high, c_low, c_close, c_vol])
+                fin_cols.extend(['open', 'high', 'low', 'close', 'volume'])
+
+                df = df[sel_cols]
+                df.columns = fin_cols
+                
+                # 숫자로 변환 후 뒤집기
+                df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
                 df = df.iloc[::-1].reset_index(drop=True)
+                
                 return df
+            
             else:
                 # 🔥 [핵심 추가] 증권사가 데이터를 안 주면, 왜 안 주는지 로그를 화면에 띄웁니다!
                 self._log_msg(f"⚠️ [{stock_code}] 차트 수신 거절: {data.get('msg1')}", "warning")
@@ -390,6 +417,17 @@ class KIS_Manager:
         mode_icon = "🇰🇷" if SystemConfig.MARKET_MODE == "DOMESTIC" else "🌐"
         self._log(f"📉 {mode_icon} [{code}] 매도 전송 중...", "send")
         return self.api.order_stock(code, qty, is_buy=False)
+
+    # 🔥 [핵심 추가] 스마트 지정가를 위한 전용 주문 함수
+    def buy_limit_order(self, code, qty, price):
+        mode_icon = "🇰🇷" if SystemConfig.MARKET_MODE == "DOMESTIC" else "🌐"
+        self._log(f"🛒 {mode_icon} [{code}] {qty}주 매수 시도 (지정가: {price:,.0f}원)", "buy")
+        return self.api.order_stock(code, qty, is_buy=True, limit_price=price)
+
+    def sell_limit_order(self, code, qty, price):
+        mode_icon = "🇰🇷" if SystemConfig.MARKET_MODE == "DOMESTIC" else "🌐"
+        self._log(f"📉 {mode_icon} [{code}] {qty}주 매도 전송 중... (지정가: {price:,.0f}원)", "send")
+        return self.api.order_stock(code, qty, is_buy=False, limit_price=price)
         
     def get_balance(self): return self.api.get_account_balance()
     def get_real_holdings(self): return self.api.get_account_holdings()
