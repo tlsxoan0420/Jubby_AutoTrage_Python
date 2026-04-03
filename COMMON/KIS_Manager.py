@@ -24,6 +24,8 @@ class KIS_API:
         self.base_url = "https://openapivts.koreainvestment.com:29443" if is_mock else "https://openapi.koreainvestment.com:9443"
         self.access_token = "" 
         self.log = log_callback 
+
+        self.last_error_msg = ""  # 🔥 [추가] 가장 최근에 발생한 에러 메시지를 저장할 변수
         
         # 🔥 [DB 연동] 통신 에러나 성공 기록을 무조건 DB에 남기기 위해 장착
         self.db = JubbyDB_Manager()
@@ -247,17 +249,30 @@ class KIS_API:
             data = res.json()
             
             if data.get('rt_cd') == '0':
+                self.last_error_msg = "" # 🔥 성공 시 초기화
                 self._log_msg(f"✅ [{SystemConfig.MARKET_MODE}] 주문 성공: {data.get('msg1')}", "success")
                 return True
             else:
-                self._log_msg(f"⚠️ 주문 거절 (사유: {data.get('msg1')})", "warning")
-                if SystemConfig.MARKET_MODE == "DOMESTIC" and not is_buy and self.is_mock and ("잔고" in data.get('msg1', '')):
+                msg = data.get('msg1', '')
+                self.last_error_msg = msg # 🔥 실패 사유 저장
+                self._log_msg(f"⚠️ 주문 거절 (사유: {msg})", "warning")
+                
+                # 모의투자 상품코드 02 재시도 로직
+                if SystemConfig.MARKET_MODE == "DOMESTIC" and not is_buy and self.is_mock and ("잔고" in msg):
                     payload["ACNT_PRDT_CD"] = "02"
                     self._log_msg(f"🔄 [{stock_code}] 상품코드 02로 재시도 중...", "info")
                     res = requests.post(url, headers=headers, data=json.dumps(payload))
-                    if res.json().get('rt_cd') == '0': return True
+                    retry_data = res.json()
+                    
+                    if retry_data.get('rt_cd') == '0': 
+                        self.last_error_msg = ""
+                        return True
+                    else:
+                        self.last_error_msg = retry_data.get('msg1', '') # 재시도 실패 사유 갱신
+                        
                 return False
         except Exception as e:
+            self.last_error_msg = str(e)
             self._log_msg(f"🚨 주문 통신 오류: {e}")
             return False
         
@@ -318,58 +333,70 @@ class KIS_API:
             "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": tr_id, "custtype": "P"
         }
 
-        try:
-            res = requests.get(url, headers=headers, params=params)
-            data = res.json()
-            if data.get('rt_cd') == '0':
-                output = data.get('output2', [])
-                if not output: return None
+        # ▼▼▼ 여기서부터 끝까지 덮어씌우기 (최대 3회 리트라이 로직 추가) ▼▼▼
+        for attempt in range(3): 
+            try:
+                res = requests.get(url, headers=headers, params=params)
+                data = res.json()
                 
-                df = pd.DataFrame(output)
-                cols = df.columns.tolist()
-                
-                # 🔥 [핵심 수정] 증권사가 주는 날짜와 시간 컬럼을 찾아냅니다!
-                c_date = next((c for c in ['stck_bsop_date', 'xymd', 'date'] if c in cols), None)
-                c_time = next((c for c in ['stck_cntg_hour', 'xhms', 'xhm', 'time'] if c in cols), None)
-                
-                c_open = next((c for c in ['stck_oprc', 'open', 'oprc'] if c in cols), None)
-                c_high = next((c for c in ['stck_hgpr', 'high', 'hgpr'] if c in cols), None)
-                c_low = next((c for c in ['stck_lwpr', 'low', 'lwpr'] if c in cols), None)
-                c_close = next((c for c in ['stck_prpr', 'last', 'close', 'prpr'] if c in cols), None)
-                c_vol = next((c for c in ['evol', 'cntg_vol', 'vold', 'vol', 'acml_vol'] if c in cols), None)
-                
-                if None in [c_open, c_high, c_low, c_close, c_vol]: return None
-
-                # 🔥 [핵심 수정] 날짜와 시간이 존재하면 버리지 않고 리스트에 챙깁니다.
-                sel_cols = []
-                fin_cols = []
-                
-                if c_date: 
-                    sel_cols.append(c_date)
-                    fin_cols.append('date')
-                if c_time: 
-                    sel_cols.append(c_time)
-                    fin_cols.append('time')
+                if data.get('rt_cd') == '0':
+                    output = data.get('output2', [])
+                    if not output: return None
                     
-                sel_cols.extend([c_open, c_high, c_low, c_close, c_vol])
-                fin_cols.extend(['open', 'high', 'low', 'close', 'volume'])
+                    df = pd.DataFrame(output)
+                    cols = df.columns.tolist()
+                    
+                    # 증권사가 주는 날짜와 시간 컬럼을 찾아냅니다!
+                    c_date = next((c for c in ['stck_bsop_date', 'xymd', 'date'] if c in cols), None)
+                    c_time = next((c for c in ['stck_cntg_hour', 'xhms', 'xhm', 'time'] if c in cols), None)
+                    
+                    c_open = next((c for c in ['stck_oprc', 'open', 'oprc'] if c in cols), None)
+                    c_high = next((c for c in ['stck_hgpr', 'high', 'hgpr'] if c in cols), None)
+                    c_low = next((c for c in ['stck_lwpr', 'low', 'lwpr'] if c in cols), None)
+                    c_close = next((c for c in ['stck_prpr', 'last', 'close', 'prpr'] if c in cols), None)
+                    c_vol = next((c for c in ['evol', 'cntg_vol', 'vold', 'vol', 'acml_vol'] if c in cols), None)
+                    
+                    if None in [c_open, c_high, c_low, c_close, c_vol]: return None
 
-                df = df[sel_cols]
-                df.columns = fin_cols
+                    sel_cols = []
+                    fin_cols = []
+                    
+                    if c_date: 
+                        sel_cols.append(c_date)
+                        fin_cols.append('date')
+                    if c_time: 
+                        sel_cols.append(c_time)
+                        fin_cols.append('time')
+                        
+                    sel_cols.extend([c_open, c_high, c_low, c_close, c_vol])
+                    fin_cols.extend(['open', 'high', 'low', 'close', 'volume'])
+
+                    df = df[sel_cols]
+                    df.columns = fin_cols
+                    
+                    # 숫자로 변환 후 뒤집기
+                    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+                    df = df.iloc[::-1].reset_index(drop=True)
+                    
+                    return df
                 
-                # 숫자로 변환 후 뒤집기
-                df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-                df = df.iloc[::-1].reset_index(drop=True)
-                
-                return df
-            
-            else:
-                # 🔥 [핵심 추가] 증권사가 데이터를 안 주면, 왜 안 주는지 로그를 화면에 띄웁니다!
-                self._log_msg(f"⚠️ [{stock_code}] 차트 수신 거절: {data.get('msg1')}", "warning")
-                return None
-        except Exception as e:
-            self._log_msg(f"🚨 [{stock_code}] 차트 통신 에러: {e}", "error")
-            return None
+                else:
+                    msg = data.get('msg1', '')
+                    # 🚨 [핵심 리트라이 방어막] 트래픽 초과 시 0.5초 대기 후 재시도
+                    if "초과" in msg or "초당" in msg:
+                        self._log_msg(f"⏳ [{stock_code}] 차트 수신 지연(트래픽). 0.5초 후 재시도... ({attempt+1}/3)", "warning")
+                        time.sleep(0.5)
+                        continue # 포기하지 않고 위로 올라가 다시 get 시도!
+                    else:
+                        self._log_msg(f"⚠️ [{stock_code}] 차트 수신 거절: {msg}", "warning")
+                        return None
+                        
+            except Exception as e:
+                self._log_msg(f"🚨 [{stock_code}] 차트 통신 에러: {e}. 재시도 중...", "error")
+                time.sleep(0.5)
+
+        # 3번 모두 실패했을 경우
+        return None
 
 # =====================================================================
 # 👔 [2] KIS_Manager 클래스

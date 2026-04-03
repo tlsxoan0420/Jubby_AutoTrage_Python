@@ -53,10 +53,13 @@ def collect_worker(code, app_key, app_secret, access_token, base_url, market_dic
         if raw_df is not None and not raw_df.empty:
             try:
                 future_win = int(db_worker.get_shared_setting("AI_TRAIN", "FUTURE_WINDOW", "10"))
-                p_target = float(db_worker.get_shared_setting("AI_TRAIN", "PROFIT_TARGET", "1.5"))
-                s_loss = float(db_worker.get_shared_setting("AI_TRAIN", "STOP_LOSS", "1.0"))
+                
+                # 🔥 [수정] 문제집 정답 기준을 '익절 2.0%, 손절 1.5%'로 깐깐하게 상향!
+                p_target = float(db_worker.get_shared_setting("AI_TRAIN", "PROFIT_TARGET", "2.0"))
+                s_loss = float(db_worker.get_shared_setting("AI_TRAIN", "STOP_LOSS", "1.5"))
             except:
-                future_win, p_target, s_loss = 10, 1.5, 1.0
+                # 🔥 [수정] DB 오류 시 작동하는 백업 수치도 2.0, 1.5로 맞춰줍니다.
+                future_win, p_target, s_loss = 10, 2.0, 1.5
                 
             processed_df = calculate_indicators_logic(raw_df, market_dict, future_win, p_target, s_loss)
             

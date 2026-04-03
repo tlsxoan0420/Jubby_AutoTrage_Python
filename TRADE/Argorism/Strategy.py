@@ -16,9 +16,11 @@ from COMMON.DB_Manager import JubbyDB_Manager
 # 🛡️ [추가] LSTM 방어막(관측수) 클래스 구조 정의
 # =========================================================================
 class JubbyLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size=32, num_layers=1):
+    # 🚨 [수정됨] 뇌 용량(64)과 층수(2)를 트레이너와 똑같이 맞춤
+    def __init__(self, input_size, hidden_size=64, num_layers=2): 
         super(JubbyLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        # 🚨 [수정됨] dropout=0.2 도 똑같이 추가해줍니다.
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
         self.fc = nn.Linear(hidden_size, 1)
         self.sigmoid = nn.Sigmoid()
         
@@ -26,7 +28,6 @@ class JubbyLSTM(nn.Module):
         out, _ = self.lstm(x)
         out = self.fc(out[:, -1, :])
         return self.sigmoid(out)
-
 
 class JubbyStrategy:
     """
@@ -40,6 +41,11 @@ class JubbyStrategy:
         # 종목명을 찾기 위한 딕셔너리 저장용 변수
         self.stock_dict = {} 
         self.db = JubbyDB_Manager()
+
+        self.ai_model = None
+        self.lstm_model = None 
+        self.scaler = None # 🔥 스케일러 변수 추가
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         self.ai_model = None
         self.lstm_model = None 
@@ -93,6 +99,15 @@ class JubbyStrategy:
 
             # 2. 휩쏘 방어막 LSTM 관측수 뇌(.pth) 로드
             lstm_path = model_path.replace(".pkl", "_lstm.pth")
+            scaler_path = model_path.replace(".pkl", "_scaler.pkl") # 🔥 스케일러 경로
+
+            # 🔥 스케일러 파일 로드
+            if os.path.exists(scaler_path):
+                try:
+                    self.scaler = joblib.load(scaler_path)
+                except:
+                    self.scaler = None
+
             if os.path.exists(lstm_path):
                 try:
                     self.lstm_model = JubbyLSTM(input_size=18).to(self.device)
@@ -283,13 +298,17 @@ class JubbyStrategy:
     # =====================================================================
     def get_dynamic_exit_prices(self, df, avg_buy_price):
         try:
-            profit_rate = float(self.db.get_shared_setting("TRADE", "PROFIT_RATE", "1.2")) / 100.0
-            stop_rate = float(self.db.get_shared_setting("TRADE", "STOP_RATE", "1.0")) / 100.0
-            atr_target_multi = float(self.db.get_shared_setting("TRADE", "ATR_TARGET_MULTI", "1.5"))
+            # 🔥 [수정 1] DB에서 불러오는 기본값을 2.0% (익절), 1.5% (손절)로 상향 조절합니다.
+            profit_rate = float(self.db.get_shared_setting("TRADE", "PROFIT_RATE", "2.0")) / 100.0
+            stop_rate = float(self.db.get_shared_setting("TRADE", "STOP_RATE", "1.5")) / 100.0
+            
+            # 🔥 [추가 팁] 변동성이 클 때(ATR) 목표가도 같이 높아지도록 배수를 1.5 -> 2.0으로 올려줍니다.
+            atr_target_multi = float(self.db.get_shared_setting("TRADE", "ATR_TARGET_MULTI", "2.0"))
             atr_stop_multi = float(self.db.get_shared_setting("TRADE", "ATR_STOP_MULTI", "1.0"))
         except:
-            profit_rate, stop_rate = 0.012, 0.010
-            atr_target_multi, atr_stop_multi = 1.5, 1.0
+            # 🔥 [수정 2] DB 연결 실패 시 백업용으로 쓰는 수치도 2.0%(0.020) / 1.5%(0.015)로 맞춰줍니다.
+            profit_rate, stop_rate = 0.020, 0.015
+            atr_target_multi, atr_stop_multi = 2.0, 1.0
 
         if len(df) < 26 or avg_buy_price <= 0:
             return avg_buy_price * (1.0 + profit_rate), avg_buy_price * (1.0 - stop_rate)
@@ -335,15 +354,18 @@ class JubbyStrategy:
                 is_above_vwap = curr_price >= current.get('VWAP', curr_price)
                 is_above_ma5 = curr_price >= current.get('MA5', curr_price)
                 is_macd_good = current.get('MACD', 0) >= current.get('Signal_Line', 0)
+                
+                # 🔥 [수정됨] RSI가 40 이하로 과하게 떨어졌을 때(낙폭과대)도 예외적으로 통과시켜줌
+                is_rsi_oversold = current.get('RSI', 50) <= 40.0 
 
-                if is_above_vwap or is_above_ma5 or is_macd_good:
-                    # 🔥 [새로운 방어막] 호가창 매도/매수 잔량 비율 검사
+                # if 조건문에 is_rsi_oversold 를 추가해 줍니다.
+                if is_above_vwap or is_above_ma5 or is_macd_good or is_rsi_oversold:
                     if self.check_orderbook_imbalance(code):
                         self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 떡상 징후 포착! (상승 확률: {ai_prob*100:.1f}%)", "buy")
                         buy_signal = True
                 else:
                     self.send_log(f"🛡️ [AI 승인 거절] {pretty_name} 확률은 {ai_prob*100:.1f}% 이나, 추세 저항(세력선 이탈)으로 진입 포기", "warning")
-
+       
         # 2. [전략 A & B] 아날로그 돌파/추세 매매 로직
         try:
             breakout_vol = float(self.db.get_shared_setting("TRADE", "BREAKOUT_VOL", "2.0")) 
@@ -366,11 +388,17 @@ class JubbyStrategy:
         # 🛡️ 3. [이중 잠금장치] LSTM이 10분 차트 보고 최종 판단!
         # =================================================================
         if buy_signal:
-            if self.lstm_model is not None and len(df) >= 10:
+            # 🔥 self.scaler is not None 조건이 추가되었습니다.
+            if self.lstm_model is not None and self.scaler is not None and len(df) >= 10:
                 seq_features = self.get_ai_sequence_features(df, seq_length=10)
                 
                 if seq_features is not None and len(seq_features) == 10:
-                    seq_tensor = torch.tensor(seq_features, dtype=torch.float32).unsqueeze(0).to(self.device)
+                    
+                    # 🚨 [핵심 버그 해결] 거대한 숫자의 실시간 차트 데이터를 0~1로 압축합니다!
+                    seq_features_scaled = self.scaler.transform(seq_features)
+                    
+                    # 압축된 데이터를 텐서로 변환하여 모델에 입력
+                    seq_tensor = torch.tensor(seq_features_scaled, dtype=torch.float32).unsqueeze(0).to(self.device)
                     
                     with torch.no_grad():
                         lstm_prob = self.lstm_model(seq_tensor).item()

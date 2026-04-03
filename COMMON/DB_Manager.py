@@ -74,7 +74,11 @@ class JubbyDB_Manager:
                 ("TRADE", "TIME_START_DOM", "0900"),        # 주간장 스캔 시작 시간
                 ("TRADE", "TIME_CLOSE_DOM", "1500"),        # 주간장 마감 방어 모드 시간
                 ("TRADE", "TIME_IMMINENT_DOM", "1515"),     # 묻지마 시장가 강제 청산 시간
-                ("TRADE", "TIME_END_DOM", "1530")           # 주간장 종료 시간
+                ("TRADE", "TIME_END_DOM", "1530"),           # 주간장 종료 시간
+                # 🔥 [추가] 리스크 관리 셧다운 설정
+                ("RISK", "MAX_CONSECUTIVE_LOSS", "5", "연속 손절 시 매수 셧다운 횟수"),
+                ("RISK", "DAILY_STOP_LOSS_PCT", "-10.0", "일일 누적 손실 제한 (%)"),
+                ("RISK", "IS_LOCKED", "N", "매수 기능 강제 잠금 여부 (Y/N)"),
             ]
             for category, key, val in default_settings:
                 conn.execute("INSERT OR IGNORE INTO SharedSettings (category, key, value) VALUES (?, ?, ?)", (category, key, val))

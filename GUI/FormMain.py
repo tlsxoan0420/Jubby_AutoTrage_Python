@@ -230,8 +230,23 @@ class AutoTradeWorker(QThread):
                 self.cooldown_dict[code] = datetime.now()
                 return True
                 
+            # 🚨 [핵심 버그 수정 1] KIS API에서 받은 에러 메시지를 꺼내옵니다.
+            error_msg = getattr(self.mw.api_manager.api, 'last_error_msg', '')
+            
+            # 🚨 [핵심 버그 수정 2] 잔고가 없다고 명확히 뜨면, 10번 재시도하지 않고 바로 포기!
+            if "잔고" in error_msg or "잔고내역" in error_msg:
+                self.sig_log.emit(f"🚨 [{stock_name}] 실제 잔고가 없습니다! 억지 매도를 멈추고 보유목록에서 삭제합니다.", "error")
+                # 의도적으로 True를 반환해 FormMain.py가 마치 잘 팔린 것처럼 프로그램 내부 장바구니에서 해당 주식을 치우게 만듭니다.
+                return True 
+                
             self.sig_log.emit(f"⚠️ [{stock_name}] 매도 실패! 즉시 재시도합니다... ({i+1}/{max_retries})", "warning")
-            time.sleep(retry_delay) 
+            
+            # 🚨 [핵심 버그 수정 3] API 초당 호출 수 제한(디도스 방어)에 걸리면 트래픽 진정을 위해 좀 더 오래 대기
+            if "초과" in error_msg or "초당" in error_msg:
+                time.sleep(1.5) # 1.5초 휴식
+            else:
+                time.sleep(retry_delay) 
+                
             if not self.is_running and not getattr(self, 'panic_mode', False): break
             
         if self.is_running or getattr(self, 'panic_mode', False):
@@ -443,14 +458,29 @@ class AutoTradeWorker(QThread):
                 curr_price = float(df.iloc[-1]['close']); profit_rate = ((curr_price - buy_price) / buy_price) * 100 
                 profit_amt = (curr_price - buy_price) * buy_qty
                 
-                stock_details_str += f"  🔸 {stock_name}: 매입 {buy_price:,.2f} -> 현재 {curr_price:,.2f} ({profit_rate:+.2f}%)\n"
+                # stock_details_str += f"  🔸 {stock_name}: 매입 {buy_price:,.2f} -> 현재 {curr_price:,.2f} ({profit_rate:+.2f}%)\n"
                 
                 target_price, stop_price = self.mw.strategy_engine.get_dynamic_exit_prices(df, buy_price)
                 target_rate = ((target_price - buy_price) / buy_price) * 100; stop_rate = ((stop_price - buy_price) / buy_price) * 100
 
-                if curr_price > high_watermark:
+# (기존 코드) 최고점 갱신 로직
+                if curr_price > holding_high:
                     self.mw.my_holdings[code]['high_watermark'] = curr_price
-                    high_watermark = curr_price
+                    holding_high = curr_price
+
+                # 🌟 [추가할 알고리즘] 본전 방어 (Break-Even Stop)
+                max_profit_rate = ((holding_high - buy_price) / buy_price) * 100 # 내가 찍었던 최고 수익률
+                
+                # 한 번이라도 1.5% 이상 올랐던 주식이라면?
+                if max_profit_rate >= 1.5:
+                    # 세금과 수수료를 커버할 수 있는 본전 라인(+0.3%) 계산
+                    break_even_price = buy_price * 1.003 
+                    
+                    # 주가가 꺾여서 본전 라인까지 위협하면 뒤도 안 돌아보고 전량 익절!
+                    if curr_price <= break_even_price:
+                        is_sell_all = True
+                        self.sig_log.emit(f"🛡️ [{stock_name}] 본전 방어선 작동! (+1.5% 터치 후 하락). 수익 보존을 위해 탈출합니다.", "warning")
+
                 trail_drop_rate = ((high_watermark - curr_price) / high_watermark) * 100 if high_watermark > 0 else 0
                 elapsed_mins = (now - buy_time).total_seconds() / 60.0
 
@@ -493,7 +523,19 @@ class AutoTradeWorker(QThread):
                         if profit_rate < 0 and is_sell_all: self.loss_streak_cnt += 1
                         elif profit_rate > 0: self.loss_streak_cnt = 0 
                         
-                        if is_sell_all: sold_codes.append(code) 
+                        # 🔥 [추가] 5연패 및 누적 손실 셧다운 계산 및 발동
+                        self.mw.daily_total_pnl_pct += profit_rate # 누적 수익률 계산
+                        
+                        try: max_loss_cnt = int(db_temp.get_shared_setting("RISK", "MAX_CONSECUTIVE_LOSS", "5"))
+                        except: max_loss_cnt = 5
+                        try: limit_pnl = float(db_temp.get_shared_setting("RISK", "DAILY_STOP_LOSS_PCT", "-10.0"))
+                        except: limit_pnl = -10.0
+
+                        if self.loss_streak_cnt >= max_loss_cnt or self.mw.daily_total_pnl_pct <= limit_pnl:
+                            db_temp.set_shared_setting("RISK", "IS_LOCKED", "Y")
+                            self.sig_log.emit(f"🚨 [긴급 셧다운] {self.loss_streak_cnt}연패 또는 누적손익({self.mw.daily_total_pnl_pct:.2f}%) 도달! 뇌동매매 방지를 위해 주삐 매수를 잠급니다.", "error")
+                            
+                        if is_sell_all: sold_codes.append(code)
                         else:
                             self.mw.my_holdings[code]['qty'] -= sell_qty
                             self.mw.my_holdings[code]['half_sold'] = True
@@ -519,7 +561,10 @@ class AutoTradeWorker(QThread):
                     if code not in self.mw.my_holdings: continue 
                     cur_qty = self.mw.my_holdings[code]['qty'] if is_sell_half else buy_qty
                     account_rows.append({'종목코드': code, '종목명': stock_name, '보유수량': cur_qty, '평균매입가': f"{buy_price:,.2f}", '현재가': f"{curr_price:,.2f}", '평가손익금': f"{profit_amt:,.0f}", '수익률': f"{profit_rate:.2f}%", '주문가능금액': 0})
-                
+                    
+                    # ✅ [추가할 부분] 팔지 않고 살아남은 종목만 브리핑 대본에 적어줍니다!
+                    stock_details_str += f"  🔸 {stock_name}: 매입 {buy_price:,.2f} -> 현재 {curr_price:,.2f} ({profit_rate:+.2f}%)\n"
+
                 ma5_val = float(df.iloc[-1].get('MA5', curr_price)); ma20_val = float(df.iloc[-1].get('MA20', curr_price)); rsi_val = float(df.iloc[-1].get('RSI', 50.0))
                 strategy_rows.append({'종목코드': code, '종목명': stock_name, '상승확률': '-', 'MA_5': f"{ma5_val:.0f}", 'MA_20': f"{ma20_val:.0f}", 'RSI': f"{rsi_val:.1f}", 'MACD': f"{curr_macd:.2f}", '전략신호': '보유중'})
                 try: db_temp.update_realtime(code, curr_price, 0.0, "YES", status_msg)
@@ -599,150 +644,275 @@ class AutoTradeWorker(QThread):
             try: cooldown_min = int(db_temp.get_shared_setting("TRADE", "COOLDOWN_MINUTES", "10"))
             except: cooldown_min = 10
             
-            scan_targets = self.get_realtime_hot_stocks()
+            # 🔥 [추가] 셧다운(잠금) 상태면 매수 탐색을 건너뜁니다.
+            is_locked = db_temp.get_shared_setting("RISK", "IS_LOCKED", "N")
+            if is_locked == "Y":
+                current_hm = datetime.now().strftime("%H:%M") 
+                if getattr(self, 'last_lock_log', '') != current_hm and datetime.now().minute % 1 == 0:
+                    self.sig_log.emit("🛑 [셧다운 발동 중] 매수가 잠겨있습니다. (로그창에서 Ctrl+우클릭하여 해제 가능)", "error")
+                    self.last_lock_log = current_hm
+            else: # 🟢 잠금이 풀려있을 때만 정상적으로 매수 대상을 스캔합니다!
+                scan_targets = self.get_realtime_hot_stocks()
 
-            for code in scan_targets:
-                if not self.is_running: 
-                    self.sig_log.emit("🛑 신규 탐색 중단 (사용자 요청)", "warning")
-                    return 
+                for code in scan_targets: # 🔥 여기서부터 Tab 1칸씩 전부 밀림!
+                    if not self.is_running: 
+                        self.sig_log.emit("🛑 신규 탐색 중단 (사용자 요청)", "warning")
+                        return 
 
-                # 🔥 [기능 2 적용] 최근에 팔았던 종목이면 10분 쿨타임 검사 (연속 뺨 맞기 방지!)
-                if code in self.cooldown_dict:
-                    elapsed_cooldown = (datetime.now() - self.cooldown_dict[code]).total_seconds() / 60.0
-                    if elapsed_cooldown < cooldown_min:
-                        continue # 10분이 안 지났으므로 과감히 패스!
-                    else:
-                        del self.cooldown_dict[code] # 쿨타임 지났으니 수첩에서 삭제
+                    # 🔥 [기능 2 적용] 최근에 팔았던 종목이면 10분 쿨타임 검사 (연속 뺨 맞기 방지!)
+                    if code in self.cooldown_dict:
+                        elapsed_cooldown = (datetime.now() - self.cooldown_dict[code]).total_seconds() / 60.0
+                        if elapsed_cooldown < cooldown_min:
+                            continue # 10분이 안 지났으므로 과감히 패스!
+                        else:
+                            del self.cooldown_dict[code] # 쿨타임 지났으니 수첩에서 삭제
 
-                # 🟢 [수정됨] 스캔할 때는 너무 빠르면 KIS 서버가 차단하므로 SCAN_DELAY(0.3초)를 적용합니다!
-                try: scan_delay = float(db_temp.get_shared_setting("TRADE", "SCAN_DELAY", "0.3"))
-                except: scan_delay = 0.3
-                time.sleep(scan_delay)
+                    # 🟢 [수정됨] 스캔할 때는 너무 빠르면 KIS 서버가 차단하므로 SCAN_DELAY(0.3초)를 적용합니다!
+                    try: scan_delay = float(db_temp.get_shared_setting("TRADE", "SCAN_DELAY", "0.3"))
+                    except: scan_delay = 0.3
+                    time.sleep(scan_delay)
 
-                try: prob, curr_price, df_feat = self.mw.get_ai_probability(code)
-                except Exception as e: continue
-                if prob == -1.0 or curr_price <= 0 or np.isnan(curr_price): continue 
+                    try: prob, curr_price, df_feat = self.mw.get_ai_probability(code)
+                    except Exception as e: continue
+                    if prob == -1.0 or curr_price <= 0 or np.isnan(curr_price): continue 
 
-                is_pyramiding = False; current_invested_in_stock = 0.0; holding_qty = 0; holding_price = 0.0; max_allowed_for_stock = 0.0
+                    is_pyramiding = False; current_invested_in_stock = 0.0; holding_qty = 0; holding_price = 0.0; max_allowed_for_stock = 0.0
 
-                if code in self.mw.my_holdings:
-                    holding_info = self.mw.my_holdings[code]; holding_price = holding_info['price']; holding_qty = holding_info['qty']
-                    current_yield = (curr_price - holding_price) / holding_price * 100.0; current_invested_in_stock = holding_price * holding_qty
-                    try: pyramiding_yield = float(db_temp.get_shared_setting("TRADE", "PYRAMIDING_YIELD", "3.0"))
-                    except: pyramiding_yield = 3.0
-                    try: max_invest_per_stock_pct = float(db_temp.get_shared_setting("TRADE", "MAX_INVEST_PER_STOCK", "30.0"))
-                    except: max_invest_per_stock_pct = 30.0
-                    max_allowed_for_stock = total_asset * (max_invest_per_stock_pct / 100.0)
+                    if code in self.mw.my_holdings:
+                        holding_info = self.mw.my_holdings[code]; holding_price = holding_info['price']; holding_qty = holding_info['qty']
+                        current_yield = (curr_price - holding_price) / holding_price * 100.0; current_invested_in_stock = holding_price * holding_qty
+                        
+                        # 🔥 [수정 1] 불타기 발동 조건을 +3.0%에서 +1.0%로 대폭 낮춥니다.
+                        try: pyramiding_yield = float(db_temp.get_shared_setting("TRADE", "PYRAMIDING_YIELD", "1.0"))
+                        except: pyramiding_yield = 1.0
+                        
+                        # 🔥 [수정 2] 최대 몰빵 한도를 총자산의 15%로 제한
+                        try: max_invest_per_stock_pct = float(db_temp.get_shared_setting("TRADE", "MAX_INVEST_PER_STOCK", "15.0"))
+                        except: max_invest_per_stock_pct = 15.0
+                        
+                        max_allowed_for_stock = total_asset * (max_invest_per_stock_pct / 100.0)
 
-                    if current_yield >= pyramiding_yield and current_invested_in_stock < max_allowed_for_stock:
-                        is_pyramiding = True
-                        if prob < 0.85: continue
-                    else: continue 
+                        if current_yield >= pyramiding_yield and current_invested_in_stock < max_allowed_for_stock:
+                            is_pyramiding = True
+                            # 🔥 [수정 3] DB에 설정해둔 AI 커트라인 사용
+                            try: ai_limit = float(db_temp.get_shared_setting("AI", "THRESHOLD", "80.0")) / 100.0
+                            except: ai_limit = 0.80
+                            
+                            if prob < ai_limit: continue
+                        else: continue
 
-                stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code) 
-                scanned_log_list.append({'name': stock_name, 'prob': prob})
-                
-                try: ai_limit = float(db_temp.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
-                except: ai_limit = 0.70
-                
-                if df_feat is not None and not df_feat.empty:
-                    strat_signal = self.mw.strategy_engine.check_trade_signal(df_feat, code)
-                    if 0.5 <= prob < ai_limit: self.sig_log.emit(f"🔎 [{stock_name}] AI 확신도 부족 ({prob*100:.1f}%)", "warning")
-                    if strat_signal == "BUY" and prob < ai_limit: self.sig_log.emit(f"💡 [{stock_name}] 전략엔진 매수 추천이나, AI 미달", "info")
-
-                    curr_open = float(df_feat.iloc[-1]['open']); curr_high = float(df_feat.iloc[-1]['high']); curr_low  = float(df_feat.iloc[-1]['low']); curr_vol  = float(df_feat.iloc[-1]['volume'])
-                    ret_1m = float(df_feat.iloc[-1].get('return', 0.0)); trade_amt = float(df_feat.iloc[-1].get('Trade_Amount', (curr_price * curr_vol) / 1000000))
-                    curr_vol_energy = float(df_feat.iloc[-1].get('Vol_Energy', 1.0)); curr_disp = float(df_feat.iloc[-1].get('Disparity_20', 100.0)); curr_macd = float(df_feat.iloc[-1].get('MACD', 0.0)); curr_rsi = float(df_feat.iloc[-1].get('RSI', 50.0)); ma5_val = float(df_feat.iloc[-1].get('MA5', curr_price)); ma20_val = float(df_feat.iloc[-1].get('MA20', curr_price)); curr_atr = float(df_feat.iloc[-1].get('ATR', 0.0))
-                else: 
-                    curr_open = curr_high = curr_low = curr_price; curr_vol = ret_1m = trade_amt = 0.0; curr_disp = 100.0; curr_vol_energy = 1.0; curr_macd = 0.0; curr_rsi = 50.0; ma5_val = curr_price; ma20_val = curr_price; curr_atr = 0.0
+                    stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code) 
+                    scanned_log_list.append({'name': stock_name, 'prob': prob})
                     
-                now_time = datetime.now().strftime('%H:%M:%S')
-                market_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '현재가': f"{curr_price:,.2f}", '시가': f"{curr_open:,.2f}", '고가': f"{curr_high:,.2f}", '저가': f"{curr_low:,.2f}", '1분등락률': f"{ret_1m:.2f}", '거래대금': f"{trade_amt:,.1f}", '거래량에너지': f"{curr_vol_energy:.2f}", '이격도': f"{curr_disp:.2f}", '거래량': f"{curr_vol:,.0f}"})
-                if df_feat is not None: strategy_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '상승확률': f"{prob*100:.1f}%", 'MA_5': f"{ma5_val:.0f}", 'MA_20': f"{ma20_val:.0f}", 'RSI': f"{curr_rsi:.1f}", 'MACD': f"{curr_macd:.2f}", '전략신호': "BUY 🟢" if prob >= ai_limit else "WAIT 🟡"})
-                
-                if prob >= ai_limit: candidates.append({'code': code, 'prob': prob, 'price': curr_price, 'stock_name': stock_name, 'is_pyramiding': is_pyramiding, 'current_invested': current_invested_in_stock, 'holding_qty': holding_qty, 'holding_price': holding_price, 'max_allowed': max_allowed_for_stock, 'atr': curr_atr})
-                try: db_temp.update_realtime(code, curr_price, prob*100, "NO", "탐색 중...")
-                except: pass
+                    try: ai_limit = float(db_temp.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
+                    except: ai_limit = 0.70
+                    
+                    # 🌟 [추가할 알고리즘] 점심장(11:30 ~ 13:30) 깐깐한 필터링
+                    now_time = datetime.now().time()
+                    lunch_start = datetime.strptime("11:30", "%H:%M").time()
+                    lunch_end = datetime.strptime("13:30", "%H:%M").time()
+                    
+                    if lunch_start <= now_time <= lunch_end:
+                        ai_limit = ai_limit + 0.05 # 커트라인을 5% 강제로 올려버림 (예: 80% -> 85%)
 
-                if len(scanned_log_list) >= min_scan_stocks: break
-            
-            if not self.is_running: return 
+                    # ---------------------------------------------------------------------
+                    # [1] 전략 엔진(Strategy.py)에 차트 데이터를 보내 AI 판단
+                    # ---------------------------------------------------------------------
+                    strat_signal = "WAIT" # 기본값은 무조건 대기
+                    if df_feat is not None and not df_feat.empty:
+                        strat_signal = self.mw.strategy_engine.check_trade_signal(df_feat, code)
+                        
+                        if 0.5 <= prob < ai_limit: self.sig_log.emit(f"🔎 [{stock_name}] AI 확신도 부족 ({prob*100:.1f}%)", "warning")
+                        if strat_signal == "BUY" and prob < ai_limit: self.sig_log.emit(f"💡 [{stock_name}] 전략엔진 매수 추천이나, AI 미달", "info")
+
+                        curr_open = float(df_feat.iloc[-1]['open']); curr_high = float(df_feat.iloc[-1]['high']); curr_low  = float(df_feat.iloc[-1]['low']); curr_vol  = float(df_feat.iloc[-1]['volume'])
+                        ret_1m = float(df_feat.iloc[-1].get('return', 0.0)); trade_amt = float(df_feat.iloc[-1].get('Trade_Amount', (curr_price * curr_vol) / 1000000))
+                        curr_vol_energy = float(df_feat.iloc[-1].get('Vol_Energy', 1.0)); curr_disp = float(df_feat.iloc[-1].get('Disparity_20', 100.0)); curr_macd = float(df_feat.iloc[-1].get('MACD', 0.0)); curr_rsi = float(df_feat.iloc[-1].get('RSI', 50.0)); ma5_val = float(df_feat.iloc[-1].get('MA5', curr_price)); ma20_val = float(df_feat.iloc[-1].get('MA20', curr_price)); curr_atr = float(df_feat.iloc[-1].get('ATR', 0.0))
+                    else: 
+                        curr_open = curr_high = curr_low = curr_price; curr_vol = ret_1m = trade_amt = 0.0; curr_disp = 100.0; curr_vol_energy = 1.0; curr_macd = 0.0; curr_rsi = 50.0; ma5_val = curr_price; ma20_val = curr_price; curr_atr = 0.0
+                        
+                    now_time_str = datetime.now().strftime('%H:%M:%S')
+                    market_rows.append({'시간': now_time_str, '종목코드': code, '종목명': stock_name, '현재가': f"{curr_price:,.2f}", '시가': f"{curr_open:,.2f}", '고가': f"{curr_high:,.2f}", '저가': f"{curr_low:,.2f}", '1분등락률': f"{ret_1m:.2f}", '거래대금': f"{trade_amt:,.1f}", '거래량에너지': f"{curr_vol_energy:.2f}", '이격도': f"{curr_disp:.2f}", '거래량': f"{curr_vol:,.0f}"})
+                    
+                    display_signal = "BUY 🟢" if strat_signal == "BUY" else ("SELL 🔴" if strat_signal == "SELL" else "WAIT 🟡")
+                    
+                    if df_feat is not None: 
+                        strategy_rows.append({
+                            '시간': now_time_str, '종목코드': code, '종목명': stock_name, 
+                            '상승확률': f"{prob*100:.1f}%", 'MA_5': f"{ma5_val:.0f}", 
+                            'MA_20': f"{ma20_val:.0f}", 'RSI': f"{curr_rsi:.1f}", 
+                            'MACD': f"{curr_macd:.2f}", '전략신호': display_signal
+                        })
+                    
+                    # ---------------------------------------------------------------------
+                    # [3] 실시간 즉시 매수 로직 (딜레이 원천 차단!) ⚡
+                    # ---------------------------------------------------------------------
+                    if strat_signal == "BUY" and prob >= ai_limit: 
+                        try: use_funds_percent = float(db_temp.get_shared_setting("TRADE", "USE_FUNDS_PERCENT", "100"))
+                        except: use_funds_percent = 100.0
+
+                        allowed_total_budget = total_asset * (use_funds_percent / 100.0)
+                        available_trading_budget = allowed_total_budget - total_invested
+                        
+                        if available_trading_budget > 0:
+                            if is_pyramiding:
+                                try: pyramiding_rate = float(db_temp.get_shared_setting("TRADE", "PYRAMIDING_RATE", "50.0"))
+                                except: pyramiding_rate = 50.0
+                                target_budget = current_invested_in_stock * (pyramiding_rate / 100.0)
+                                max_remaining_for_stock = max_allowed_for_stock - current_invested_in_stock
+                                target_budget = min(target_budget, max_remaining_for_stock)
+                            else:
+                                try: weight_high = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_HIGH", "20.0")) / 100.0
+                                except: weight_high = 0.20
+                                try: weight_mid = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_MID", "10.0")) / 100.0
+                                except: weight_mid = 0.10
+                                try: weight_low = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_LOW", "5.0")) / 100.0
+                                except: weight_low = 0.05
+                                
+                                if prob >= 0.85: weight = weight_high     
+                                elif prob >= 0.70: weight = weight_mid   
+                                else: weight = weight_low                
+                                
+                                base_target_budget = float(total_asset * weight)
+                                
+                                # ATR 변동성에 따른 비중 축소
+                                try: 
+                                    atr_high_limit = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_LIMIT", "5.0"))
+                                    atr_high_ratio = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_RATIO", "50.0")) / 100.0
+                                    atr_mid_limit  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_LIMIT", "2.5"))
+                                    atr_mid_ratio  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_RATIO", "70.0")) / 100.0
+                                except: 
+                                    atr_high_limit, atr_high_ratio = 5.0, 0.5
+                                    atr_mid_limit, atr_mid_ratio = 2.5, 0.7
+                                    
+                                volatility_pct = (curr_atr / curr_price) * 100 if curr_price > 0 else 0
+                                if volatility_pct >= atr_high_limit: 
+                                    target_budget = base_target_budget * atr_high_ratio
+                                    self.sig_log.emit(f"🚨 {stock_name} 변동성 극심({volatility_pct:.1f}%)! 매수 축소", "warning")
+                                elif volatility_pct >= atr_mid_limit: 
+                                    target_budget = base_target_budget * atr_mid_ratio
+                                    self.sig_log.emit(f"🛡️ {stock_name} 변동성 높음({volatility_pct:.1f}%). 매수 축소", "warning")
+                                else: 
+                                    target_budget = base_target_budget
+
+                            budget = min(target_budget, available_trading_budget)
+                            buy_qty = int(budget // curr_price) 
+                            if buy_qty * curr_price > my_cash: 
+                                buy_qty = int(my_cash // curr_price)
+                            
+                            if buy_qty > 0 and self.execute_guaranteed_buy(code, buy_qty, curr_price):
+                                now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                if is_pyramiding:
+                                    old_qty = holding_qty
+                                    old_price = holding_price
+                                    new_total_qty = old_qty + buy_qty
+                                    new_avg_price = ((old_price * old_qty) + (curr_price * buy_qty)) / new_total_qty
+                                    self.mw.my_holdings[code]['price'] = new_avg_price
+                                    self.mw.my_holdings[code]['qty'] = new_total_qty
+                                    self.mw.my_holdings[code]['high_watermark'] = max(self.mw.my_holdings[code]['high_watermark'], curr_price)
+                                    self.sig_log.emit(f"🔥 [불타기 성공] {stock_name} | 추가: {buy_qty}주 | AI: {prob*100:.1f}%", "buy") 
+                                else:
+                                    self.mw.my_holdings[code] = {'price': curr_price, 'qty': buy_qty, 'high_watermark': curr_price, 'buy_time': now_str, 'half_sold': False}
+                                    self.sig_log.emit(f"⚡ [즉시 진입] {stock_name} 떡상 포착! 딜레이 없이 즉시 매수 실행 (AI: {prob*100:.1f}%)", "success")
+                                    self.sig_log.emit(f"🔵 [매수 체결] {stock_name} | {curr_price:,.2f}원 | {buy_qty}주", "buy") 
+
+                                my_cash -= (curr_price * buy_qty)
+                                total_invested += (curr_price * buy_qty)
+                                self.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': '매수' if not is_pyramiding else '불타기', '주문가격': f"{curr_price:,.2f}", '주문수량': buy_qty, '체결수량': buy_qty, '주문시간': now_str, '상태': '체결완료', '수익률': '0.00%'})
+                                
+                                account_rows.append({'시간': now_time_str, '종목코드': code, '종목명': stock_name, '보유수량': new_total_qty if is_pyramiding else buy_qty, '평균매입가': f"{new_avg_price if is_pyramiding else curr_price:,.2f}", '현재가': f"{curr_price:,.2f}", '평가손익금': "0", '수익률': "0.00%", '주문가능금액': 0})
+                                if account_rows: account_rows[0]['주문가능금액'] = f"{my_cash:,}" 
+                                
+                                acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','주문가능금액']
+                                temp_df = pd.DataFrame(account_rows)
+                                for c in acc_cols:
+                                    if c not in temp_df.columns: temp_df[c] = ""
+                                self.sig_account_df.emit(temp_df[acc_cols].copy()); self.sig_sync_cs.emit()
+                                
+                                needed_count -= 1
+                                
+                                # 🔥 슬롯이 꽉 찼으면 더 검색 안 함
+                                if needed_count <= 0:
+                                    break
+
+                    try: db_temp.update_realtime(code, curr_price, prob*100, "NO", "탐색 중...")
+                    except: pass
+
+                    if len(scanned_log_list) >= min_scan_stocks: break
 
             if scanned_log_list:
                 scanned_log_list = sorted(scanned_log_list, key=lambda x: x['prob'], reverse=True)
                 top_list = scanned_log_list[:3] 
                 top_msg = ", ".join([f"{x['name']}({x['prob']*100:.1f}%)" for x in top_list])
-                try: ai_limit_display = float(db_temp.get_shared_setting("AI", "THRESHOLD", "70.0"))
-                except: ai_limit_display = 70.0
                 
                 actual_scanned_count = len(scanned_log_list)
-                if candidates: self.sig_log.emit(f"🔥 시장 주도주 {actual_scanned_count}개 분석. TOP 3: {top_msg} 👉 기준 통과! 매수 진입", "send")
-                else: self.sig_log.emit(f"🔎 시장 주도주 {actual_scanned_count}개 분석. TOP 3: {top_msg} 👉 미달", "warning")
+                # 🔥 [수정] 장바구니 로직이 사라졌으므로, 헷갈리지 않게 그냥 스캔 결과만 깔끔하게 브리핑합니다!
+                self.sig_log.emit(f"🔎 1분 스캔 사이클 완료 ({actual_scanned_count}개 탐색). 현재 주도주 TOP 3: {top_msg}", "info")
 
-            if candidates:
-                candidates = sorted(candidates, key=lambda x: x['prob'], reverse=True)
-                for i in range(min(needed_count, len(candidates))):
-                    if not self.is_running: return 
+            # if candidates:
+            #     candidates = sorted(candidates, key=lambda x: x['prob'], reverse=True)
+            #     for i in range(min(needed_count, len(candidates))):
+            #         if not self.is_running: return 
 
-                    cand = candidates[i]; code = cand['code']; prob = cand['prob']; curr_price = cand['price']; stock_name = cand['stock_name']; is_pyramiding = cand['is_pyramiding']
+            #         cand = candidates[i]; code = cand['code']; prob = cand['prob']; curr_price = cand['price']; stock_name = cand['stock_name']; is_pyramiding = cand['is_pyramiding']
 
-                    try: use_funds_percent = float(db_temp.get_shared_setting("TRADE", "USE_FUNDS_PERCENT", "100"))
-                    except: use_funds_percent = 100.0
+            #         try: use_funds_percent = float(db_temp.get_shared_setting("TRADE", "USE_FUNDS_PERCENT", "100"))
+            #         except: use_funds_percent = 100.0
 
-                    allowed_total_budget = total_asset * (use_funds_percent / 100.0); available_trading_budget = allowed_total_budget - total_invested
-                    if available_trading_budget <= 0: continue
+            #         allowed_total_budget = total_asset * (use_funds_percent / 100.0); available_trading_budget = allowed_total_budget - total_invested
+            #         if available_trading_budget <= 0: continue
 
-                    if is_pyramiding:
-                        try: pyramiding_rate = float(db_temp.get_shared_setting("TRADE", "PYRAMIDING_RATE", "50.0"))
-                        except: pyramiding_rate = 50.0
-                        target_budget = cand['current_invested'] * (pyramiding_rate / 100.0); max_remaining_for_stock = cand['max_allowed'] - cand['current_invested']; target_budget = min(target_budget, max_remaining_for_stock)
-                    else:
-                        try: weight_high = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_HIGH", "20.0")) / 100.0
-                        except: weight_high = 0.20
-                        try: weight_mid = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_MID", "10.0")) / 100.0
-                        except: weight_mid = 0.10
-                        try: weight_low = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_LOW", "5.0")) / 100.0
-                        except: weight_low = 0.05
+            #         if is_pyramiding:
+            #             try: pyramiding_rate = float(db_temp.get_shared_setting("TRADE", "PYRAMIDING_RATE", "50.0"))
+            #             except: pyramiding_rate = 50.0
+            #             target_budget = cand['current_invested'] * (pyramiding_rate / 100.0); max_remaining_for_stock = cand['max_allowed'] - cand['current_invested']; target_budget = min(target_budget, max_remaining_for_stock)
+            #         else:
+            #             try: weight_high = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_HIGH", "20.0")) / 100.0
+            #             except: weight_high = 0.20
+            #             try: weight_mid = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_MID", "10.0")) / 100.0
+            #             except: weight_mid = 0.10
+            #             try: weight_low = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_LOW", "5.0")) / 100.0
+            #             except: weight_low = 0.05
                         
-                        if prob >= 0.85: weight = weight_high     
-                        elif prob >= 0.70: weight = weight_mid   
-                        else: weight = weight_low                
+            #             if prob >= 0.85: weight = weight_high     
+            #             elif prob >= 0.70: weight = weight_mid   
+            #             else: weight = weight_low                
                         
-                        base_target_budget = float(total_asset * weight)
-                        try: atr_high_limit = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_LIMIT", "5.0")); atr_high_ratio = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_RATIO", "50.0")) / 100.0; atr_mid_limit  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_LIMIT", "2.5")); atr_mid_ratio  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_RATIO", "70.0")) / 100.0
-                        except: atr_high_limit, atr_high_ratio = 5.0, 0.5; atr_mid_limit, atr_mid_ratio = 2.5, 0.7
+            #             base_target_budget = float(total_asset * weight)
+            #             try: atr_high_limit = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_LIMIT", "5.0")); atr_high_ratio = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_RATIO", "50.0")) / 100.0; atr_mid_limit  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_LIMIT", "2.5")); atr_mid_ratio  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_RATIO", "70.0")) / 100.0
+            #             except: atr_high_limit, atr_high_ratio = 5.0, 0.5; atr_mid_limit, atr_mid_ratio = 2.5, 0.7
                             
-                        current_atr = cand['atr']; volatility_pct = (current_atr / curr_price) * 100 if curr_price > 0 else 0
-                        if volatility_pct >= atr_high_limit: target_budget = base_target_budget * atr_high_ratio; self.sig_log.emit(f"🚨 {stock_name} 변동성 극심({volatility_pct:.1f}%)! 매수 축소", "warning")
-                        elif volatility_pct >= atr_mid_limit: target_budget = base_target_budget * atr_mid_ratio; self.sig_log.emit(f"🛡️ {stock_name} 변동성 높음({volatility_pct:.1f}%). 매수 축소", "warning")
-                        else: target_budget = base_target_budget
+            #             current_atr = cand['atr']; volatility_pct = (current_atr / curr_price) * 100 if curr_price > 0 else 0
+            #             if volatility_pct >= atr_high_limit: target_budget = base_target_budget * atr_high_ratio; self.sig_log.emit(f"🚨 {stock_name} 변동성 극심({volatility_pct:.1f}%)! 매수 축소", "warning")
+            #             elif volatility_pct >= atr_mid_limit: target_budget = base_target_budget * atr_mid_ratio; self.sig_log.emit(f"🛡️ {stock_name} 변동성 높음({volatility_pct:.1f}%). 매수 축소", "warning")
+            #             else: target_budget = base_target_budget
 
-                    budget = min(target_budget, available_trading_budget); buy_qty = int(budget // curr_price) 
-                    if buy_qty * curr_price > my_cash: buy_qty = int(my_cash // curr_price)
-                    if buy_qty == 0: continue
+            #         budget = min(target_budget, available_trading_budget); buy_qty = int(budget // curr_price) 
+            #         if buy_qty * curr_price > my_cash: buy_qty = int(my_cash // curr_price)
+            #         if buy_qty == 0: continue
 
-                    # 🔥 [기능 1 적용] 매수 실행 함수에 현재가(limit_price) 전달
-                    if buy_qty > 0 and self.execute_guaranteed_buy(code, buy_qty, curr_price):
-                        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        if is_pyramiding:
-                            old_qty = cand['holding_qty']; old_price = cand['holding_price']; new_total_qty = old_qty + buy_qty; new_avg_price = ((old_price * old_qty) + (curr_price * buy_qty)) / new_total_qty
-                            self.mw.my_holdings[code]['price'] = new_avg_price; self.mw.my_holdings[code]['qty'] = new_total_qty; self.mw.my_holdings[code]['high_watermark'] = max(self.mw.my_holdings[code]['high_watermark'], curr_price)
-                            self.sig_log.emit(f"🔥 [불타기 성공] {stock_name} | 추가: {buy_qty}주 | AI: {prob*100:.1f}%", "buy") 
-                        else:
-                            self.mw.my_holdings[code] = {'price': curr_price, 'qty': buy_qty, 'high_watermark': curr_price, 'buy_time': now, 'half_sold': False}
-                            self.sig_log.emit(f"🔵 [매수 체결] {stock_name} | {curr_price:,.2f}원 | {buy_qty}주 | AI: {prob*100:.1f}%", "buy") 
+            #         # 🔥 [기능 1 적용] 매수 실행 함수에 현재가(limit_price) 전달
+            #         if buy_qty > 0 and self.execute_guaranteed_buy(code, buy_qty, curr_price):
+            #             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            #             if is_pyramiding:
+            #                 old_qty = cand['holding_qty']; old_price = cand['holding_price']; new_total_qty = old_qty + buy_qty; new_avg_price = ((old_price * old_qty) + (curr_price * buy_qty)) / new_total_qty
+            #                 self.mw.my_holdings[code]['price'] = new_avg_price; self.mw.my_holdings[code]['qty'] = new_total_qty; self.mw.my_holdings[code]['high_watermark'] = max(self.mw.my_holdings[code]['high_watermark'], curr_price)
+            #                 self.sig_log.emit(f"🔥 [불타기 성공] {stock_name} | 추가: {buy_qty}주 | AI: {prob*100:.1f}%", "buy") 
+            #             else:
+            #                 self.mw.my_holdings[code] = {'price': curr_price, 'qty': buy_qty, 'high_watermark': curr_price, 'buy_time': now, 'half_sold': False}
+            #                 self.sig_log.emit(f"🔵 [매수 체결] {stock_name} | {curr_price:,.2f}원 | {buy_qty}주 | AI: {prob*100:.1f}%", "buy") 
 
-                        my_cash -= (curr_price * buy_qty); total_invested += (curr_price * buy_qty)
-                        self.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': '매수' if not is_pyramiding else '불타기', '주문가격': f"{curr_price:,.2f}", '주문수량': buy_qty, '체결수량': buy_qty, '주문시간': now, '상태': '체결완료', '수익률': '0.00%'})
-                        now_time = datetime.now().strftime('%H:%M:%S')
-                        account_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '보유수량': new_total_qty if is_pyramiding else buy_qty, '평균매입가': f"{new_avg_price if is_pyramiding else curr_price:,.2f}", '현재가': f"{curr_price:,.2f}", '평가손익금': "0", '수익률': "0.00%", '주문가능금액': 0})
-                        if account_rows: account_rows[0]['주문가능금액'] = f"{my_cash:,}" 
+            #             my_cash -= (curr_price * buy_qty); total_invested += (curr_price * buy_qty)
+            #             self.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': '매수' if not is_pyramiding else '불타기', '주문가격': f"{curr_price:,.2f}", '주문수량': buy_qty, '체결수량': buy_qty, '주문시간': now, '상태': '체결완료', '수익률': '0.00%'})
+            #             now_time = datetime.now().strftime('%H:%M:%S')
+            #             account_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '보유수량': new_total_qty if is_pyramiding else buy_qty, '평균매입가': f"{new_avg_price if is_pyramiding else curr_price:,.2f}", '현재가': f"{curr_price:,.2f}", '평가손익금': "0", '수익률': "0.00%", '주문가능금액': 0})
+            #             if account_rows: account_rows[0]['주문가능금액'] = f"{my_cash:,}" 
                         
-                        acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','주문가능금액']
-                        temp_df = pd.DataFrame(account_rows)
-                        for c in acc_cols:
-                            if c not in temp_df.columns: temp_df[c] = ""
-                        self.sig_account_df.emit(temp_df[acc_cols].copy()); self.sig_sync_cs.emit()
+            #             acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','주문가능금액']
+            #             temp_df = pd.DataFrame(account_rows)
+            #             for c in acc_cols:
+            #                 if c not in temp_df.columns: temp_df[c] = ""
+            #             self.sig_account_df.emit(temp_df[acc_cols].copy()); self.sig_sync_cs.emit()
 
         if not self.is_running: return 
 
@@ -871,6 +1041,29 @@ class FormMain(QtWidgets.QMainWindow):
 
         QtCore.QTimer.singleShot(3000, self.load_real_holdings) 
         self.kakao_timer = QtCore.QTimer(self); self.kakao_timer.timeout.connect(self.auto_status_report); self.kakao_timer.start(1000 * 60 * 60) 
+        
+        # 🔥 [추가] 리스크 관리용 변수 세팅
+        self.daily_total_pnl_pct = 0.0
+        
+        # 🔥 [추가] 로그창(txtLog) Ctrl+우클릭 이벤트 연결
+        self.txtLog.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.txtLog.customContextMenuRequested.connect(self.show_log_context_menu)
+
+    # 🔥 [추가] 로그창 우클릭 시 잠금 해제 메뉴 띄우기 (def send_kakao_msg 함수 바로 위에 넣으시면 됩니다)
+    def show_log_context_menu(self, pos):
+        modifiers = QtWidgets.QApplication.keyboardModifiers()
+        if modifiers == QtCore.Qt.ControlModifier: # Ctrl 키를 누른 상태일 때만 작동
+            menu = QtWidgets.QMenu()
+            menu.setStyleSheet("QMenu { background-color: rgb(30, 40, 60); color: white; font-size: 14px; border: 1px solid Silver; } QMenu::item { padding: 10px 25px; } QMenu::item:selected { background-color: rgb(80, 120, 160); }")
+            unlock_action = menu.addAction("🔓 주삐 셧다운(매수 잠금) 강제 해제")
+            action = menu.exec_(self.txtLog.mapToGlobal(pos))
+            
+            if action == unlock_action:
+                self.db.set_shared_setting("RISK", "IS_LOCKED", "N")
+                self.daily_total_pnl_pct = 0.0 # 손실률 누적 초기화
+                if hasattr(self, 'trade_worker'):
+                    self.trade_worker.loss_streak_cnt = 0 # 워커 내부의 연패 카운터도 초기화
+                self.add_log("🛡️ [시스템] 관리자 권한으로 매수 잠금이 해제되었습니다. 다시 탐색을 시작합니다.", "success")
 
     def send_kakao_msg(self, text):
         REST_API_KEY = self.db.get_shared_setting("KAKAO", "REST_API_KEY", "4cbe02304c893a129a812045d5f200a3")
@@ -1080,6 +1273,11 @@ class FormMain(QtWidgets.QMainWindow):
             ("TRADE", "TIME_END_DOM", "1530", "국내 주식 장 종료 시간"),
             ("TRADE", "TIME_START_OVS", "2230", "해외 주식 자동매매 시작 시간"),
             ("TRADE", "TIME_CLOSE_OVS", "0430", "해외 주식 마감 임박 시작 시간"),
+
+            # 🔥 [추가] 리스크 관리 셧다운 설정
+            ("RISK", "MAX_CONSECUTIVE_LOSS", "5", "연속 손절 시 매수 셧다운 횟수"),
+            ("RISK", "DAILY_STOP_LOSS_PCT", "-10.0", "일일 누적 손실 제한 (%)"),
+            ("RISK", "IS_LOCKED", "N", "매수 기능 강제 잠금 여부 (Y/N)"),
             
             # 💸 [리스크 및 컷오프(손/익절) 설정]
             ("TRADE", "CRASH_LIMIT", "-1.5", "시장(ETF) 폭락 감지 기준 (%) - 도달 시 매수 정지"),

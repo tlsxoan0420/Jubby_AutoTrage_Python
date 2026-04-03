@@ -74,8 +74,10 @@ def train_jubby_brain(log_callback=None):
     
     X = df[features]
     y = df['Target_Buy']
+    # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    # 🔥 [변경 코드] 무작위 섞기(shuffle)를 False로 꺼버립니다! (시간 순서 그대로 자름)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-
+    
     # =========================================================================
     # 🔥 [핵심 고도화] 극단적 쫄보 현상(데이터 불균형)을 해결하는 스케일링 가중치 계산
     # =========================================================================
@@ -209,46 +211,74 @@ def train_jubby_brain(log_callback=None):
     send_log("🛡️ [4/4] 가짜 반등을 걸러낼 'LSTM 패턴 관측수' 학습을 시작합니다...", "WARNING")
     db.update_system_status('TRAINER', 'LSTM 딥러닝 학습 중...', 90)
 
-    # 1. 시계열(Window) 데이터 만들기 (과거 10분 단위로 묶기)
+    from sklearn.preprocessing import MinMaxScaler
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X.values) 
+
+    # 1. 시계열(Window) 데이터 임시 생성
     seq_length = 10
-    X_seq, y_seq = [], []
-    X_values = X.values
+    X_seq_temp, y_seq_temp = [], []
     y_values = y.values
     
-    for i in range(len(X_values) - seq_length):
-        X_seq.append(X_values[i : i + seq_length])
-        y_seq.append(y_values[i + seq_length])
+    for i in range(len(X_scaled) - seq_length):
+        X_seq_temp.append(X_scaled[i : i + seq_length])
+        y_seq_temp.append(y_values[i + seq_length])
         
-    X_seq = torch.tensor(np.array(X_seq), dtype=torch.float32)
-    y_seq = torch.tensor(np.array(y_seq), dtype=torch.float32).unsqueeze(1)
+    X_seq_temp = np.array(X_seq_temp)
+    y_seq_temp = np.array(y_seq_temp)
+
+    # 🚨 [핵심 버그 수정 1] 데이터 불균형(Class Imbalance) 강제 교정!
+    # 진짜 반등(1)이 너무 적어서 AI가 무조건 0%를 찍는 현상을 막습니다.
+    pos_idx = np.where(y_seq_temp == 1)[0] # 진짜 반등 인덱스
+    neg_idx = np.where(y_seq_temp == 0)[0] # 가짜 반등 인덱스
+
+    if len(pos_idx) > 0:
+        # 실패(0) 데이터를 성공(1) 데이터의 '2배수'까지만 무작위로 뽑아옵니다. (비율 1:2)
+        # 이렇게 하면 AI가 "무조건 0이라고 찍으면 틀릴 수도 있겠네?" 하고 진지하게 패턴을 공부합니다.
+        neg_sampled = np.random.choice(neg_idx, size=min(len(neg_idx), len(pos_idx) * 2), replace=False)
+        
+        # 데이터를 다시 합치고 순서를 무작위로 섞어줍니다.
+        final_idx = np.concatenate([pos_idx, neg_sampled])
+        np.random.shuffle(final_idx)
+        
+        X_seq = X_seq_temp[final_idx]
+        y_seq = y_seq_temp[final_idx]
+    else:
+        X_seq = X_seq_temp
+        y_seq = y_seq_temp
+
+    # 파이토치 텐서로 변환
+    X_seq = torch.tensor(X_seq, dtype=torch.float32)
+    y_seq = torch.tensor(y_seq, dtype=torch.float32).unsqueeze(1)
     
-    # 데이터셋 나누기
     train_size = int(len(X_seq) * 0.8)
     train_dataset = TensorDataset(X_seq[:train_size], y_seq[:train_size])
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=False)
+    # 🔥 배치 사이즈를 줄여서 더 정밀하게 학습시킵니다.
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
-    # 2. LSTM 신경망 모델 정의
+    # 2. LSTM 모델 정의
     class JubbyLSTM(nn.Module):
-        def __init__(self, input_size, hidden_size=32, num_layers=1):
+        def __init__(self, input_size, hidden_size=64, num_layers=2): # 🔥 은닉층(hidden)과 층(layer) 추가로 뇌 용량 증가
             super(JubbyLSTM, self).__init__()
-            self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+            self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
             self.fc = nn.Linear(hidden_size, 1)
             self.sigmoid = nn.Sigmoid()
             
         def forward(self, x):
             out, _ = self.lstm(x)
-            out = self.fc(out[:, -1, :]) # 마지막 10분째의 결과를 사용
+            out = self.fc(out[:, -1, :]) 
             return self.sigmoid(out)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     lstm_model = JubbyLSTM(input_size=X_seq.shape[2]).to(device)
     
-    # 3. 모델 학습 (에포크 10번)
-    criterion = nn.BCELoss(weight=torch.tensor([scale_weight], dtype=torch.float32).to(device)) # 가중치 적용
+    # 3. 모델 학습 
+    criterion = nn.BCELoss()
     optimizer = optim.Adam(lstm_model.parameters(), lr=0.001)
 
     lstm_model.train()
-    for epoch in range(10):
+    # 🚨 [핵심 버그 수정 2] 학습 횟수(Epoch) 10회 -> 50회로 대폭 증가
+    for epoch in range(50):
         total_loss = 0
         for batch_X, batch_y in train_loader:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
@@ -261,11 +291,17 @@ def train_jubby_brain(log_callback=None):
             
     send_log("✅ LSTM 관측수 학습 완료!", "SUCCESS")
 
-    # 4. LSTM 모델 저장
+    # (이하 모델 저장 코드는 기존과 동일하게 유지)
     lstm_model_name = model_name.replace(".pkl", "_lstm.pth")
+    scaler_name = model_name.replace(".pkl", "_scaler.pkl")
+    
     lstm_save_path = os.path.join(SystemConfig.PROJECT_ROOT, lstm_model_name)
+    scaler_save_path = os.path.join(SystemConfig.PROJECT_ROOT, scaler_name)
+    
     torch.save(lstm_model.state_dict(), lstm_save_path)
-    send_log(f"💾 [저장 완료] 이중 방어막({lstm_model_name})이 성공적으로 장착되었습니다!", "SUCCESS")
+    joblib.dump(scaler, scaler_save_path)
+    
+    send_log(f"💾 [저장 완료] 이중 방어막({lstm_model_name})과 스케일러가 성공적으로 장착되었습니다!", "SUCCESS")
 
     db.insert_ai_train_log(model_name=model_name, accuracy=final_accuracy, data_count=total_data_count)
     db.update_system_status('TRAINER', '학습 완료!', 100)
