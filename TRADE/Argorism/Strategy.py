@@ -128,47 +128,46 @@ class JubbyStrategy:
         else:
             print(msg)
 
+    # [Strategy.py 수정 부분]
+    
     # =====================================================================
-    # ⚖️ [핵심 추가] 실시간 호가창 매도/매수 잔량 비율(Orderbook Imbalance) 검사
+    # ⚖️ [궁극의 2차 방어막] 실시간 호가창 매도/매수 잔량 비율 검사
     # =====================================================================
     def check_orderbook_imbalance(self, code):
         """ 
-        [호가창 최후의 방어막] 
-        매도 호가 잔량이 매수 호가 잔량보다 2배(기본값) 이상 많은지 검사하여 '가짜 돌파(휩쏘)'를 걸러냅니다.
+        [1차 방어: LSTM 패턴]을 통과한 종목에 대해 
+        [2차 방어: 실시간 수급]을 확인하여 '가짜 돌파(휩쏘)'를 완벽히 걸러냅니다.
         """
         try:
-            # 메모리에 실시간으로 수집되고 있는 TradeData(UI 전송용)를 가로채서 읽어옵니다!
-            from COMMON.Flag import TradeData
-            market_df = TradeData.market.df
-            
-            if market_df is not None and not market_df.empty:
-                stock_data = market_df[market_df['종목코드'] == code]
-                
-                if not stock_data.empty:
-                    recent = stock_data.iloc[-1] # 가장 최근 찰나의 데이터
+            # 웹소켓(FormTicker)이 실시간으로 업데이트 중인 최신 잔량 데이터를 꺼내옵니다.
+            conn = self.db._get_connection(self.db.shared_db_path)
+            cursor = conn.execute("SELECT ask_size, bid_size FROM MarketStatus WHERE symbol = ?", (code,))
+            row = cursor.fetchone()
+            conn.close()
+
+            if row:
+                ask_size = float(row[0])
+                bid_size = float(row[1])
+
+                if ask_size > 0 and bid_size > 0:
+                    imbalance_ratio = ask_size / bid_size
                     
-                    # 콤마(,) 제거 후 숫자로 안전하게 변환
-                    ask_size = float(str(recent.get('매도잔량', '0')).replace(',', ''))
-                    bid_size = float(str(recent.get('매수잔량', '0')).replace(',', ''))
+                    # 목표 매도벽 비율 (기본 2.0배 - 매도 잔량이 매수 잔량보다 2배 많아야 진짜 상승)
+                    try: target_ratio = float(self.db.get_shared_setting("TRADE", "ORDERBOOK_RATIO", "2.0"))
+                    except: target_ratio = 2.0
 
-                    # 잔량 데이터가 모두 정상적으로 들어왔을 때만 비율 검사 진행
-                    if ask_size > 0 and bid_size > 0:
-                        imbalance_ratio = ask_size / bid_size
-                        
-                        # DB에서 설정값(배수)을 가져옵니다. 기본값은 2.0배입니다.
-                        try: target_ratio = float(self.db.get_shared_setting("TRADE", "ORDERBOOK_RATIO", "2.0"))
-                        except: target_ratio = 2.0
-
-                        if imbalance_ratio >= target_ratio:
-                            return True # 매도벽이 무거움 -> 진짜 상승! (통과)
-                        else:
-                            pretty_name = self.get_pretty_name(code)
-                            self.send_log(f"🛡️ [호가창 휩쏘 방어] {pretty_name} 매도잔량 부족(비율: {imbalance_ratio:.1f}배 < {target_ratio}배). 가짜 돌파 의심되어 스킵!", "warning")
-                            return False # 매수벽이 두껍거나 비율 미달 -> 개미 꼬시기 (차단)
+                    if imbalance_ratio >= target_ratio:
+                        # 🚀 [매도벽 두꺼움] 개미들이 팔고 나가는 물량을 세력이 다 받아먹으면서 올릴 준비! (찐상승)
+                        self.send_log(f"🔥 [최종 승인] {self.get_pretty_name(code)} 실시간 호가 수급 완벽! (매도벽 {imbalance_ratio:.1f}배). 🚀발사!", "success")
+                        return True 
+                    else:
+                        # 🛑 [매수벽 두꺼움] 누군가 아래에 매수 물량을 엄청 깔아두고 개미 꼬시는 중! (가짜 상승)
+                        self.send_log(f"🛡️ [2차 방어막 작동] {self.get_pretty_name(code)} 호가 수급 불량 (매도벽 {imbalance_ratio:.1f}배 < {target_ratio}배). 개미 꼬시기 차단!", "warning")
+                        return False 
         except Exception as e:
             pass 
         
-        # 만약 통신 지연으로 호가창 데이터를 못 불러왔다면 기존 로직대로 1차 통과시킵니다.
+        # 데이터 오류 시 안전을 위해 우선 통과 (1차 LSTM 방어막이 있으므로)
         return True
 
     # =====================================================================

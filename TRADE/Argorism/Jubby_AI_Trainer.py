@@ -213,7 +213,13 @@ def train_jubby_brain(log_callback=None):
 
     from sklearn.preprocessing import MinMaxScaler
     scaler = MinMaxScaler()
-    X_scaled = scaler.fit_transform(X.values) 
+    
+    # 🚨 [수정 및 주석 추가] 데이터 누수(Data Leakage) 방지 처리!
+    # 기존에는 전체 X에 대해 fit(학습)을 해버려서 미래 데이터의 정보가 섞여 들어갔습니다.
+    # 훈련 데이터(X_train)로만 스케일러의 기준(최대/최소)을 잡고(fit), 
+    # 그 기준으로 전체 데이터를 변환(transform)해야 실전과 똑같은 환경이 됩니다.
+    scaler.fit(X_train.values)             # 오직 훈련 데이터로만 기준점을 잡습니다!
+    X_scaled = scaler.transform(X.values)  # 그 기준을 바탕으로 전체 데이터를 변환합니다.
 
     # 1. 시계열(Window) 데이터 임시 생성
     seq_length = 10
@@ -226,6 +232,21 @@ def train_jubby_brain(log_callback=None):
         
     X_seq_temp = np.array(X_seq_temp)
     y_seq_temp = np.array(y_seq_temp)
+
+    # 🚨 [핵심 버그 수정 1] 데이터 불균형 강제 교정 (기존 코드 유지)
+    pos_idx = np.where(y_seq_temp == 1)[0] 
+    neg_idx = np.where(y_seq_temp == 0)[0] 
+
+    if len(pos_idx) > 0:
+        neg_sampled = np.random.choice(neg_idx, size=min(len(neg_idx), len(pos_idx) * 2), replace=False)
+        final_idx = np.concatenate([pos_idx, neg_sampled])
+        np.random.shuffle(final_idx) # 순서 무작위 섞기
+        
+        X_seq = X_seq_temp[final_idx]
+        y_seq = y_seq_temp[final_idx]
+    else:
+        X_seq = X_seq_temp
+        y_seq = y_seq_temp
 
     # 🚨 [핵심 버그 수정 1] 데이터 불균형(Class Imbalance) 강제 교정!
     # 진짜 반등(1)이 너무 적어서 AI가 무조건 0%를 찍는 현상을 막습니다.
