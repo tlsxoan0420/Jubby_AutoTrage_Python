@@ -47,10 +47,6 @@ class JubbyStrategy:
         self.scaler = None # 🔥 스케일러 변수 추가
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        self.ai_model = None
-        self.lstm_model = None 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
         # 뇌(Model) 장착
         self.load_ai_brain()
 
