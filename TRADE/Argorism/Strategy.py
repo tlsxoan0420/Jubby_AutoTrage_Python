@@ -321,7 +321,7 @@ class JubbyStrategy:
         return target_price, stop_price
 
     # =====================================================================
-    # 🚀 4. 실전 매수/매도 타점 판독 (AI 예측 + 돌파 + 호가창 이중방어)
+    # 🚀 [최종 통합본] 실전 매수/매도 타점 판독 (AI 3중 필터 + 매도 비상 탈출)
     # =====================================================================
     def check_trade_signal(self, df, code):
         if len(df) < 26: return "WAIT"
@@ -329,62 +329,35 @@ class JubbyStrategy:
         current = df.iloc[-1]
         curr_price = float(current['close']) 
         ai_prob = 0.0 
-        buy_signal = False
-        features = None
-        
+        buy_signal = False 
         pretty_name = self.get_pretty_name(code)
         
-        # =================================================================
-        # 🤖 1. AI 뇌(앙상블) 및 돌파 전략의 1차 예측
-        # =================================================================
+        # -----------------------------------------------------------------
+        # 🤖 [1단계] AI 모델 및 기술적 지표 1차 판독 (매수 탐색)
+        # -----------------------------------------------------------------
         if self.ai_model is not None:
             features = self.get_ai_features(df)
-            
-            if features is None:
-                return "WAIT"
+            if features is not None:
+                ai_prob = self.ai_model.predict_proba(features)[0][1]
+                try: ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
+                except: ai_threshold = 0.70
                 
-            ai_prob = self.ai_model.predict_proba(features)[0][1]
-            try: ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
-            except: ai_threshold = 0.70
-            
-            if ai_prob >= ai_threshold:
-                is_above_vwap = curr_price >= current.get('VWAP', curr_price)
-                is_above_ma5 = curr_price >= current.get('MA5', curr_price)
-                is_macd_good = current.get('MACD', 0) >= current.get('Signal_Line', 0)
-                is_rsi_oversold = current.get('RSI', 50) <= 40.0 
+                if ai_prob >= ai_threshold:
+                    is_above_vwap = curr_price >= current.get('VWAP', curr_price)
+                    is_above_ma5 = curr_price >= current.get('MA5', curr_price)
+                    is_macd_good = current.get('MACD', 0) >= current.get('Signal_Line', 0)
+                    is_rsi_oversold = current.get('RSI', 50) <= 40.0 
 
-                if is_above_vwap or is_above_ma5 or is_macd_good or is_rsi_oversold:
-                    # ⭐ 1차 승인에서는 호가창 검사를 뺐습니다.
-                    self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 떡상 징후 포착! (상승 확률: {ai_prob*100:.1f}%)", "buy")
-                    buy_signal = True
-                else:
-                    self.send_log(f"🛡️ [AI 승인 거절] {pretty_name} 확률은 {ai_prob*100:.1f}% 이나, 추세 저항(세력선 이탈)으로 진입 포기", "warning")
-       
-        # [전략 A & B] 아날로그 돌파/추세 매매 로직
-        try:
-            breakout_vol = float(self.db.get_shared_setting("TRADE", "BREAKOUT_VOL", "2.0")) 
-            breakout_ret = float(self.db.get_shared_setting("TRADE", "BREAKOUT_RET", "0.5")) 
-            ai_min_pass = float(self.db.get_shared_setting("AI", "MIN_PASS_RATE", "50.0")) / 100.0
-        except:
-            breakout_vol, breakout_ret = 2.0, 0.5
-            ai_min_pass = 0.50
+                    if is_above_vwap or is_above_ma5 or is_macd_good or is_rsi_oversold:
+                        self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 포착! (확률: {ai_prob*100:.1f}%)", "buy")
+                        buy_signal = True 
 
-        if not buy_signal and current['Vol_Energy'] >= breakout_vol and curr_price > current['VWAP'] and current['return'] > breakout_ret:
-            if self.ai_model is not None and ai_prob < ai_min_pass:
-                self.send_log(f"💡 [전략엔진] {pretty_name} 돌파 매수를 추천이나, AI 확신도 미달({ai_prob*100:.1f}% < {ai_min_pass*100:.0f}%)로 스킵", "info")
-            else:
-                # ⭐ 여기도 호가창 검사를 뺐습니다.
-                self.send_log(f"🔥 [1차 승인] {pretty_name} 거래량 폭발 & 세력선(VWAP) 돌파 포착!", "buy")
-                buy_signal = True
-
-        # =================================================================
-        # 🛡️ 2. [이중 잠금장치] LSTM 패턴 검사 및 실시간 호가 수급(최종) 검사
-        # =================================================================
+        # -----------------------------------------------------------------
+        # 🛡️ [2단계] LSTM 시계열 패턴 방어막
+        # -----------------------------------------------------------------
         if buy_signal:
-            # (1) LSTM 패턴 검사 (2차 승인)
             if self.lstm_model is not None and self.scaler is not None and len(df) >= 10:
                 seq_features = self.get_ai_sequence_features(df, seq_length=10)
-                
                 if seq_features is not None and len(seq_features) == 10:
                     seq_features_scaled = self.scaler.transform(seq_features)
                     seq_tensor = torch.tensor(seq_features_scaled, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -396,41 +369,46 @@ class JubbyStrategy:
                     except: lstm_threshold = 0.30
 
                     if lstm_prob < lstm_threshold:
-                        self.send_log(f"🛑 [LSTM 방어막 발동] {pretty_name} 10분 시계열 패턴이 불량함 (통과율: {lstm_prob*100:.1f}%). 가짜 반등 방어!", "error")
-                        buy_signal = False
-                        return "WAIT"
+                        self.send_log(f"🛑 [LSTM 매수취소] {pretty_name} 패턴 불량 ({lstm_prob*100:.1f}%). 진입 포기!", "error")
+                        buy_signal = False 
                     else:
-                        # LSTM은 '최종'이 아닌 '2차 승인'으로 문구를 변경했습니다.
-                        self.send_log(f"✅ [2차 승인] {pretty_name} 10분 시계열 패턴 우수! (통과율: {lstm_prob*100:.1f}%)", "success")
+                        self.send_log(f"✅ [2차 승인] {pretty_name} 시계열 패턴 우수 ({lstm_prob*100:.1f}%)", "success")
 
-            # (2) ⭐ [궁극의 최종 승인] 실시간 호가창 매수/매도 잔량 수급 검사
-            if buy_signal:
-                if self.check_orderbook_imbalance(code):
-                    # 호가창 매도벽까지 두꺼운게 확인되면 진짜 실전 매수 진입!
-                    try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "강력 매수 신호 발생!")
-                    except: pass
-                    return "BUY"
-                else:
-                    # 차트는 예쁜데 호가창에서 개미를 꼬시고 있다면 매수 취소
-                    buy_signal = False
-                    return "WAIT"
+        # -----------------------------------------------------------------
+        # ⚖️ [3단계] 최종 관문: 실시간 호가 수급 비율 검사
+        # -----------------------------------------------------------------
+        if buy_signal:
+            if self.check_orderbook_imbalance(code):
+                self.send_log(f"🚀 [최종 승인] {pretty_name} 모든 조건 충족! 강력 매수 진입!", "success")
+                try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "🔥 강력 매수 신호!")
+                except: pass
+                return "BUY" 
+            else:
+                self.send_log(f"🛡️ [수급 불량 취소] {pretty_name} 매수 잔량 과다(개미 꼬시기). 진입 취소!", "warning")
+                buy_signal = False
 
-        try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "탐색 및 분석 중...")
-        except: pass
-
-        # -------------------------------------------------------------
-        # 💸 [매도 조건] : 초단타에 맞게 위험 신호 발생 시 즉각 던집니다.
-        # -------------------------------------------------------------
-        if current['MACD'] < current['Signal_Line'] and curr_price < current['MA5']:
+        # -----------------------------------------------------------------
+        # 💸 [매도 조건] : 초단타 비상 탈출구 (보유 중인 종목을 위한 로직)
+        # -----------------------------------------------------------------
+        # 1. 추세 붕괴 신호 (데드크로스 + 이평선 이탈)
+        if current['MACD'] < current['Signal_Line'] and curr_price < current.get('MA5', curr_price):
+            # 로그 없이 즉각 SELL 반환 (속도가 생명)
             return "SELL"
             
+        # 2. 고점 과열 및 매도 폭탄(긴 윗꼬리) 감지
         try: sell_rsi = float(self.db.get_shared_setting("TRADE", "SELL_RSI", "75.0"))
         except: sell_rsi = 75.0
 
         body_size = abs(current['open'] - current['close'])
+        # 윗꼬리가 몸통보다 길면 누군가 위에서 강하게 찍어누르고 있다는 뜻!
         is_heavy_selling_pressure = current['High_Tail'] > body_size and current['High_Tail'] > 0
+        
         if current['RSI'] >= sell_rsi and is_heavy_selling_pressure:
-            self.send_log(f"💡 [전략엔진] {pretty_name} 고점 매도 폭탄(긴 윗꼬리) 차트 감지 -> 탈출 신호!", "info")
+            self.send_log(f"💡 [비상 탈출] {pretty_name} 고점 매도 폭탄 감지! 즉시 수익 보존!", "info")
             return "SELL"
+
+        # 모든 조건이 아니면 대기
+        try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "분석 및 탐색 중...")
+        except: pass
         
         return "WAIT"

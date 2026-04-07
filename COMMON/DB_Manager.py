@@ -32,10 +32,12 @@ class JubbyDB_Manager:
         return self._get_connection(self.shared_db_path)
 
     def _get_connection(self, db_path):
-        # 🔥 [마법의 락 해제 옵션] 
-        # 1. timeout=20: C#이 읽고 있어서 잠겨있어도 팅기지 않고 문 밖에서 20초 대기합니다.
-        # 2. isolation_level=None: Auto-commit 닌자 모드! 데이터를 쓰자마자 0.001초 만에 락을 풀고 도망칩니다.
-        conn = sqlite3.connect(db_path, timeout=20, isolation_level=None)
+        # 🔥 [마법의 락 해제 옵션]
+        # timeout을 30초로 넉넉히 주고, 매번 연결할 때마다 WAL(동시 읽기/쓰기) 모드와 동기화 설정을 강제 주입합니다!
+        conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+        conn.execute('PRAGMA journal_mode = WAL;')  
+        conn.execute('PRAGMA synchronous = NORMAL;')
+        conn.execute('PRAGMA busy_timeout = 5000;') 
         return conn
 
     # =======================================================================
@@ -62,7 +64,7 @@ class JubbyDB_Manager:
             # =================================================================
             # 🛒 [수정] TradeHistory 테이블 생성 및 자동 컬럼 추가 로직
             # =================================================================
-            # 1. 일단 기본 구조로 테이블 생성 (이미 있으면 무시됨)
+            # 1. 일단 기본 구조로 테이블 생성 시도
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS TradeHistory (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,19 +82,37 @@ class JubbyDB_Manager:
                 )
             """)
 
-            # 2. ⭐ [핵심 기능] 기존 데이터 보존하며 order_no 칸이 없으면 추가하기
+            # 2. ⭐ [강력 보정 로직] 기존 데이터 100% 보존 + 누락된 최신 컬럼 전체 자동 검사 및 추가
             cursor = conn.execute("PRAGMA table_info(TradeHistory)")
-            columns = [col[1] for col in cursor.fetchall()]
+            cols = [c[1].lower() for c in cursor.fetchall()] # 대소문자 구분 없이 비교하기 위해 소문자 변환
             
-            if 'order_no' not in columns:
-                try:
-                    conn.execute("ALTER TABLE TradeHistory ADD COLUMN order_no TEXT")
-                    print("💡 [DB 시스템] TradeHistory 테이블에 'order_no' 컬럼을 안전하게 추가했습니다.")
-                except Exception as e:
-                    print(f"⚠️ 컬럼 추가 중 오류 (이미 존재할 수 있음): {e}")
+            # 주삐 최신 엔진에 필요한 컬럼과 기본 데이터 타입 목록
+            required_columns = {
+                'time': 'TEXT',
+                'symbol': 'TEXT',
+                'symbol_name': 'TEXT DEFAULT "-"',
+                'type': 'TEXT',
+                'price': 'REAL DEFAULT 0.0',
+                'quantity': 'INTEGER DEFAULT 0',
+                'order_no': 'TEXT',
+                'Status': 'TEXT DEFAULT "미체결"',
+                'filled_quantity': 'INTEGER DEFAULT 0',
+                'order_price': 'REAL DEFAULT 0.0',
+                'order_time': 'TEXT',
+                'order_yield': 'TEXT'
+            }
+            
+            # 현재 DB에 없는 컬럼만 쏙쏙 골라서 안전하게 추가합니다.
+            for col_name, col_type in required_columns.items():
+                if col_name.lower() not in cols:
+                    try:
+                        conn.execute(f"ALTER TABLE TradeHistory ADD COLUMN {col_name} {col_type}")
+                        print(f"🔧 [DB 시스템] TradeHistory에 '{col_name}' 컬럼을 안전하게 추가했습니다.")
+                    except Exception as e:
+                        pass # 이미 있거나 충돌나면 무시하고 다음으로 넘어감
 
             # =================================================================
-            # 🚀 [DB 무손실 자동 업그레이드 패치] MarketStatus 컬럼 보정
+            # 🚀 [MarketStatus 컬럼 보정]
             # =================================================================
             try:
                 cursor = conn.execute("PRAGMA table_info(MarketStatus)")
@@ -208,16 +228,16 @@ class JubbyDB_Manager:
         except Exception as e: print(f"로그 기록 중 에러: {e}")
         finally: conn.close()
 
-    def insert_trade_history(self, order_no, symbol, trade_type, price, qty, yield_rate=0.0):
-        """ 주문 내역을 DB에 '미체결' 상태로 기록 """
+    # 🚀 [수정] status와 filled_qty 파라미터를 추가하여 체결 상태를 동적으로 지정 가능하게 변경
+    def insert_trade_history(self, order_no, symbol, trade_type, price, qty, yield_rate=0.0, status="미체결", filled_qty=0):
+        """ 주문 내역을 DB에 동적으로 상태를 지정하여 기록 """
         conn = self._get_connection(self.shared_db_path)
         try:
-            # 🚨 [중요] 컬럼 순서와 INSERT 문을 테이블 구조에 맞게 일치시켰습니다.
             conn.execute('''INSERT INTO TradeHistory 
                 (time, symbol, symbol_name, type, price, quantity, order_no, Status, filled_quantity, order_price, order_time, order_yield) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
                 (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "-", trade_type, price, qty, str(order_no), 
-                 "미체결", 0, price, datetime.datetime.now().strftime("%H:%M:%S"), f"{yield_rate}%"))
+                 status, filled_qty, price, datetime.datetime.now().strftime("%H:%M:%S"), f"{yield_rate}%"))
         except Exception as e:
             print(f"🚨 TradeHistory 저장 에러: {e}")
         finally:
@@ -297,3 +317,17 @@ class JubbyDB_Manager:
             return float(row[0]) if row and row[0] is not None else 0.0
         except: return 0.0
         finally: conn.close()
+
+    def update_shared_risk_status(self, is_locked):
+        """
+        [상세 설명]
+        오늘 손실이 너무 크면 C# UI와 공유하는 DB에 '잠금' 상태를 기록합니다.
+        C#은 이 값을 읽어서 화면에 '자동매매 중단' 경고를 띄울 수 있습니다.
+        """
+        conn = self._get_connection(self.shared_db_path)
+        try:
+            val = "Y" if is_locked else "N"
+            conn.execute("INSERT OR REPLACE INTO SharedSettings (category, key, value) VALUES (?, ?, ?)",
+                        ("RISK", "IS_LOCKED", val))
+        finally:
+            conn.close()

@@ -106,7 +106,7 @@ class KIS_API:
                 self.db.set_shared_setting("ACCOUNT", "CASH", str(balance))
                 return balance
         except: pass
-        return 0.0
+        return None # 🔥 통신 에러 시 0원이 아니라 None을 반환하여 이전 잔고를 유지하게 합니다!
 
     def get_account_holdings(self):
         """ 보유 종목 리스트 조회 """
@@ -116,18 +116,81 @@ class KIS_API:
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
             tr_id = "VTTC8434R" if self.is_mock else "TTTC8434R"
             params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
-            # (중략: 해외 로직 유지)
-        
+            # (해외 로직 등은 기존 유지)
+        else:
+            return {}
+
         headers = {"Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
         try:
             res = requests.get(url, headers=headers, params=params)
             data = res.json()
             if data.get('rt_cd') == '0':
                 for item in data.get('output1', []):
-                    if int(float(item.get('hldg_qty', 0))) > 0:
-                        holdings[item['pdno']] = {'price': float(item['pchs_avg_pric']), 'qty': int(float(item['hldg_qty']))}
-        except: pass
+                    # 🔥 [핵심 수정] 예약 매도 중인 물량도 화면에 표시하기 위해 '총 보유수량(hldg_qty)'을 가져옵니다!
+                    qty = int(float(item.get('hldg_qty', 0))) 
+                    
+                    if qty > 0:
+                        # 🚀 [정보 보강] 메인 UI에서 종목명, 수익률 등을 제대로 표기할 수 있게 꽉 채워서 보냅니다.
+                        holdings[item['pdno']] = {
+                            'name': item.get('prdt_name', ''),
+                            'qty': qty, 
+                            'price': float(item.get('pchs_avg_pric', 0)),     # 기존 코드 호환용 매입가
+                            'buy_price': float(item.get('pchs_avg_pric', 0)), # 신규 코드 호환용 매입가
+                            'curr_price': float(item.get('prpr', 0)),         # 현재가
+                            'profit_rate': float(item.get('evlu_pfls_rt', 0)) # 수익률
+                        }
+        except Exception as e: 
+            print(f"보유 종목 로드 에러: {e}")
+            
         return holdings
+    
+    def get_unfilled_orders(self):
+        """ 🔍 서버에서 '진짜' 예약매수/예약매도(미체결) 내역을 가져옵니다. """
+        unfilled_list = []
+        if SystemConfig.MARKET_MODE != "DOMESTIC": 
+            return unfilled_list
+            
+        # 한투 미체결 조회 API 주소
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecnl"
+        tr_id = "VTTC8036R" if self.is_mock else "TTTC8036R"
+        params = {
+            "CANO": self.account_no[:8], 
+            "ACNT_PRDT_CD": "01",
+            "CTX_AREA_FK100": "", 
+            "CTX_AREA_NK100": "",
+            "INQR_DVSN_1": "0", 
+            "INQR_DVSN_2": "0"
+        }
+        headers = {
+            "Content-Type": "application/json", 
+            "authorization": f"Bearer {self.access_token}", 
+            "appKey": self.app_key, 
+            "appSecret": self.app_secret, 
+            "tr_id": tr_id, 
+            "custtype": "P"
+        }
+        
+        try:
+            res = requests.get(url, headers=headers, params=params)
+            data = res.json()
+            if data.get('rt_cd') == '0':
+                for item in data.get('output', []):
+                    remn_qty = int(item.get('remn_qty', 0))
+                    if remn_qty > 0: # 잔여(미체결) 수량이 남아있는 것만 수집!
+                        unfilled_list.append({
+                            '주문번호': item.get('odno', ''),
+                            '종목코드': item.get('pdno', ''),
+                            '종목명': item.get('prdt_name', ''),
+                            '주문종류': item.get('sll_buy_dvsn_cd_name', '예약'), # KIS가 '매도' 또는 '매수'로 줍니다.
+                            '주문수량': int(item.get('ord_qty', 0)),
+                            '미체결수량': remn_qty,
+                            '주문가격': float(item.get('ord_unpr', 0)),
+                            '주문시간': item.get('ord_tmd', '') # 시간 (HHMMSS 형식)
+                        })
+        except Exception as e: 
+            print(f"미체결 조회 에러: {e}")
+            
+        return unfilled_list
 
     # =====================================================================
     # 🛒 [핵심 수정] 주식 주문 (주문번호 ODNO 반환 및 전략 적용)
