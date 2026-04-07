@@ -15,7 +15,6 @@ class SystemConfig:
         PROJECT_ROOT = os.path.dirname(sys.executable)
     else:
         # 2. 스크립트로 실행된 경우 (🔥 3칸 위로 올라가야 진짜 Jubby Project가 됩니다!)
-        # 1칸(COMMON) -> 2칸(Jubby_AutoTrage_Python) -> 3칸(Jubby Project)
         PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class TradeData:
@@ -39,13 +38,13 @@ class TradeData:
 
             self.last_mock_price = 70000 
 
-            # 🔥 [수정] '시간'을 제일 첫 번째 컬럼으로 배치
+            # 💡 [컬럼 순서 유지] 시세 표에 표시될 데이터 순서입니다.
             dtColumns =  ['시간','종목코드','종목명','현재가','시가','고가','저가','매수호가','매도호가','매수잔량','매도잔량','거래량']
             self.df = pd.DataFrame(columns=dtColumns, dtype=object)
 
         def update_df(self):
             new_row = {
-                '시간': datetime.now().strftime("%H:%M:%S"), # 🔥 시간 자동 주입!
+                '시간': datetime.now().strftime("%H:%M:%S"),
                 '종목코드' : self.symbol, '종목명' : self.symbol_name, '현재가': self.last_price,
                 '시가': self.open_price, '고가': self.high_price, '저가': self.low_price,
                 '매수호가': self.bid_price, '매도호가': self.ask_price, '매수잔량': self.bid_size,
@@ -53,53 +52,15 @@ class TradeData:
             }
             self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
 
-        def generate_mock_data(self):
-            self.df = pd.DataFrame(columns=self.df.columns) 
-            mock_stocks = [
-                ("005930", "삼성전자"), ("000660", "SK하이닉스"), ("035420", "NAVER"),
-                ("035720", "카카오"), ("005380", "현대차"), ("000270", "기아"),
-                ("068270", "셀트리온"), ("005490", "POSCO홀딩스"), ("051910", "LG화학"), ("000100", "유한양행")
-            ]
-            
-            rows = []
-            for i in range(10):
-                code, name = mock_stocks[i]
-                change = random.randint(-300, 310)
-                self.last_mock_price += change 
-                
-                price = self.last_mock_price
-                open_p = price - random.randint(-50, 50)
-                high_p = max(price, open_p) + random.randint(0, 100)
-                low_p = min(price, open_p) - random.randint(0, 100)
-                
-                rows.append({
-                    '시간': datetime.now().strftime("%H:%M:%S"), # 🔥 시간 자동 주입!
-                    '종목코드': code, '종목명': name, '현재가': price,
-                    '시가': open_p, '고가': high_p, '저가': low_p,
-                    '매수호가': price - 100, '매도호가': price + 100,
-                    '매수잔량': random.randint(1000, 5000), '매도잔량': random.randint(1000, 5000),
-                    '거래량': random.randint(10000, 50000)
-                })
-            self.df = pd.concat([self.df, pd.DataFrame(rows)], ignore_index=True)
-
     # =========================================================================
     # 💼 2. Account (내 지갑/계좌 상황)
     # =========================================================================
     class Account:
         def __init__(self):
             self.update_count = 0
-            # 🔥 [수정] '시간'을 제일 첫 번째 컬럼으로 배치
-            dtColumns = ['시간','종목코드','종목명','보유수량','평균매입가','평가손익','주문가능금액']
+            # 💡 실시간 수익률 계산을 위해 '현재가' 컬럼을 추가 배치하는 것이 좋습니다.
+            dtColumns = ['시간','종목코드','종목명','보유수량','평균매입가','현재가','평가손익','주문가능금액']
             self.df = pd.DataFrame(columns=dtColumns, dtype=object)
-
-        def generate_mock_data(self):
-            self.df = pd.DataFrame(columns=self.df.columns)
-            new_row = {
-                '시간': datetime.now().strftime("%H:%M:%S"), # 🔥 시간 자동 주입!
-                '종목코드': '005930', '종목명': '삼성전자', '보유수량': 100,
-                '평균매입가': '70,000', '평가손익': '2.50%', '주문가능금액': '5,000,000'
-            }
-            self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
 
     # =========================================================================
     # 🧠 3. Strategy (AI 및 보조지표 분석 현황)
@@ -107,51 +68,38 @@ class TradeData:
     class Strategy:
         def __init__(self):
             self.update_count = 0
-            # 🔥 [수정] '시간'을 제일 첫 번째 컬럼으로 배치
-            dtColumns = ['시간','종목코드','종목명','상승확률','MA_5','MA_20','RSI','MACD','전략신호']
+            # ⭐ [기능 보강] '상태메시지' 컬럼을 추가하여 AI가 지금 무엇을 하는지 표에 보여줍니다.
+            dtColumns = ['시간','종목코드','종목명','상승확률','MA_5','MA_20','RSI','MACD','전략신호','상태메시지']
             self.df = pd.DataFrame(columns=dtColumns, dtype=object)
 
-        def generate_mock_data(self):
-            self.df = pd.DataFrame(columns=self.df.columns)
-            prob = random.uniform(0.1, 0.9)
-            new_row = {
-                '시간': datetime.now().strftime("%H:%M:%S"), # 🔥 시간 자동 주입!
-                '종목코드': '005930', '종목명': '삼성전자', 
-                '상승확률': f"{prob*100:.1f}%", 
-                'MA_5': 71000, 'MA_20': 70000, 
-                'RSI': f"{random.randint(20, 80)}", 
-                'MACD': f"{random.uniform(-1.0, 1.0):.2f}", 
-                '전략신호': "BUY 🟢" if prob >= 0.6 else "WAIT 🟡"
-            }
-            self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
-
     # =========================================================================
-    # 📜 4. Order (주문 및 체결 내역)
+    # 📜 4. Order (주문 및 체결 내역) - ⚠️ 여기가 에러의 핵심!
     # =========================================================================
     class Order:
         def __init__(self):
-            # 🔥 [수정] '주문시간'을 맨 앞 '시간'으로 통일하여 배치
-            dtColumns = ['시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태']
+            # 💡 [핵심 수정] '주문번호'를 맨 앞에 추가합니다. 
+            # Ticker가 이 번호를 보고 "아! 내 주문이 체결됐네" 하고 상태를 바꿉니다.
+            dtColumns = ['주문번호', '시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태']
             self.df = pd.DataFrame(columns=dtColumns, dtype=object)
             
         def generate_mock_data(self):
             self.df = pd.DataFrame(columns=self.df.columns)
             now = datetime.now().strftime("%H:%M:%S")
+            # 🚀 [수정] 테스트 데이터 생성 시에도 칸 수를 9개로 맞춰줍니다.
             rows = [
-                {'시간': now, '종목코드': '005930', '종목명': '삼성전자', '주문종류': '매수(BUY)', '주문가격': '75,000', '주문수량': '10', '체결수량': '10', '상태': '체결완료'},
-                {'시간': now, '종목코드': '000660', '종목명': 'SK하이닉스', '주문종류': '매도(SELL)', '주문가격': '150,000', '주문수량': '5', '체결수량': '5', '상태': '체결완료'}
+                {'주문번호': '000001', '시간': now, '종목코드': '005930', '종목명': '삼성전자', '주문종류': '매수(BUY)', '주문가격': '75,000', '주문수량': '10', '체결수량': '10', '상태': '체결완료'},
             ]
             self.df = pd.concat([self.df, pd.DataFrame(rows)], ignore_index=True)
 
 
     # =========================================================================
-    # 📡 [데이터 번역기] C# 서버 전송용 JSON 변환기
+    # 📡 [데이터 번역기] JSON 변환 시 누락된 필드들을 모두 채워줍니다.
     # =========================================================================
     def market_dict(self):
         result_list = []
         for _, row in self.market.df.iterrows():
             result_list.append({
-                "time": str(row.get('시간', '')), # 🔥 C#에 시간 전달
+                "time": str(row.get('시간', '')),
                 "symbol": str(row.get('종목코드', '')),
                 "symbol_name": str(row.get('종목명', '')),
                 "last_price": str(row.get('현재가', '0')),
@@ -171,11 +119,12 @@ class TradeData:
         result_list = []
         for _, row in self.account.df.iterrows():
             result_list.append({
-                "time": str(row.get('시간', '')), # 🔥 C#에 시간 전달
+                "time": str(row.get('시간', '')),
                 "symbol": str(row.get('종목코드', '')),
                 "symbol_name": str(row.get('종목명', '')),
                 "quantity": str(row.get('보유수량', '0')),
                 "avg_price": str(row.get('평균매입가', '0')),
+                "current_price": str(row.get('현재가', '0')), # 현재가 추가
                 "pnl": str(row.get('평가손익', '0%')),
                 "available_cash": str(row.get('주문가능금액', '0')),
                 "update_count": self.account.update_count
@@ -186,7 +135,7 @@ class TradeData:
         result_list = []
         for _, row in self.strategy.df.iterrows():
             result_list.append({
-                "time": str(row.get('시간', '')), # 🔥 C#에 시간 전달
+                "time": str(row.get('시간', '')),
                 "symbol": str(row.get('종목코드', '')),
                 "symbol_name": str(row.get('종목명', '')),
                 "ai_prob": str(row.get('상승확률', '0%')), 
@@ -195,6 +144,7 @@ class TradeData:
                 "rsi": str(row.get('RSI', '')),
                 "macd": str(row.get('MACD', '')),
                 "signal": str(row.get('전략신호', '')),
+                "status_msg": str(row.get('상태메시지', '대기 중...')), # 상태메시지 전달
                 "update_count": self.strategy.update_count
             })
         return result_list
@@ -203,12 +153,15 @@ class TradeData:
         result_list = []
         for _, row in self.order.df.iterrows():
             result_list.append({
-                "time": str(row.get('시간', '')), # 🔥 C#에 시간 전달
+                # ⭐ [수정] Ticker가 검색할 수 있도록 주문번호를 반드시 포함시킵니다.
+                "order_no": str(row.get('주문번호', '')), 
+                "time": str(row.get('시간', '')),
                 "symbol": str(row.get('종목코드', '')),
                 "symbol_name": str(row.get('종목명', '')),
                 "type": str(row.get('주문종류', '')),
                 "price": str(row.get('주문가격', '0')),
                 "quantity": str(row.get('주문수량', '0')),
+                "filled_quantity": str(row.get('체결수량', '0')), # 체결수량 추가
                 "status": str(row.get('상태', ''))
             })
         return result_list

@@ -1192,54 +1192,59 @@ class FormMain(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(dict)
     def append_order_table_slot(self, order_info):
-        """ 주문 내역 발생 시 표에 한 줄 추가하는 함수 """
         if not order_info: return 
+        
+        # 1. DB 저장은 기존 로직 그대로 유지
         try:
-            # 🚀 [수정] 주문번호를 추출해서 DB 저장 함수의 첫 번째 자리에 넣어야 합니다!
             order_no = order_info.get('주문번호', '00000000')
             code = order_info.get('종목코드', '')
             o_type = "BUY" if "BUY" in str(order_info.get('주문종류', '')).upper() else "SELL"
             price = float(str(order_info.get('주문가격', '0')).replace(',', ''))
             qty = int(order_info.get('주문수량', 0))
             y_rate = float(str(order_info.get('수익률', '0')).replace('%', ''))
-            
-            # ❌ 기존 코드: self.db.insert_trade_history(code, o_type, price, qty, y_rate, 0.0)
-            # ✅ 올바른 코드: 맨 앞에 order_no 추가!
             self.db.insert_trade_history(order_no, code, o_type, price, qty, y_rate)
         except Exception: pass
 
-        # =====================================================================
-        # 🚀 [핵심 수정] 이미지의 표 제목 순서와 코드의 매핑 순서를 일치시킵니다!
-        # 이미지 순서: 시간 | 종목코드 | 종목명 | 주문종류 | 주문가격 | 주문수량 | 체결수량 | 상태
-        # =====================================================================
-        # ※ '주문번호'는 이미지에 칸이 없으므로 '시간' 칸에 주문번호를 넣고 싶으신 게 아니라면
-        # 아래 리스트의 첫 번째를 '주문시간'으로 바꿔야 합니다.
-        
-        # [A안] 이미지처럼 첫 칸에 주문번호를 계속 나오게 하고 싶을 때:
-        # ord_cols = ['주문번호', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '주문시간']
-        
-        # [B안] 제목 '시간'에 맞게 진짜 시간이 나오게 하고 싶을 때 (추천 👍):
-        ord_cols = ['주문시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태']
-        # ※ 단, 이 경우 order_info 딕셔너리에 '상태' 키값이 있어야 합니다.
-        # =====================================================================
+        # 2. 💡 [중요] Flag.py의 설계도 순서와 정확히 일치시킵니다.
+        ord_cols = ['주문번호', '주문시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태']
 
         row_idx = self.tbOrder.rowCount()
         self.tbOrder.insertRow(row_idx)
         
         for col_idx, col_name in enumerate(ord_cols):
-            # 딕셔너리에서 값을 꺼내옴
-            val = str(order_info.get(col_name, ''))
+            # 딕셔너리에서 데이터를 꺼내올 때 키값이 다를 수 있으므로 보정합니다.
+            key = col_name if col_name != '주문시간' else '주문시간'
+            val = str(order_info.get(key, order_info.get(col_name, '')))
             
-            # 예외처리: '상태'라는 키가 없으면 '미체결'이라고 강제로 적어줌
-            if col_name == '상태' and not order_info.get('상태'):
-                val = "미체결"
+            if col_name == '상태' and not val: val = "미체결"
 
             item = QtWidgets.QTableWidgetItem(val)
             item.setTextAlignment(QtCore.Qt.AlignCenter)
             self.tbOrder.setItem(row_idx, col_idx, item)
             
-        if self.tbOrder.rowCount() > 500: 
-            self.tbOrder.removeRow(0)
+        # 🚀 [보안] 0번 컬럼(주문번호)은 Ticker는 읽어야 하지만 사용자에겐 안 보이게 숨깁니다.
+        self.tbOrder.setColumnHidden(0, True)
+
+        # 2. ⭐ 표 컬럼 순서 재정의 (주문번호를 첫 칸에 추가하여 Ticker가 찾기 쉽게 함)
+        # 이미지의 [시간 | 종목코드 | 종목명...] 순서를 유지하면서 '주문번호'를 숨겨진 칸으로 활용합니다.
+        ord_cols = ['주문번호', '주문시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태']
+
+        row_idx = self.tbOrder.rowCount()
+        self.tbOrder.insertRow(row_idx)
+        
+        for col_idx, col_name in enumerate(ord_cols):
+            val = str(order_info.get(col_name, ''))
+            # '상태' 값이 없으면 '미체결'로 기본값 세팅
+            if col_name == '상태' and not order_info.get('상태'): val = "미체결"
+
+            item = QtWidgets.QTableWidgetItem(val)
+            item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.tbOrder.setItem(row_idx, col_idx, item)
+            
+        # 🚀 [꿀팁] 0번 칼럼(주문번호)은 사용자에게 보일 필요 없으므로 숨깁니다.
+        self.tbOrder.setColumnHidden(0, True) 
+        
+        if self.tbOrder.rowCount() > 500: self.tbOrder.removeRow(0)
 
     @QtCore.pyqtSlot() 
     def btnDataSendClickEvent(self):
@@ -1498,6 +1503,10 @@ class FormMain(QtWidgets.QMainWindow):
         act_train = menu.addAction("🧠 Jubby AI Trainer (AI 학습기 실행)")
         
         menu.addSeparator() 
+        # ⭐ [추가됨] 셧다운 강제 해제 메뉴 버튼 생성
+        act_unlock = menu.addAction("🔓 주삐 셧다운(매수 잠금) 강제 해제")
+        
+        menu.addSeparator() 
         act_panic = menu.addAction("🛑 긴급 전체 청산 및 자동매매 종료 (Panic Sell)")
         menu.addSeparator() 
         act_save_log = menu.addAction("💾 현재 로그 텍스트로 저장 (Save Log)") 
@@ -1507,6 +1516,24 @@ class FormMain(QtWidgets.QMainWindow):
         if action == act_toggle_mode: self.toggle_market_mode() 
         elif action == act_collect: self.start_data_collector()
         elif action == act_train: self.start_ai_trainer()
+        
+        # ⭐ [추가됨] 해제 버튼을 클릭했을 때의 동작 로직
+        elif action == act_unlock:
+            # 1. DB의 잠금 상태를 'N'(풀림)으로 변경
+            self.db.set_shared_setting("RISK", "IS_LOCKED", "N")
+            
+            # 2. 누적 손실률 초기화 (필요시)
+            if hasattr(self, 'daily_total_pnl_pct'):
+                self.daily_total_pnl_pct = 0.0 
+            
+            # 3. 워커(자동매매 일꾼)의 연패 기록도 0으로 초기화
+            if hasattr(self, 'trade_worker') and self.trade_worker is not None:
+                self.trade_worker.loss_streak_cnt = 0
+                
+            # 4. 로그에 성공 메세지 출력
+            if hasattr(self, 'add_log'):
+                self.add_log("🛡️ [시스템] 관리자 권한으로 매수 잠금이 해제되었습니다. 다시 탐색을 시작합니다.", "success")
+                
         elif action == act_panic: self.start_panic_sell()
         elif action == act_save_log: self.save_manual_log()
 
@@ -1626,6 +1653,35 @@ class FormMain(QtWidgets.QMainWindow):
 
     def mouseReleaseEvent(self, event): self._isDragging = False
 
+    # =====================================================================
+    # ⭐ [핵심 추가] 메인 창 숨김/최소화/복구 시 Ticker 창 완벽 동기화
+    # =====================================================================
+    def showEvent(self, event):
+        """ 메인 창이 화면에 나타날 때 Ticker 창도 강제로 소환합니다. """
+        super().showEvent(event)
+        if hasattr(self, 'ticker_window') and self.ticker_window:
+            self.ticker_window.show()       # 숨어있던 Ticker 보이기
+            self.ticker_window.raise_()     # Ticker를 화면 맨 앞으로 끌어올리기
+            self.ticker_window.snap_to_main() # 메인 창 옆구리에 예쁘게 다시 붙이기
+
+    def changeEvent(self, event):
+        """ 메인 창의 상태(최소화, 전체화면 등)가 변할 때를 감지합니다. """
+        if event.type() == QtCore.QEvent.WindowStateChange:
+            # 1. 메인 창을 아래로 내렸을 때 (최소화) -> Ticker도 같이 내림
+            if self.isMinimized():
+                if hasattr(self, 'ticker_window') and self.ticker_window:
+                    self.ticker_window.showMinimized()
+                    
+            # 2. 메인 창을 다시 눌러서 띄웠을 때 (복구) -> Ticker도 같이 복구
+            elif self.windowState() == QtCore.Qt.WindowNoState or self.windowState() == QtCore.Qt.WindowMaximized:
+                if hasattr(self, 'ticker_window') and self.ticker_window:
+                    self.ticker_window.showNormal()
+                    self.ticker_window.raise_()
+                    self.ticker_window.snap_to_main()
+                    
+        super().changeEvent(event)
+        
+    # (이 아래로는 기존에 있던 emergency_sell_event 등 함수들이 이어집니다)
     def emergency_sell_event(self):
         """ [수동 판매 손익 합산 버전] 사용자가 선택한 종목을 즉시 매도하고 수익금을 정산합니다. """
         try:

@@ -220,6 +220,27 @@ class KIS_Manager:
         if self.ui: self.ui.add_log(msg, log_type)
         else: print(f"[{log_type.upper()}] {msg}")
 
+    # =====================================================================
+    # 💡 [여기에 추가] 한국 증시 호가단위 자동 계산기 (에러 방지용)
+    # =====================================================================
+    def get_tick_price(self, price):
+        """ 주가를 한국거래소(KRX) 정상 호가 단위로 자동 보정합니다. """
+        if SystemConfig.MARKET_MODE != "DOMESTIC":
+            return int(price) # 해외 주식은 틱 단위가 다르므로 우선 정수 변환만
+            
+        p = int(price)
+        # 한국 주식 호가 단위 규정
+        if p < 2000: tick = 1
+        elif p < 5000: tick = 5
+        elif p < 20000: tick = 10
+        elif p < 50000: tick = 50
+        elif p < 200000: tick = 100
+        elif p < 500000: tick = 500
+        else: tick = 1000
+        
+        # 호가 단위에 맞게 내림 처리하여 안전하게 지정가 생성
+        return int((p // tick) * tick)
+
     # --- 주문 함수들 (이제 모두 주문번호 ODNO를 반환합니다) ---
 
     def buy_market_price(self, stock_code, qty):
@@ -227,8 +248,11 @@ class KIS_Manager:
         return self.api.order_stock(stock_code, qty, is_buy=True, prcs_dv="01")
 
     def buy_limit_order(self, code, qty, price):
-        """ 지정가 매수 (스마트 지정가용) """
-        return self.api.order_stock(code, qty, is_buy=True, limit_price=price)
+        """ 지정가 매수 (스마트 지정가용) + 호가 단위 보정 """
+        # 계산된 가격을 규격에 맞는 호가로 다듬습니다.
+        adj_price = self.get_tick_price(price) 
+        
+        return self.api.order_stock(code, qty, is_buy=True, limit_price=adj_price)
 
     # ✅ 올바른 코드 (이걸로 교체)
     def sell(self, code, qty): 

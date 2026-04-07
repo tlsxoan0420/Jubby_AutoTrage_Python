@@ -200,6 +200,31 @@ class RealWebSocketWorker(QThread):
         if self.ws: self.ws.close()
         self.quit(); self.wait()
 
+    # -----------------------------------------------------------------
+    # 📡 [신규 추가] 실시간 가격/호가 수신 요청 (수익률 0% 방지용)
+    # -----------------------------------------------------------------
+    def subscribe_stock_realtime(self, code):
+        """ 새 종목을 사자마자 한투 서버에 '실시간 가격 좀 줘!'라고 요청하는 함수 """
+        if not self.ws or not self.ws.sock or not self.ws.sock.connected:
+            return
+            
+        # 1. 실시간 현재가(H0STCNT0) 구독 요청
+        cnt_msg = {
+            "header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+            "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}}
+        }
+        self.ws.send(json.dumps(cnt_msg))
+        
+        # 2. 실시간 호가잔량(H0STASP0) 구독 요청 (2차 방어막용)
+        asp_msg = {
+            "header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+            "body": {"input": {"tr_id": "H0STASP0", "tr_key": code}}
+        }
+        time.sleep(0.05) # 서버 과부하 방지 딜레이
+        self.ws.send(json.dumps(asp_msg))
+        
+        self.sig_execution_msg.emit(f"📡 [{code}] 실시간 수익률 추적 모드 가동!", "info")
+
 # =====================================================================
 # 🖥️ 체결 수신기 미니 윈도우 UI 클래스
 # =====================================================================
@@ -225,121 +250,138 @@ class FormTicker(QtWidgets.QWidget):
         self.lst_ticker.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: 'Consolas'; font-size: 11px; border: 1px solid #3c3c3c;")
         layout.addWidget(self.lst_ticker)
         
-        # 🌟 [수정 완료] 워커 생성 시 main_ui를 반드시 전달하여 추적 종목을 가져올 수 있게 함!
         self.ws_worker = RealWebSocketWorker(main_ui=self.main_ui)
         self.ws_worker.sig_execution_msg.connect(self.add_ticker_log)
         self.ws_worker.sig_real_execution.connect(self.update_main_ui_order)
         self.ws_worker.start()
 
+        # =============================================================
+        # ⭐ [핵심 추가 1] Ticker 창 잠금 및 마우스 드래그 상태 관리 변수
+        # =============================================================
+        self.is_locked = True       # 창이 켜질 때 기본적으로 이동 못하게 꽉 잠가둡니다.
+        self._isDragging = False    # 현재 마우스로 창을 끌고(드래그) 있는지 확인하는 스위치
+        self._startPos = QtCore.QPoint(0, 0) # 마우스를 클릭한 위치 저장용
+
+    # =============================================================
+    # ⭐ [핵심 추가 2] 마우스 클릭 이벤트 (잠금 해제 및 이동 준비)
+    # =============================================================
+    def mousePressEvent(self, event):
+        # 1. 키보드의 'Ctrl' 키와 마우스의 '우클릭'을 동시에 눌렀는지 검사합니다.
+        if event.modifiers() == Qt.ControlModifier and event.button() == Qt.RightButton:
+            # 잠겨있으면 풀고, 풀려있으면 잠그는 스위치 역할 (상태 반전)
+            self.is_locked = not self.is_locked
+            
+            # 상태에 따라 Ticker 창 리스트에 메세지를 띄워 사용자에게 알려줍니다.
+            if self.is_locked:
+                self.add_ticker_log("🔒 Ticker 창이 잠겼습니다. (이동 불가)", "warning")
+            else:
+                self.add_ticker_log("🔓 Ticker 창 잠금이 해제되었습니다. (이동 가능)", "success")
+            
+            event.accept() # 이벤트를 처리했으니 파이썬에게 작업 끝났다고 알림
+            return
+
+        # 2. 잠금이 풀려있는(False) 상태에서 마우스 '좌클릭'을 했을 때 창을 이동할 준비를 합니다.
+        if event.button() == Qt.LeftButton and not self.is_locked:
+            self._isDragging = True
+            # 내가 윈도우 창의 어느 부분을 잡고 끌려는지 마우스 포인터의 갭(차이)을 계산해 둡니다.
+            self._startPos = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+
+    # =============================================================
+    # ⭐ [핵심 추가 3] 마우스 이동 이벤트 (실제로 창을 끌고 다님)
+    # =============================================================
+    def mouseMoveEvent(self, event):
+        # 좌클릭을 누른 채로 드래그 중이고, 잠금이 풀려있을 때만 창이 마우스를 따라갑니다.
+        if self._isDragging and event.buttons() == Qt.LeftButton and not self.is_locked:
+            self.move(event.globalPos() - self._startPos) # 창 좌표 이동
+            event.accept()
+
+    # =============================================================
+    # ⭐ [핵심 추가 4] 마우스 떼기 이벤트 (드래그 종료)
+    # =============================================================
+    def mouseReleaseEvent(self, event):
+        # 마우스에서 손을 떼면 드래그 상태를 해제하여 멈춥니다.
+        self._isDragging = False
+
+    # =============================================================
+    # ⭐ [핵심 추가 5] 창 닫기(X버튼) 방어막 (프로그램 재시작 에러 원인 해결)
+    # =============================================================
+    def closeEvent(self, event):
+        # 수동으로 X 버튼을 눌러 창을 닫으면, 완전히 파괴(Destroy)되어 메인 엔진과 꼬입니다.
+        # 따라서 파괴하지 않고 투명 망토를 씌워 '숨김(Hide)' 처리만 합니다.
+        self.hide() 
+        event.ignore() # X버튼의 원래 기능(프로그램 강제 종료)을 씹어버립니다.
+
+    # (이하 기존 함수들 그대로 유지)
     @QtCore.pyqtSlot(str, str)
     def add_ticker_log(self, msg, msg_type="info"):
-        """ Ticker 창에 컬러 로그를 추가합니다. """
-        # 시간 자동 추가 (이미 있으면 패스)
         if not msg.startswith("["):
             now_time = time.strftime("%H:%M:%S")
             msg = f"[{now_time}] {msg}"
 
         item = QtWidgets.QListWidgetItem(msg)
         
-        # 🎨 매수/매도 성격에 따른 강렬한 색상 부여
         if msg_type == "buy": 
-            item.setForeground(QtGui.QColor("#FF4500")) # OrangeRed (매수)
+            item.setForeground(QtGui.QColor("#FF4500")) 
             item.setFont(QtGui.QFont("Consolas", 11, QtGui.QFont.Bold))
         elif msg_type == "sell": 
-            item.setForeground(QtGui.QColor("#00BFFF")) # DeepSkyBlue (매도)
+            item.setForeground(QtGui.QColor("#00BFFF")) 
             item.setFont(QtGui.QFont("Consolas", 11, QtGui.QFont.Bold))
         elif msg_type == "success": 
             item.setForeground(QtGui.QColor("lime")) 
         elif msg_type == "error": 
             item.setForeground(QtGui.QColor("red"))
+        elif msg_type == "warning": # 잠금 메세지용 노란색 추가
+            item.setForeground(QtGui.QColor("yellow"))
         else: 
-            item.setForeground(QtGui.QColor("#A0A0A0")) # 기본 회색
+            item.setForeground(QtGui.QColor("#A0A0A0")) 
             
         self.lst_ticker.addItem(item)
         self.lst_ticker.scrollToBottom()
 
     def update_main_ui_order(self, exec_data):
-        """ [상급 노하우] 주문번호 기반 DB 동기화 및 메인 UI 표 색상 변경 """
         if not self.main_ui: return
         
-        target_ono = str(exec_data.get('주문번호')) 
+        target_ono = str(exec_data.get('주문번호'))  # 서버에서 온 체결 주문번호
         target_symbol = exec_data.get('종목코드')
         filled_qty = int(exec_data.get('체결수량', 0))
         real_price = exec_data.get('체결가', 0)
-        real_time = exec_data.get('체결시간', time.strftime("%H:%M:%S"))
 
-        # -------------------------------------------------------------
-        # 🛡️ [네트워크 지연 방어] 리트라이 로직 (DB에 주문이 먼저 쌓일 때까지 대기)
-        # -------------------------------------------------------------
-        found_in_db = False
-        for attempt in range(5): # 0.1초씩 최대 0.5초 대기
-            conn = self.db._get_connection(self.db.shared_db_path)
-            try:
-                # 🚀 핵심: 주문번호(ODNO)로 '미체결' 건을 정확히 찾아냅니다.
-                cursor = conn.execute("SELECT id FROM TradeHistory WHERE order_no = ? AND Status = '미체결'", (target_ono,))
-                row_db = cursor.fetchone()
-                
-                if row_db:
-                    # 🎯 찾았다! 상태를 '체결완료'로 바꾸고 실제 체결 가격과 시간으로 덮어씁니다.
-                    conn.execute("""
-                        UPDATE TradeHistory 
-                        SET Status = '체결완료', filled_quantity = ?, order_price = ?, order_time = ?
-                        WHERE id = ?
-                    """, (filled_qty, real_price, real_time, row_db[0]))
-                    conn.commit()
-                    found_in_db = True
-                    break 
-            except: pass
-            finally: conn.close()
-            
-            if not found_in_db: time.sleep(0.1) 
-
-        # -------------------------------------------------------------
-        # 2. PyQt 메인 UI 테이블(tbOrder) 실시간 연두색 업데이트
-        # -------------------------------------------------------------
+        # 1. 메인 UI의 tbOrder(주문내역 표)를 가져옵니다.
         table = self.main_ui.tbOrder
-        headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
         
+        # 2. 표의 전체 헤더 이름을 읽어서 각 칸의 위치를 정확히 파악합니다.
+        headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
         try:
+            ono_col = headers.index('주문번호')
             stat_col = headers.index('상태')
             qty_col = headers.index('체결수량')
             price_col = headers.index('주문가격')
-            ono_col = headers.index('주문번호') if '주문번호' in headers else -1
-        except: return
+        except ValueError:
+            return # 헤더 이름이 안 맞으면 중단
 
-        # 거꾸로 순회하며 해당 주문번호를 찾아 업데이트
+        # 3. 표를 아래에서 위로 훑으면서 해당 주문번호를 찾습니다.
         for row in range(table.rowCount() - 1, -1, -1):
-            is_match = False
-            if ono_col != -1:
-                ono_item = table.item(row, ono_col)
-                if ono_item and ono_item.text() == target_ono: is_match = True
-            else:
-                # 주문번호 열이 없는 경우 종목코드로 백업 매칭
-                sym_item = table.item(row, headers.index('종목코드'))
-                if sym_item and sym_item.text() == target_symbol: is_match = True
-
-            if is_match:
+            ono_item = table.item(row, ono_col)
+            if ono_item and ono_item.text() == target_ono:
                 status_item = table.item(row, stat_col)
-                # '미체결' 상태일 때만 연두색으로 변경 (중복 업데이트 방지)
+                
+                # 4. '미체결' 상태인 녀석을 찾아 '체결완료' 도장을 쾅 찍어줍니다.
                 if status_item and status_item.text() == "미체결":
                     status_item.setText("체결완료")
-                    status_item.setForeground(QtGui.QColor("lime")) # 갓벽한 연두색!
+                    status_item.setForeground(QtGui.QColor("lime")) # 연두색 변경
                     
-                    # 실제 체결 수량과 가격으로 UI 덮어쓰기
-                    table.item(row, qty_col).setText(str(filled_qty))
-                    table.item(row, price_col).setText(f"{real_price:,.0f}")
+                    table.item(row, qty_col).setText(str(filled_qty))     # 체결수량 업데이트
+                    table.item(row, price_col).setText(f"{real_price:,.0f}") # 체결가 업데이트
+                    
+                    # ⭐ [가장 중요] 체결이 확인되었으니, 이 종목의 실시간 현재가 수신을 시작합니다!
+                    # 그래야 AutoTradeWorker가 실시간 가격을 보고 수익률을 계산합니다.
+                    self.ws_worker.subscribe_stock_realtime(target_symbol)
                     break
                 
     def snap_to_main(self):
-        """ 메인 윈도우의 오른쪽 옆구리에 딱 붙게 위치를 조정합니다. """
         if not self.main_ui: return
-        
-        # 1. 메인 윈도우의 현재 위치와 크기를 가져옵니다.
         main_geo = self.main_ui.geometry()
-        
-        # 2. 메인 윈도우의 오른쪽(Right) 좌표 + 여백(5픽셀)에 위치시킵니다.
-        # 높이는 메인 윈도우와 똑같은 높이(Top)에 맞춥니다.
         new_x = main_geo.right() + 5 
         new_y = main_geo.top()
-        
         self.move(new_x, new_y)

@@ -334,7 +334,9 @@ class JubbyStrategy:
         
         pretty_name = self.get_pretty_name(code)
         
-        # 1. AI 뇌(앙상블)의 1차 예측
+        # =================================================================
+        # 🤖 1. AI 뇌(앙상블) 및 돌파 전략의 1차 예측
+        # =================================================================
         if self.ai_model is not None:
             features = self.get_ai_features(df)
             
@@ -349,19 +351,16 @@ class JubbyStrategy:
                 is_above_vwap = curr_price >= current.get('VWAP', curr_price)
                 is_above_ma5 = curr_price >= current.get('MA5', curr_price)
                 is_macd_good = current.get('MACD', 0) >= current.get('Signal_Line', 0)
-                
-                # 🔥 [수정됨] RSI가 40 이하로 과하게 떨어졌을 때(낙폭과대)도 예외적으로 통과시켜줌
                 is_rsi_oversold = current.get('RSI', 50) <= 40.0 
 
-                # if 조건문에 is_rsi_oversold 를 추가해 줍니다.
                 if is_above_vwap or is_above_ma5 or is_macd_good or is_rsi_oversold:
-                    if self.check_orderbook_imbalance(code):
-                        self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 떡상 징후 포착! (상승 확률: {ai_prob*100:.1f}%)", "buy")
-                        buy_signal = True
+                    # ⭐ 1차 승인에서는 호가창 검사를 뺐습니다.
+                    self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 떡상 징후 포착! (상승 확률: {ai_prob*100:.1f}%)", "buy")
+                    buy_signal = True
                 else:
                     self.send_log(f"🛡️ [AI 승인 거절] {pretty_name} 확률은 {ai_prob*100:.1f}% 이나, 추세 저항(세력선 이탈)으로 진입 포기", "warning")
        
-        # 2. [전략 A & B] 아날로그 돌파/추세 매매 로직
+        # [전략 A & B] 아날로그 돌파/추세 매매 로직
         try:
             breakout_vol = float(self.db.get_shared_setting("TRADE", "BREAKOUT_VOL", "2.0")) 
             breakout_ret = float(self.db.get_shared_setting("TRADE", "BREAKOUT_RET", "0.5")) 
@@ -374,25 +373,20 @@ class JubbyStrategy:
             if self.ai_model is not None and ai_prob < ai_min_pass:
                 self.send_log(f"💡 [전략엔진] {pretty_name} 돌파 매수를 추천이나, AI 확신도 미달({ai_prob*100:.1f}% < {ai_min_pass*100:.0f}%)로 스킵", "info")
             else:
-                # 🔥 [새로운 방어막] 호가창 매도/매수 잔량 비율 검사
-                if self.check_orderbook_imbalance(code):
-                    self.send_log(f"🔥 [1차 승인] {pretty_name} 거래량 폭발 & 세력선(VWAP) 돌파 포착!", "buy")
-                    buy_signal = True
+                # ⭐ 여기도 호가창 검사를 뺐습니다.
+                self.send_log(f"🔥 [1차 승인] {pretty_name} 거래량 폭발 & 세력선(VWAP) 돌파 포착!", "buy")
+                buy_signal = True
 
         # =================================================================
-        # 🛡️ 3. [이중 잠금장치] LSTM이 10분 차트 보고 최종 판단!
+        # 🛡️ 2. [이중 잠금장치] LSTM 패턴 검사 및 실시간 호가 수급(최종) 검사
         # =================================================================
         if buy_signal:
-            # 🔥 self.scaler is not None 조건이 추가되었습니다.
+            # (1) LSTM 패턴 검사 (2차 승인)
             if self.lstm_model is not None and self.scaler is not None and len(df) >= 10:
                 seq_features = self.get_ai_sequence_features(df, seq_length=10)
                 
                 if seq_features is not None and len(seq_features) == 10:
-                    
-                    # 🚨 [핵심 버그 해결] 거대한 숫자의 실시간 차트 데이터를 0~1로 압축합니다!
                     seq_features_scaled = self.scaler.transform(seq_features)
-                    
-                    # 압축된 데이터를 텐서로 변환하여 모델에 입력
                     seq_tensor = torch.tensor(seq_features_scaled, dtype=torch.float32).unsqueeze(0).to(self.device)
                     
                     with torch.no_grad():
@@ -406,12 +400,20 @@ class JubbyStrategy:
                         buy_signal = False
                         return "WAIT"
                     else:
-                        self.send_log(f"✅ [최종 승인] {pretty_name} 10분 시계열 패턴 우수! (통과율: {lstm_prob*100:.1f}%). 실전 매수 진입!", "success")
+                        # LSTM은 '최종'이 아닌 '2차 승인'으로 문구를 변경했습니다.
+                        self.send_log(f"✅ [2차 승인] {pretty_name} 10분 시계열 패턴 우수! (통과율: {lstm_prob*100:.1f}%)", "success")
 
+            # (2) ⭐ [궁극의 최종 승인] 실시간 호가창 매수/매도 잔량 수급 검사
             if buy_signal:
-                try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "강력 매수 신호 발생!")
-                except: pass
-                return "BUY"
+                if self.check_orderbook_imbalance(code):
+                    # 호가창 매도벽까지 두꺼운게 확인되면 진짜 실전 매수 진입!
+                    try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "강력 매수 신호 발생!")
+                    except: pass
+                    return "BUY"
+                else:
+                    # 차트는 예쁜데 호가창에서 개미를 꼬시고 있다면 매수 취소
+                    buy_signal = False
+                    return "WAIT"
 
         try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "탐색 및 분석 중...")
         except: pass
