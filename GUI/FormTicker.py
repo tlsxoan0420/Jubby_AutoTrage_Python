@@ -16,8 +16,9 @@ class RealWebSocketWorker(QThread):
     sig_execution_msg = pyqtSignal(str, str) # Ticker 창에 텍스트 띄우기용 (메시지, 타입)
     sig_real_execution = pyqtSignal(dict)    # 메인 UI(FormMain)로 데이터 넘기기용
 
-    def __init__(self):
+    def __init__(self, main_ui=None):
         super().__init__()
+        self.main_ui = main_ui
         self.is_running = True
         self.db = JubbyDB_Manager()
         self.ws = None
@@ -62,26 +63,37 @@ class RealWebSocketWorker(QThread):
                     tr_id_recv = parts[1]
                     
                     # ---------------------------------------------------------
-                    # 🟢 1. 기존 체결 통보 (H0STCNI0 / H0STCNI9) 처리 로직
+                    # 🟢 1. [복구 완료] 기존 체결 통보 (H0STCNI0 / H0STCNI9) 파싱 로직
                     # ---------------------------------------------------------
                     if tr_id_recv in ["H0STCNI0", "H0STCNI9"]:
                         content = parts[3].split('^')
                         if len(content) < 12: return
-                        # ... (기존 체결 통보 파싱 및 UI 업데이트 코드는 그대로 유지) ...
+                        
+                        try:
+                            exec_data = {
+                                "주문번호": content[1], 
+                                "종목코드": content[3], 
+                                "체결수량": int(content[5]), 
+                                "체결가": float(content[6]), 
+                                "체결시간": f"{content[7][:2]}:{content[7][2:4]}:{content[7][4:6]}"
+                            }
+                            self.sig_real_execution.emit(exec_data)
+                            self.sig_execution_msg.emit(f"💰 [체결] {content[3]} | {exec_data['체결수량']}주 @ {exec_data['체결가']:,.0f}원", "success")
+                        except: pass
                         
                     # ---------------------------------------------------------
-                    # 🚀 2. [신규 추가] 실시간 호가 잔량 (H0STASP0) 처리 로직
+                    # 🚀 2. [수정 완료] 실시간 호가 잔량 (H0STASP0) 하드코딩 제거
                     # ---------------------------------------------------------
                     elif tr_id_recv == "H0STASP0":
                         content = parts[3].split('^')
                         if len(content) >= 74: # 한투 웹소켓 호가 데이터 규격
                             try:
-                                # 한국투자증권 웹소켓 규격: 
+                                symbol = content[0] # 🔥 0번에 진짜 종목 코드가 들어옵니다!
+                                
                                 # 총 매도호가 잔량(Total Ask) = 43번째 인덱스
                                 # 총 매수호가 잔량(Total Bid) = 73번째 인덱스
                                 total_ask_size = float(content[43])
                                 total_bid_size = float(content[73])
-                                symbol = "추적중인종목코드" # 웹소켓 요청 시 사용한 종목코드 매핑 필요
                                 
                                 # ⚡ DB의 MarketStatus 테이블에 0.1초 단위로 잔량 업데이트
                                 conn = self.db._get_connection(self.db.shared_db_path)
@@ -94,6 +106,27 @@ class RealWebSocketWorker(QThread):
                                 conn.close()
                             except Exception as e:
                                 pass
+                                
+                    # ---------------------------------------------------------
+                    # 🚀 3. [신규 추가] 실시간 체결가/현재가 (H0STCNT0) 0초 딜레이 수신
+                    # ---------------------------------------------------------
+                    elif tr_id_recv == "H0STCNT0":
+                        content = parts[3].split('^')
+                        if len(content) >= 3:
+                            try:
+                                symbol = content[0] 
+                                curr_price = float(content[2])
+                                
+                                # API 통신 없이 메인 엔진이 바로 읽어다 쓸 수 있도록 DB에 꽂아줍니다.
+                                conn = self.db._get_connection(self.db.shared_db_path)
+                                conn.execute("""
+                                    UPDATE MarketStatus 
+                                    SET last_price = ? 
+                                    WHERE symbol = ?
+                                """, (curr_price, symbol))
+                                conn.commit()
+                                conn.close()
+                            except: pass
             else:
                 # JSON 응답 (최초 접속 성공 등) 처리
                 try:
@@ -132,6 +165,20 @@ class RealWebSocketWorker(QThread):
             }
             ws.send(json.dumps(subscribe_msg))
             self.sig_execution_msg.emit(f"📡 [{self.hts_id}] 계좌 실시간 감시 시작!", "info")
+
+            # -------------------------------------------------------------
+            # 🚀 [추가] AI가 선정한 종목들의 호가(H0STASP0) & 현재가(H0STCNT0) 구독!
+            # -------------------------------------------------------------
+            if self.main_ui and hasattr(self.main_ui, 'DYNAMIC_STOCK_DICT'):
+                target_stocks = list(self.main_ui.DYNAMIC_STOCK_DICT.keys())
+                for code in target_stocks:
+                    # 📊 1. 호가창 잔량 구독
+                    ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"}, "body": {"input": {"tr_id": "H0STASP0", "tr_key": code}}}))
+                    time.sleep(0.05) 
+                    # ⚡ 2. 실시간 현재가(체결가) 구독
+                    ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"}, "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}}}))
+                    time.sleep(0.05)
+                self.sig_execution_msg.emit(f"📊 {len(target_stocks)}개 종목 실시간 0초 딜레이 감시 시작!", "info")
 
         # 웹소켓 실행 (ping 설정 제거로 안정성 확보)
         websocket.enableTrace(False)
@@ -178,8 +225,8 @@ class FormTicker(QtWidgets.QWidget):
         self.lst_ticker.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: 'Consolas'; font-size: 11px; border: 1px solid #3c3c3c;")
         layout.addWidget(self.lst_ticker)
         
-        # 🌟 진짜 웹소켓 스레드 실행
-        self.ws_worker = RealWebSocketWorker()
+        # 🌟 [수정 완료] 워커 생성 시 main_ui를 반드시 전달하여 추적 종목을 가져올 수 있게 함!
+        self.ws_worker = RealWebSocketWorker(main_ui=self.main_ui)
         self.ws_worker.sig_execution_msg.connect(self.add_ticker_log)
         self.ws_worker.sig_real_execution.connect(self.update_main_ui_order)
         self.ws_worker.start()

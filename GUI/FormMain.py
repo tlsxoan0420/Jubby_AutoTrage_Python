@@ -456,17 +456,42 @@ class AutoTradeWorker(QThread):
                     except: buy_time = now
                     self.mw.my_holdings[code]['buy_time'] = buy_time 
 
-                df = self.mw.api_manager.fetch_minute_data(code)
-                if df is None or len(df) < 26: continue
+                # -------------------------------------------------------------
+                # 🚀 [하이브리드 엔진 1] 1분 차트 캐싱 + 0초 딜레이 현재가 병합
+                # -------------------------------------------------------------
+                current_minute = datetime.now().strftime("%H:%M")
                 
-                df = self.mw.strategy_engine.calculate_indicators(df)
-                curr_price = float(df.iloc[-1]['close']); profit_rate = ((curr_price - buy_price) / buy_price) * 100 
+                # 1. 1분이 지났을 때만 API 통신을 통해 분봉 차트를 갱신합니다.
+                if self.mw.last_fetch_time.get(code) != current_minute:
+                    df = self.mw.api_manager.fetch_minute_data(code)
+                    if df is not None and len(df) >= 26:
+                        df = self.mw.strategy_engine.calculate_indicators(df)
+                        self.mw.df_cache[code] = df  # 뇌에 저장
+                        self.mw.last_fetch_time[code] = current_minute
+                else:
+                    # 2. 1분이 안 지났다면 통신 없이 뇌(캐시)에서 0초만에 꺼내옵니다.
+                    df = self.mw.df_cache.get(code)
+                
+                if df is None or len(df) < 26: 
+                    continue
+                
+                # 3. 0초 딜레이 DB 실시간 가격 가져와서 종가 덮어치기
+                # 🚨 [수정 1] self.db ➔ db_temp 로 변경! (일꾼 내부의 DB 변수 사용)
+                realtime_price = db_temp.get_realtime_price(code)
+                curr_price = realtime_price if realtime_price > 0 else float(df.iloc[-1]['close'])
+                
+                df.at[df.index[-1], 'close'] = curr_price 
+                # -------------------------------------------------------------
+                
+                profit_rate = ((curr_price - buy_price) / buy_price) * 100
+                
                 profit_amt = (curr_price - buy_price) * buy_qty
                 
-                # stock_details_str += f"  🔸 {stock_name}: 매입 {buy_price:,.2f} -> 현재 {curr_price:,.2f} ({profit_rate:+.2f}%)\n"
-                
                 target_price, stop_price = self.mw.strategy_engine.get_dynamic_exit_prices(df, buy_price)
-                target_rate = ((target_price - buy_price) / buy_price) * 100; stop_rate = ((stop_price - buy_price) / buy_price) * 100
+
+                # 🚨 [치명적 버그 수정] 받아온 목표가/손절가(원)를 조건문에서 쓸 수 있게 수익률(%)로 변환!
+                target_rate = ((target_price - buy_price) / buy_price) * 100
+                stop_rate = ((stop_price - buy_price) / buy_price) * 100
 
                 # (기존 코드) 최고점 갱신 로직
                 if curr_price > high_watermark:
@@ -1094,6 +1119,10 @@ class FormMain(QtWidgets.QMainWindow):
 
         self.my_holdings = {}; self.last_known_cash = 0 
         
+        # 🚀 [추가] 1분에 1번만 통신하기 위한 하이브리드 캐시 메모리
+        self.df_cache = {}          
+        self.last_fetch_time = {}
+        
         self.trade_worker = AutoTradeWorker(main_window=self) 
         self.trade_worker.sig_log.connect(self.add_log)                                
         self.trade_worker.sig_account_df.connect(self.update_account_table_slot)        
@@ -1676,15 +1705,35 @@ class FormMain(QtWidgets.QMainWindow):
             self.add_log(f"🚨 수동 매도 처리 중 에러: {e}", "error")
 
     def get_ai_probability(self, code):
-        df = self.api_manager.fetch_minute_data(code) 
-        if df is None or len(df) < 26: return 0.0, 0, None
-        df = self.strategy_engine.calculate_indicators(df)
-        curr_price = df.iloc[-1]['close']; prob = 0.0
+        # -------------------------------------------------------------
+        # 🚀 [하이브리드 엔진 2] AI 매수 탐색 시에도 캐시 메모리 활용
+        # -------------------------------------------------------------
+        current_minute = datetime.now().strftime("%H:%M")
+        
+        if self.last_fetch_time.get(code) != current_minute:
+            df = self.api_manager.fetch_minute_data(code)
+            if df is not None and len(df) >= 26:
+                df = self.strategy_engine.calculate_indicators(df)
+                self.df_cache[code] = df
+                self.last_fetch_time[code] = current_minute
+        else:
+            df = self.df_cache.get(code)
+
+        if df is None or len(df) < 26: 
+            return 0.0, 0, None
+        
+        # 🚀 0초 딜레이 DB 실시간 가격 가져와서 종가 덮어치기
+        realtime_price = self.db.get_realtime_price(code)
+        curr_price = realtime_price if realtime_price > 0 else float(df.iloc[-1]['close'])
+        
+        df.at[df.index[-1], 'close'] = curr_price 
+        
+        prob = 0.0
         if self.strategy_engine.ai_model is not None:
             features = self.strategy_engine.get_ai_features(df)
             if features is not None: prob = self.strategy_engine.ai_model.predict_proba(features)[0][1]
         return prob, curr_price, df
-
+    
     @QtCore.pyqtSlot(object) 
     def update_account_table_slot(self, df): 
         # 🚀 [수정] 백그라운드 데이터셋을 먼저 갱신해야 DB 동기화가 이루어집니다.

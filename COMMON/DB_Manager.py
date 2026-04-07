@@ -52,7 +52,20 @@ class JubbyDB_Manager:
             # 테이블 생성
             conn.execute('''CREATE TABLE IF NOT EXISTS SharedSettings (category TEXT, key TEXT, value TEXT, PRIMARY KEY (category, key))''')
             conn.execute('''CREATE TABLE IF NOT EXISTS SystemStatus (module TEXT PRIMARY KEY, status TEXT, progress INTEGER, last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS MarketStatus (symbol TEXT PRIMARY KEY, symbol_name TEXT, last_price REAL, open_price REAL, high_price REAL, low_price REAL, return_1m REAL, trade_amount REAL, vol_energy REAL, disparity REAL, volume REAL)''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS MarketStatus (symbol TEXT PRIMARY KEY, symbol_name TEXT, last_price REAL, open_price REAL, high_price REAL, low_price REAL, return_1m REAL, trade_amount REAL, vol_energy REAL, disparity REAL, volume REAL, ask_size REAL, bid_size REAL)''')
+            
+            # =================================================================
+            # 🚀 [DB 무손실 자동 업그레이드 패치] 기존 데이터를 살리면서 컬럼만 강제 추가!
+            # =================================================================
+            try:
+                # 사용자가 굳이 DB를 지우지 않아도 알아서 빈칸을 추가해줍니다!
+                conn.execute("ALTER TABLE MarketStatus ADD COLUMN last_price REAL")
+                conn.execute("ALTER TABLE MarketStatus ADD COLUMN ask_size REAL")
+                conn.execute("ALTER TABLE MarketStatus ADD COLUMN bid_size REAL")
+            except Exception:
+                pass # 🤫 이미 추가되어 있으면 에러 없이 조용히 넘어갑니다.
+            # =================================================================
+
             conn.execute('''CREATE TABLE IF NOT EXISTS AccountStatus (symbol TEXT PRIMARY KEY, symbol_name TEXT, quantity INTEGER, avg_price REAL, current_price REAL, pnl_amt REAL, pnl_rate REAL, available_cash REAL)''')
             conn.execute('''CREATE TABLE IF NOT EXISTS StrategyStatus (symbol TEXT PRIMARY KEY, symbol_name TEXT, ai_prob REAL, ma_5 REAL, ma_20 REAL, RSI REAL, macd REAL, signal TEXT, status_msg TEXT)''')
             conn.execute('''CREATE TABLE IF NOT EXISTS TradeHistory (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, symbol TEXT, symbol_name TEXT, order_type TEXT, order_price REAL, order_quantity INTEGER, filled_quantity INTEGER, order_time TEXT, Status TEXT, order_yield TEXT)''')
@@ -297,5 +310,23 @@ class JubbyDB_Manager:
         except Exception as e:
             conn.execute("ROLLBACK;")
             print(f"청소 중 에러 발생: {e}")
+        finally:
+            conn.close()
+
+    # =======================================================================
+    # ⚡ [신규 추가] 실시간 웹소켓 현재가 초고속 조회 (API 호출 완전 대체용)
+    # =======================================================================
+    def get_realtime_price(self, symbol):
+        """ API 대신 DB에 꽂혀있는 0.1초 단위 웹소켓 현재가를 바로 읽어옵니다. """
+        conn = self._get_connection(self.shared_db_path)
+        try:
+            # MarketStatus 테이블에서 실시간 가격 꺼내기
+            cursor = conn.execute("SELECT last_price FROM MarketStatus WHERE symbol = ?", (symbol,))
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+            return 0.0
+        except Exception:
+            return 0.0
         finally:
             conn.close()
