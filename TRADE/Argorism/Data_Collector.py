@@ -267,20 +267,23 @@ class UltraDataCollector:
         except: pass
 
     def get_already_collected_stocks(self, table_name):
+        conn = None # 🌟 변수 미리 선언
         try:
             import sqlite3
             conn = sqlite3.connect(self.db.python_db_path)
             cursor = conn.cursor()
             cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
             if not cursor.fetchone():
-                conn.close()
                 return []
             
             df = pd.read_sql(f"SELECT DISTINCT code FROM {table_name}", conn)
-            conn.close()
             return df['code'].tolist()
-        except:
+        except Exception as e:
             return []
+        finally:
+            # 🌟 에러가 났더라도 conn이 생성되어 있다면 무조건 닫아주기 (안전장치)
+            if conn: 
+                conn.close()
 
     def run_collection(self, stock_list):
         if not self.access_token:

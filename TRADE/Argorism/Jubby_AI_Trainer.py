@@ -233,21 +233,6 @@ def train_jubby_brain(log_callback=None):
     X_seq_temp = np.array(X_seq_temp)
     y_seq_temp = np.array(y_seq_temp)
 
-    # 🚨 [핵심 버그 수정 1] 데이터 불균형 강제 교정 (기존 코드 유지)
-    pos_idx = np.where(y_seq_temp == 1)[0] 
-    neg_idx = np.where(y_seq_temp == 0)[0] 
-
-    if len(pos_idx) > 0:
-        neg_sampled = np.random.choice(neg_idx, size=min(len(neg_idx), len(pos_idx) * 2), replace=False)
-        final_idx = np.concatenate([pos_idx, neg_sampled])
-        np.random.shuffle(final_idx) # 순서 무작위 섞기
-        
-        X_seq = X_seq_temp[final_idx]
-        y_seq = y_seq_temp[final_idx]
-    else:
-        X_seq = X_seq_temp
-        y_seq = y_seq_temp
-
     # 🚨 [핵심 버그 수정 1] 데이터 불균형(Class Imbalance) 강제 교정!
     # 진짜 반등(1)이 너무 적어서 AI가 무조건 0%를 찍는 현상을 막습니다.
     pos_idx = np.where(y_seq_temp == 1)[0] # 진짜 반등 인덱스

@@ -53,12 +53,15 @@ class JubbyDB_Manager:
 
             # [공통 테이블 생성]
             conn.execute('''CREATE TABLE IF NOT EXISTS SharedSettings (category TEXT, key TEXT, value TEXT, PRIMARY KEY (category, key))''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS SystemStatus (module TEXT PRIMARY KEY, status TEXT, progress INTEGER, last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            
+            # 🔥 CURRENT_TIMESTAMP를 한국 시간으로 변경 완료!
+            conn.execute('''CREATE TABLE IF NOT EXISTS SystemStatus (module TEXT PRIMARY KEY, status TEXT, progress INTEGER, last_update TIMESTAMP DEFAULT (datetime('now', '+9 hours')))''')
             conn.execute('''CREATE TABLE IF NOT EXISTS MarketStatus (symbol TEXT PRIMARY KEY, symbol_name TEXT, last_price REAL, open_price REAL, high_price REAL, low_price REAL, return_1m REAL, trade_amount REAL, vol_energy REAL, disparity REAL, volume REAL, ask_size REAL, bid_size REAL)''')
             conn.execute('''CREATE TABLE IF NOT EXISTS AccountStatus (symbol TEXT PRIMARY KEY, symbol_name TEXT, quantity INTEGER, avg_price REAL, current_price REAL, pnl_amt REAL, pnl_rate REAL, available_cash REAL)''')
             conn.execute('''CREATE TABLE IF NOT EXISTS StrategyStatus (symbol TEXT PRIMARY KEY, symbol_name TEXT, ai_prob REAL, ma_5 REAL, ma_20 REAL, RSI REAL, macd REAL, signal TEXT, status_msg TEXT)''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS SharedLogs (id INTEGER PRIMARY KEY AUTOINCREMENT, log_level TEXT, message TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS PriceHistory (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, price REAL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            
+            conn.execute('''CREATE TABLE IF NOT EXISTS SharedLogs (id INTEGER PRIMARY KEY AUTOINCREMENT, log_level TEXT, message TEXT, created_at TIMESTAMP DEFAULT (datetime('now', '+9 hours')))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS PriceHistory (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, price REAL, created_at TIMESTAMP DEFAULT (datetime('now', '+9 hours')))''')
             conn.execute('''CREATE TABLE IF NOT EXISTS target_stocks (symbol TEXT, symbol_name TEXT, market_mode TEXT)''')
 
             # =================================================================
@@ -148,12 +151,10 @@ class JubbyDB_Manager:
         finally:
             conn.close()
 
-    # (중략: update_system_status, broadcast_settings 등 기존 함수 유지)
-
     def update_system_status(self, module, status, progress=0):
         conn = self._get_connection(self.shared_db_path)
         try:
-            conn.execute("REPLACE INTO SystemStatus (module, status, progress, last_update) VALUES (?, ?, ?, CURRENT_TIMESTAMP)", (module, status, progress))
+            conn.execute("REPLACE INTO SystemStatus (module, status, progress, last_update) VALUES (?, ?, ?, datetime('now', '+9 hours'))", (module, status, progress))
         finally:
             conn.close()
 
@@ -171,10 +172,12 @@ class JubbyDB_Manager:
         try:
             conn.execute("BEGIN TRANSACTION;")
             conn.execute("DELETE FROM MarketStatus") 
-            conn.executemany('INSERT INTO MarketStatus (symbol, symbol_name, last_price, open_price, high_price, low_price, return_1m, trade_amount, vol_energy, disparity, volume) VALUES (:symbol, :symbol_name, :last_price, :open_price, :high_price, :low_price, :return_1m, :trade_amount, :vol_energy, :disparity, :volume)', data_list) 
+            # 🔥 [핵심 수정] INSERT INTO -> REPLACE INTO 로 변경하여 UNIQUE 에러 완벽 차단!
+            conn.executemany('REPLACE INTO MarketStatus (symbol, symbol_name, last_price, open_price, high_price, low_price, return_1m, trade_amount, vol_energy, disparity, volume) VALUES (:symbol, :symbol_name, :last_price, :open_price, :high_price, :low_price, :return_1m, :trade_amount, :vol_energy, :disparity, :volume)', data_list) 
             conn.execute("COMMIT;")
-        except Exception:
+        except Exception as e:
             conn.execute("ROLLBACK;")
+            print(f"🔥 Market DB 에러: {e}")
         finally:
             conn.close()
 
@@ -184,7 +187,8 @@ class JubbyDB_Manager:
         try:
             conn.execute("BEGIN TRANSACTION;")
             conn.execute("DELETE FROM AccountStatus")
-            conn.executemany('INSERT INTO AccountStatus (symbol, symbol_name, quantity, avg_price, current_price, pnl_amt, pnl_rate, available_cash) VALUES (:symbol, :symbol_name, :quantity, :avg_price, :current_price, :pnl_amt, :pnl_rate, :available_cash)', data_list)
+            # 🌟 [수정 확인] REPLACE INTO 가 아주 잘 적용되어 있습니다!
+            conn.executemany('REPLACE INTO AccountStatus (symbol, symbol_name, quantity, avg_price, current_price, pnl_amt, pnl_rate, available_cash) VALUES (:symbol, :symbol_name, :quantity, :avg_price, :current_price, :pnl_amt, :pnl_rate, :available_cash)', data_list)
             conn.execute("COMMIT;")
         except Exception as e: 
             conn.execute("ROLLBACK;")
@@ -228,16 +232,19 @@ class JubbyDB_Manager:
         except Exception as e: print(f"로그 기록 중 에러: {e}")
         finally: conn.close()
 
-    # 🚀 [수정] status와 filled_qty 파라미터를 추가하여 체결 상태를 동적으로 지정 가능하게 변경
     def insert_trade_history(self, order_no, symbol, trade_type, price, qty, yield_rate=0.0, status="미체결", filled_qty=0):
         """ 주문 내역을 DB에 동적으로 상태를 지정하여 기록 """
         conn = self._get_connection(self.shared_db_path)
         try:
+            kst_now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)
+            time_str = kst_now.strftime("%Y-%m-%d %H:%M:%S")
+            short_time_str = kst_now.strftime("%H:%M:%S")
+            
             conn.execute('''INSERT INTO TradeHistory 
                 (time, symbol, symbol_name, type, price, quantity, order_no, Status, filled_quantity, order_price, order_time, order_yield) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
-                (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "-", trade_type, price, qty, str(order_no), 
-                 status, filled_qty, price, datetime.datetime.now().strftime("%H:%M:%S"), f"{yield_rate}%"))
+                (time_str, symbol, "-", trade_type, price, qty, str(order_no), 
+                 status, filled_qty, price, short_time_str, f"{yield_rate}%"))
         except Exception as e:
             print(f"🚨 TradeHistory 저장 에러: {e}")
         finally:
@@ -261,12 +268,11 @@ class JubbyDB_Manager:
             conn.execute("REPLACE INTO SharedSettings (category, key, value) VALUES (?, ?, ?)", (category, key, str(value)))
         finally: conn.close()
 
-    # (이하 python_db 관련 및 유지보수 함수 기존과 동일)
     def _initialize_python_db(self):
         conn = self._get_connection(self.python_db_path)
         try:
             conn.execute('PRAGMA journal_mode = WAL;')
-            conn.execute('''CREATE TABLE IF NOT EXISTS AITrainingLogs (id INTEGER PRIMARY KEY AUTOINCREMENT, train_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, model_name TEXT, accuracy REAL, data_count INTEGER)''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS AITrainingLogs (id INTEGER PRIMARY KEY AUTOINCREMENT, train_date TIMESTAMP DEFAULT (datetime('now', '+9 hours')), model_name TEXT, accuracy REAL, data_count INTEGER)''')
         finally: conn.close()
 
     def insert_ai_train_log(self, model_name, accuracy, data_count):

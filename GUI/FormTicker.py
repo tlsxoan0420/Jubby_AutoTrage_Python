@@ -22,6 +22,7 @@ class RealWebSocketWorker(QThread):
         self.is_running = True
         self.db = JubbyDB_Manager()
         self.ws = None
+        self.tracked_symbols = set()
 
         # 1. DB에서 한투 API 키 및 HTS 아이디 가져오기
         self.app_key = self.db.get_shared_setting("KIS_API", "APP_KEY", "")
@@ -214,61 +215,91 @@ class FormTicker(QtWidgets.QWidget):
         self.lst_ticker.addItem(item); self.lst_ticker.scrollToBottom()
 
     def update_main_ui_order(self, exec_data):
-        """ [가장 중요] 한투 체결 통보를 메인 UI 표에 즉시 반영합니다. """
+        """ [최종 완성본] 무한 렉 및 DB 충돌 완벽 해결 버전 """
         if not self.main_ui: return
         
         target_ono = str(exec_data.get('주문번호')) 
         target_symbol = exec_data.get('종목코드')
         filled_qty = int(exec_data.get('체결수량', 0))
         real_price = exec_data.get('체결가', 0)
+        
+        is_cancel = exec_data.get('is_cancel', False)
+        is_detective = exec_data.get('is_detective', False)
 
-        # 메인 UI의 주문 내역 표 가져오기
+        # 🌟 1. 상태 판별 (취소인지, 체결인지, 부분체결인지)
+        db_status = "체결완료"
+        if is_cancel:
+            db_status = "주문취소"
+        else:
+            try:
+                conn = self.db._get_connection(self.db.shared_db_path)
+                cursor = conn.execute("SELECT quantity FROM TradeHistory WHERE order_no = ?", (target_ono,))
+                row = cursor.fetchone()
+                if row and 0 < filled_qty < int(row[0]):
+                    db_status = "부분체결"
+            except: pass
+            finally:
+                if 'conn' in locals() and conn: conn.close()
+
+        # 🌟 2. [가장 중요] DB에 상태를 쓰고 반드시 'commit(도장)'을 찍습니다.
+        # 이 도장을 찍어야 '탐정'이 DB를 보고 "아, 처리됐구나" 하고 멈춥니다!
+        try:
+            conn = self.db._get_connection(self.db.shared_db_path)
+            conn.execute("UPDATE TradeHistory SET Status = ?, filled_quantity = ?, price = ? WHERE order_no = ?", 
+                         (db_status, filled_qty, real_price, target_ono))
+            conn.commit() # 🔥 필수! 이게 없으면 탐정이 5초마다 계속 신호를 보내서 렉이 걸립니다.
+        except: pass
+        finally:
+            if 'conn' in locals() and conn: conn.close()
+
+        # 🌟 3. UI(표) 업데이트 로직
         table = self.main_ui.tbOrder
         headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
-        
         try:
-            # 헤더 이름을 기준으로 컬럼 위치를 찾습니다 (유연한 대응)
-            ono_col = headers.index('주문번호')
-            stat_col = headers.index('상태')
-            qty_col = headers.index('체결수량')
-            price_col = headers.index('주문가격')
+            ono_col = headers.index('주문번호'); stat_col = headers.index('상태')
+            qty_col = headers.index('체결수량'); price_col = headers.index('주문가격')
         except: return
 
-        # 표를 거꾸로 뒤져서 내 주문번호와 맞는 줄을 찾습니다.
         for row in range(table.rowCount() - 1, -1, -1):
             ono_item = table.item(row, ono_col)
             if ono_item and ono_item.text() == target_ono:
                 status_item = table.item(row, stat_col)
                 
-                if status_item and status_item.text() == "미체결":
-                    status_item.setText("체결완료")
-                    status_item.setForeground(QtGui.QColor("lime")) 
+                # 중복 방지: 이미 처리된 행이면 무시
+                if status_item and status_item.text() == db_status: break 
+
+                if status_item and status_item.text() in ["미체결", "부분체결"]:
+                    status_item.setText(db_status)
+                    # 상태에 따른 색깔 지정
+                    if db_status == "주문취소": status_item.setForeground(QtGui.QColor("gray"))
+                    elif db_status == "부분체결": status_item.setForeground(QtGui.QColor("orange"))
+                    else: status_item.setForeground(QtGui.QColor("lime"))
                     
                     table.item(row, qty_col).setText(str(filled_qty))
                     table.item(row, price_col).setText(f"{real_price:,.0f}")
                     
-                    # 🚀 [추가] 표에서 데이터를 읽어와 아주 상세하고 예쁜 Ticker 한글 로그를 띄웁니다!
+                    # 🔥 [여기에 2줄 추가!] DB는 바꿨으니, 이제 메인 화면한테 "빨리 표 다시 그려!" 라고 명령합니다.
+                    if self.main_ui:
+                        QtCore.QMetaObject.invokeMethod(self.main_ui, "refresh_order_table", QtCore.Qt.QueuedConnection)
+                    
+                    # (기존 코드)
                     order_type = table.item(row, headers.index('주문종류')).text()
                     stock_name = table.item(row, headers.index('종목명')).text()
                     
-                    # 🔥 탐정이 잡아낸 건지, 진짜 웹소켓이 온 건지 접두사로 구분!
-                    prefix = "🕵️‍♂️ [누락복구]" if exec_data.get('is_detective') else "💰 [체결완료]"
-                    log_icon = "🔵" if "매수" in order_type or "불타기" in order_type else "🔴"
+                    # 로그 출력
+                    if is_cancel:
+                        self.add_ticker_log(f"🗑️ [취소완료] {stock_name} | 30초 경과 주문 정리됨", "warning")
+                    else:
+                        prefix = "🕵️‍♂️ [누락복구]" if is_detective else "💰 [체결알림]"
+                        log_icon = "🔵" if "매수" in order_type or "불타기" in order_type else "🔴"
+                        self.add_ticker_log(f"{prefix} {log_icon} {stock_name} | {db_status} | {real_price:,.0f}원 | {filled_qty}주", "success")
                     
-                    self.add_ticker_log(f"{prefix} {log_icon} {stock_name} | {order_type} | {real_price:,.0f}원 | {filled_qty}주", "success")
-                    
-                    # ⭐ 체결 즉시 실시간 수익률 계산을 위해 시세 추적을 시작합니다!
-                    self.ws_worker.subscribe_stock_realtime(target_symbol)
-
-                    # 🔥 [C# UI 완벽 동기화 추가]
-                    # DB의 TradeHistory 상태를 업데이트해야 C# 화면에서도 즉각 '체결완료'가 뜹니다!
-                    try:
-                        conn = self.db._get_connection(self.db.shared_db_path)
-                        conn.execute("UPDATE TradeHistory SET Status = '체결완료', filled_quantity = ?, price = ? WHERE order_no = ?", (filled_qty, real_price, target_ono))
-                        conn.close()
-                    except Exception as e:
-                        print(f"TradeHistory DB 업데이트 에러: {e}")
-                        
+                    # 🌟 4. [렉 방지 핵심] 시세 추적 무한 반복 방어막 실행!
+                    if db_status == "체결완료" and not is_cancel:
+                        # 1단계에서 만든 바구니(tracked_symbols)에 종목이 없을 때만 딱 1번 실행!
+                        if target_symbol not in self.tracked_symbols:
+                            self.ws_worker.subscribe_stock_realtime(target_symbol)
+                            self.tracked_symbols.add(target_symbol) # 바구니에 추가
                     break
                 
     def snap_to_main(self):

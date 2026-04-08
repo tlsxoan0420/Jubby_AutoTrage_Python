@@ -141,9 +141,15 @@ class JubbyStrategy:
         try:
             # 웹소켓(FormTicker)이 실시간으로 업데이트 중인 최신 잔량 데이터를 꺼내옵니다.
             conn = self.db._get_connection(self.db.shared_db_path)
-            cursor = conn.execute("SELECT ask_size, bid_size FROM MarketStatus WHERE symbol = ?", (code,))
-            row = cursor.fetchone()
-            conn.close()
+            try:
+                cursor = conn.execute("SELECT ask_size, bid_size FROM MarketStatus WHERE symbol = ?", (code,))
+                row = cursor.fetchone()
+            except Exception as e:
+                # 에러 발생 시 프로그램이 터지지 않고 안전하게 빈 값(None) 처리
+                row = None 
+            finally:
+                # 🌟 핵심: 위에서 무슨 일이 있었든 간에, 이 구역을 빠져나갈 땐 무조건 문을 닫습니다.
+                conn.close()
 
             if row:
                 ask_size = float(row[0])

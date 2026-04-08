@@ -35,6 +35,14 @@ class KIS_API:
         try: self.db.insert_log(log_type.upper(), msg)
         except: pass
 
+    def _safe_json_parse(self, response):
+        try:
+            if not response.text or response.text.strip() == "":
+                return {"rt_cd": "9", "msg1": "서버 응답 없음"}
+            return response.json()
+        except:
+            return {"rt_cd": "9", "msg1": "JSON 파싱 에러"}
+
     def get_access_token(self):
         """ KIS API 접속 토큰 발급 (파일 캐싱 적용으로 1분 제한 방어) """
         token_path = os.path.join(SystemConfig.PROJECT_ROOT, "kis_token.txt")
@@ -99,8 +107,8 @@ class KIS_API:
 
         headers = {"Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
         try:
-            res = requests.get(url, headers=headers, params=params)
-            data = res.json()
+            res = requests.get(url, headers=headers, params=params, timeout=5.0)
+            data = self._safe_json_parse(res)
             if data.get('rt_cd') == '0':
                 balance = float(data.get('output', {}).get('ord_psbl_cash', 0))
                 self.db.set_shared_setting("ACCOUNT", "CASH", str(balance))
@@ -122,8 +130,8 @@ class KIS_API:
 
         headers = {"Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
         try:
-            res = requests.get(url, headers=headers, params=params)
-            data = res.json()
+            res = requests.get(url, headers=headers, params=params, timeout=5.0)
+            data = self._safe_json_parse(res)
             if data.get('rt_cd') == '0':
                 for item in data.get('output1', []):
                     # 🔥 [핵심 수정] 예약 매도 중인 물량도 화면에 표시하기 위해 '총 보유수량(hldg_qty)'을 가져옵니다!
@@ -170,9 +178,10 @@ class KIS_API:
             "custtype": "P"
         }
         
+        # 🟢 [수정 후] 이렇게 2줄을 바꾸세요!
         try:
-            res = requests.get(url, headers=headers, params=params)
-            data = res.json()
+            res = requests.get(url, headers=headers, params=params, timeout=5.0)
+            data = self._safe_json_parse(res)
             if data.get('rt_cd') == '0':
                 for item in data.get('output', []):
                     remn_qty = int(item.get('remn_qty', 0))
@@ -216,9 +225,10 @@ class KIS_API:
 
         headers = {"Content-Type": "application/json; charset=utf-8", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
         
+        # 🟢 [수정 후] 이렇게 2줄을 바꾸세요!
         try:
-            res = requests.post(url, headers=headers, data=json.dumps(payload))
-            data = res.json()
+            res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=5.0)
+            data = self._safe_json_parse(res)
             
             if data.get('rt_cd') == '0':
                 self.last_error_msg = ""
@@ -258,6 +268,38 @@ class KIS_API:
                     return None
             except: time.sleep(0.5)
         return None
+
+    def cancel_order(self, order_no):
+        """ [B전략] 미체결 주문 강제 취소 전송 """
+        if SystemConfig.MARKET_MODE == "DOMESTIC":
+            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecnl"
+            tr_id = "VTTC0803U" if self.is_mock else "TTTC0803U"
+            payload = {
+                "CANO": self.account_no[:8], 
+                "ACNT_PRDT_CD": "01", 
+                "KRX_FWDG_ORD_ORGNO": "", 
+                "ORGN_ODNO": str(order_no), 
+                "ORD_DVSN": "00", 
+                "RVSE_CNCL_DVSN_CD": "02", # 02가 취소 명령
+                "ORD_QTY": "0",            # 0은 전량 취소를 의미
+                "ORD_UNPR": "0", 
+                "QTY_ALL_ORD_YN": "Y"
+            }
+            headers = {"Content-Type": "application/json; charset=utf-8", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
+            try:
+
+                # 🔥 [렉 방지 마법] timeout=5.0을 추가해서 한투 서버가 느려도 5초 뒤엔 쿨하게 넘어가도록 설정!
+                res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=5.0)
+                data = res.json()
+                if data.get('rt_cd') == '0':
+                    self._log_msg(f"✅ 주문취소 성공 [원주문번호:{order_no}]", "success")
+                    return True
+
+                else:
+                    self._log_msg(f"⚠️ 주문취소 실패: {data.get('msg1')}", "warning")
+            except Exception as e:
+                self._log_msg(f"🚨 주문취소 통신 에러: {e}", "error")
+        return False
 
 # =====================================================================
 # 👔 [2] KIS_Manager 클래스 (사용자 편의용 래퍼 클래스)
@@ -328,3 +370,4 @@ class KIS_Manager:
     def get_balance(self): return self.api.get_account_balance()
     def get_real_holdings(self): return self.api.get_account_holdings()
     def fetch_minute_data(self, code): return self.api.fetch_minute_data(code)
+    def cancel_order(self, order_no): return self.api.cancel_order(order_no)
