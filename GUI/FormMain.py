@@ -1088,113 +1088,73 @@ class AutoTradeWorker(QThread):
                 # 🔥 [수정] 장바구니 로직이 사라졌으므로, 헷갈리지 않게 그냥 스캔 결과만 깔끔하게 브리핑합니다!
                 self.sig_log.emit(f"🔎 1분 스캔 사이클 완료 ({actual_scanned_count}개 탐색). 현재 주도주 TOP 3: {top_msg}", "info")
 
-            # if candidates:
-            #     candidates = sorted(candidates, key=lambda x: x['prob'], reverse=True)
-            #     for i in range(min(needed_count, len(candidates))):
-            #         if not self.is_running: return 
-
-            #         cand = candidates[i]; code = cand['code']; prob = cand['prob']; curr_price = cand['price']; stock_name = cand['stock_name']; is_pyramiding = cand['is_pyramiding']
-
-            #         try: use_funds_percent = float(db_temp.get_shared_setting("TRADE", "USE_FUNDS_PERCENT", "100"))
-            #         except: use_funds_percent = 100.0
-
-            #         allowed_total_budget = total_asset * (use_funds_percent / 100.0); available_trading_budget = allowed_total_budget - total_invested
-            #         if available_trading_budget <= 0: continue
-
-            #         if is_pyramiding:
-            #             try: pyramiding_rate = float(db_temp.get_shared_setting("TRADE", "PYRAMIDING_RATE", "50.0"))
-            #             except: pyramiding_rate = 50.0
-            #             target_budget = cand['current_invested'] * (pyramiding_rate / 100.0); max_remaining_for_stock = cand['max_allowed'] - cand['current_invested']; target_budget = min(target_budget, max_remaining_for_stock)
-            #         else:
-            #             try: weight_high = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_HIGH", "20.0")) / 100.0
-            #             except: weight_high = 0.20
-            #             try: weight_mid = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_MID", "10.0")) / 100.0
-            #             except: weight_mid = 0.10
-            #             try: weight_low = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_LOW", "5.0")) / 100.0
-            #             except: weight_low = 0.05
-                        
-            #             if prob >= 0.85: weight = weight_high     
-            #             elif prob >= 0.70: weight = weight_mid   
-            #             else: weight = weight_low                
-                        
-            #             base_target_budget = float(total_asset * weight)
-            #             try: atr_high_limit = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_LIMIT", "5.0")); atr_high_ratio = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_RATIO", "50.0")) / 100.0; atr_mid_limit  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_LIMIT", "2.5")); atr_mid_ratio  = float(db_temp.get_shared_setting("TRADE", "ATR_MID_RATIO", "70.0")) / 100.0
-            #             except: atr_high_limit, atr_high_ratio = 5.0, 0.5; atr_mid_limit, atr_mid_ratio = 2.5, 0.7
-                            
-            #             current_atr = cand['atr']; volatility_pct = (current_atr / curr_price) * 100 if curr_price > 0 else 0
-            #             if volatility_pct >= atr_high_limit: target_budget = base_target_budget * atr_high_ratio; self.sig_log.emit(f"🚨 {stock_name} 변동성 극심({volatility_pct:.1f}%)! 매수 축소", "warning")
-            #             elif volatility_pct >= atr_mid_limit: target_budget = base_target_budget * atr_mid_ratio; self.sig_log.emit(f"🛡️ {stock_name} 변동성 높음({volatility_pct:.1f}%). 매수 축소", "warning")
-            #             else: target_budget = base_target_budget
-
-            #         budget = min(target_budget, available_trading_budget); buy_qty = int(budget // curr_price) 
-            #         if buy_qty * curr_price > my_cash: buy_qty = int(my_cash // curr_price)
-            #         if buy_qty == 0: continue
-
-            #         # 🔥 [기능 1 적용] 매수 실행 함수에 현재가(limit_price) 전달
-            #         if buy_qty > 0 and self.execute_guaranteed_buy(code, buy_qty, curr_price):
-            #             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            #             if is_pyramiding:
-            #                 old_qty = cand['holding_qty']; old_price = cand['holding_price']; new_total_qty = old_qty + buy_qty; new_avg_price = ((old_price * old_qty) + (curr_price * buy_qty)) / new_total_qty
-            #                 self.mw.my_holdings[code]['price'] = new_avg_price; self.mw.my_holdings[code]['qty'] = new_total_qty; self.mw.my_holdings[code]['high_watermark'] = max(self.mw.my_holdings[code]['high_watermark'], curr_price)
-            #                 self.sig_log.emit(f"🔥 [불타기 성공] {stock_name} | 추가: {buy_qty}주 | AI: {prob*100:.1f}%", "buy") 
-            #             else:
-            #                 self.mw.my_holdings[code] = {'price': curr_price, 'qty': buy_qty, 'high_watermark': curr_price, 'buy_time': now, 'half_sold': False}
-            #                 self.sig_log.emit(f"🔵 [매수 체결] {stock_name} | {curr_price:,.2f}원 | {buy_qty}주 | AI: {prob*100:.1f}%", "buy") 
-
-            #             my_cash -= (curr_price * buy_qty); total_invested += (curr_price * buy_qty)
-            #             self.sig_order_append.emit({'종목코드': code, '종목명': stock_name, '주문종류': '매수' if not is_pyramiding else '불타기', '주문가격': f"{curr_price:,.2f}", '주문수량': buy_qty, '체결수량': buy_qty, '주문시간': now, '상태': '체결완료', '수익률': '0.00%'})
-            #             now_time = datetime.now().strftime('%H:%M:%S')
-            #             account_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '보유수량': new_total_qty if is_pyramiding else buy_qty, '평균매입가': f"{new_avg_price if is_pyramiding else curr_price:,.2f}", '현재가': f"{curr_price:,.2f}", '평가손익금': "0", '수익률': "0.00%", '주문가능금액': 0})
-            #             if account_rows: account_rows[0]['주문가능금액'] = f"{my_cash:,}" 
-                        
-            #             acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','주문가능금액']
-            #             temp_df = pd.DataFrame(account_rows)
-            #             for c in acc_cols:
-            #                 if c not in temp_df.columns: temp_df[c] = ""
-            #             self.sig_account_df.emit(temp_df[acc_cols].copy()); self.sig_sync_cs.emit()
-
-        if not self.is_running: return 
-
-        if not hasattr(self.mw, 'accumulated_market'): self.mw.accumulated_market = {}
-        if not hasattr(self.mw, 'accumulated_strategy'): self.mw.accumulated_strategy = {}
-        if not hasattr(self.mw, 'accumulated_account'): self.mw.accumulated_account = {}
-
-        for row in market_rows: self.mw.accumulated_market[row['종목코드']] = row
-        for row in strategy_rows: self.mw.accumulated_strategy[row['종목코드']] = row
+            # -------------------------------------------------------------
+        # 🔥 [위표 완벽 동기화] 보유종목 + 오늘 매도/취소 내역 합치기 (규격 통일)
+        # -------------------------------------------------------------
+        unified_account_rows = []
+        is_first_row = True
         
-        # 🔥 [핵심 완벽 수정] 더 이상 위표 데이터를 파괴하는 편법을 쓰지 않고 DB에서 직접 확실한 매도/취소 데이터를 가져옵니다.
+        # 1. 현재 주머니에 있는 '보유 중' 종목들 (불타기 포함 최신 상태)
+        for code, info in list(self.mw.my_holdings.items()):
+            stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
+            buy_price = info['price']
+            buy_qty = info['qty']
+            
+            # DB에서 실시간 현재가 가져오기
+            realtime_p = db_temp.get_realtime_price(code)
+            curr_p = realtime_p if realtime_p > 0 else buy_price
+            
+            p_amt = (curr_p - buy_price) * buy_qty
+            p_rate = ((curr_p - buy_price) / buy_price) * 100 if buy_price > 0 else 0
+            
+            unified_account_rows.append({
+                '시간': datetime.now().strftime('%H:%M:%S'),
+                '종목코드': code, '종목명': stock_name, '보유수량': str(buy_qty),
+                '평균매입가': f"{buy_price:,.0f}", '현재가': f"{curr_p:,.0f}",
+                '평가손익금': f"{p_amt:,.0f}", '수익률': f"{p_rate:.2f}%",
+                '상태': '보유중', '주문가능금액': f"{my_cash:,.0f}" if is_first_row else ""
+            })
+            is_first_row = False
+
+        # 2. 오늘 매도/취소된 내역 (보유 중인 종목은 제외하고 합침 - 중복 방지)
         try:
             conn = db_temp._get_connection(db_temp.shared_db_path)
             query = """
-                SELECT strftime('%H:%M:%S', time) AS short_time, symbol_name, quantity, price, Status, order_yield, symbol
+                SELECT strftime('%H:%M:%S', time), symbol, symbol_name, quantity, price, Status, order_yield 
                 FROM TradeHistory 
-                WHERE Status IN ('매도완료', '주문취소') 
-                AND time >= date('now', 'localtime')
+                WHERE Status IN ('매도완료', '주문취소') AND time >= date('now', 'localtime')
             """
-            cursor = conn.execute(query)
-            past_rows = cursor.fetchall()
+            past_data = conn.execute(query).fetchall()
             conn.close()
 
             current_holding_codes = list(self.mw.my_holdings.keys())
 
-            for r in past_rows:
-                short_time = r[0]; s_name = r[1]; qty = int(r[2]); buy_price = float(r[3])
-                status = r[4]; s_code = r[6]
-                
-                # 🚀 [% 기호 제거 방어막] DB에 '%'가 섞여 있어도 안전하게 숫자만 빼옵니다!
-                raw_yield = str(r[5]).replace('%', '').replace(',', '').strip() if r[5] else '0.0'
+            for r in past_data:
+                s_code = r[1]
+                # 🚀 [방어막] 이미 다시 사서 보유 중인 종목이면 '매도완료' 줄은 표시 안 함
+                if s_code in current_holding_codes: continue
+
+                status = r[5]
+                raw_yield = str(r[6]).replace('%', '').strip() if r[6] else '0.0'
                 try: fixed_yield = float(raw_yield)
                 except: fixed_yield = 0.0
 
-                if s_code in current_holding_codes: continue
+                unified_account_rows.append({
+                    '시간': r[0], '종목코드': s_code, '종목명': r[2], '보유수량': "0",
+                    '평균매입가': f"{float(r[4]):,.0f}", '현재가': "-",
+                    '평가손익금': f"{(float(r[4])*int(r[3]))*(fixed_yield/100):,.0f}" if status=='매도완료' else "0",
+                    '수익률': f"{fixed_yield:.2f}%", '상태': status, '주문가능금액': ""
+                })
+        except: pass
 
-                if status == '매도완료':
-                    eval_profit = (buy_price * qty) * (fixed_yield / 100.0) 
-                    # 🔥 [수정] '주문가능금액' 컬럼에 명시적으로 빈칸("")을 넣어 nan을 방지합니다.
-                    account_rows.append({'시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", '평균매입가': f"{buy_price:,.0f}", '현재가': f"{buy_price:,.0f}", '평가손익금': f"{eval_profit:,.0f}", '수익률': f"{fixed_yield:.2f}%", '상태': "매도완료", '주문가능금액': ""})
-                elif status == '주문취소':
-                    account_rows.append({'시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", '평균매입가': f"{buy_price:,.0f}", '현재가': f"{buy_price:,.0f}", '평가손익금': "0", '수익률': "0.00%", '상태': "주문취소", '주문가능금액': ""})
-        except Exception as e: pass
+        # 3. 데이터프레임 변환 및 nan 청소 후 UI로 쏘기
+        acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','상태','주문가능금액']
+        if unified_account_rows:
+            df_acc = pd.DataFrame(unified_account_rows)
+            df_acc.fillna("", inplace=True) # 🔥 nan 글자 완전 삭제
+            for c in acc_cols:
+                if c not in df_acc.columns: df_acc[c] = ""
+            self.sig_account_df.emit(df_acc[acc_cols].copy())
 
         market_rows = list(self.mw.accumulated_market.values())
         strategy_rows = list(self.mw.accumulated_strategy.values())
@@ -1262,6 +1222,14 @@ class FormMain(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(100, self.ticker_window.snap_to_main)
 
         self.strategy_engine = JubbyStrategy(log_callback=self.add_log)
+
+        # 🔒 [핵심] 매수/매도 엔진이 동시에 계좌 주머니를 만지지 못하게 하는 자물쇠
+        import threading
+        self.holdings_lock = threading.Lock()
+        
+        # 🚜 새로운 일꾼들 변수 준비
+        self.buy_worker = None
+        self.sell_worker = None
         
         # -------------------------------------------------------------
         # 📖 [여기서부터 찾으세요!] DB에서 종목 명단 불러오는 구간
@@ -1303,6 +1271,11 @@ class FormMain(QtWidgets.QMainWindow):
         # =========================================================
 
         self.my_holdings = {}; self.last_known_cash = 0 
+
+        # 🚀 [추가] 표 데이터 유실 및 깜빡임 방지를 위한 누적 기록용 수첩 (이게 없어서 에러가 발생함)
+        self.accumulated_market = {}   # 시장 시세 데이터 기록용
+        self.accumulated_strategy = {} # AI 전략 데이터 기록용
+        self.accumulated_account = {}  # 잔고/매도 내역 기록용
         
         # 🚀 [추가] 1분에 1번만 통신하기 위한 하이브리드 캐시 메모리
         self.df_cache = {}          
@@ -1537,58 +1510,91 @@ class FormMain(QtWidgets.QMainWindow):
 
     def load_real_holdings(self):
         try:
+            # 1. KIS API에서 현재 보유 잔고 긁어오기
             self.my_holdings = self.api_manager.get_real_holdings()
             if self.my_holdings:
-                holdings_str = ", ".join([f"{self.DYNAMIC_STOCK_DICT.get(code, code)}({info['qty']}주)" for code, info in self.my_holdings.items()])
                 self.add_log(f"💼 [보유 종목 로드] {len(self.my_holdings)}개 확인", "success")
-            else: self.add_log("💼 [보유 종목] 현재 보유 종목 없음", "info")
-        except Exception as e: self.add_log(f"🚨 잔고 로드 에러: {e}", "error"); return
+            else: 
+                self.add_log("💼 [보유 종목] 현재 보유 종목 없음", "info")
+        except Exception as e: 
+            self.add_log(f"🚨 잔고 로드 에러: {e}", "error")
+            return
             
-        # 🚀 [방어막 1] 서버 오류로 잔고가 None이나 0이 오면 기존 잔고를 지켜냅니다!
+        # 2. 예수금 확인 (서버 무응답 대비 방어막)
         api_cash = self.api_manager.get_balance()
         if api_cash is None or float(api_cash) <= 0:
             my_cash_float = getattr(self, 'last_known_cash', 0.0)
         else:
             my_cash_float = float(api_cash)
-            self.last_known_cash = my_cash_float # 정상일 때만 업데이트
+            self.last_known_cash = my_cash_float 
             
-        cash_str = f"{my_cash_float:,.0f}"
+        account_rows = []
+        is_first = True
+        total_invested = 0
+        total_current_val = 0
+        stock_details_str = ""
         
-        account_rows = []; is_first = True; total_invested = 0; total_current_val = 0; stock_details_str = ""
+        # 🚀 [수정] 위표 컬럼 순서 고정 (10개 컬럼 세팅)
+        # 시간, 종목코드, 종목명, 보유수량, 평균매입가, 현재가, 평가손익금, 수익률, 상태, 주문가능금액
         
+        # 3. 실시간 보유 종목 리스트 생성
         for code, info in list(self.my_holdings.items()):
-            # ✅ 여기를 0.2으로 수정하세요! (기존 0.2 또는 0.25)
             time.sleep(0.2)
             
-            # 🚀 [추가된 방어막 1] 0.2초 쉬는 동안 탐정이나 자동매매 일꾼이 팔아서 지워버렸으면 즉시 건너뜁니다!
+            # 다른 스레드에서 팔렸을 경우 대비
             if code not in self.my_holdings: 
                 continue
                 
-            buy_price = info['price']; buy_qty = info['qty']; stock_name = self.DYNAMIC_STOCK_DICT.get(code, f"알수없음_{code}")
-            self.my_holdings[code]['high_watermark'] = buy_price
-
-            df = self.api_manager.fetch_minute_data(code); pnl_str = "0.00%"; curr_price = buy_price
+            buy_price = info['price']
+            buy_qty = info['qty']
+            stock_name = self.DYNAMIC_STOCK_DICT.get(code, f"알수없음_{code}")
             
-            # 🚀 [추가된 방어막 2] 한투 서버랑 통신(fetch)하느라 시간 걸리는 동안 또 팔려서 지워졌으면 안전하게 건너뜁니다!
-            if code not in self.my_holdings: 
-                continue
+            # 고점 관리 데이터 초기화
+            if 'high_watermark' not in self.my_holdings[code]:
+                self.my_holdings[code]['high_watermark'] = buy_price
 
-            if df is not None:
-                curr_price = df.iloc[-1]['close']; profit_rate = ((curr_price - buy_price) / buy_price) * 100; pnl_str = f"{profit_rate:.2f}%"
-                self.my_holdings[code]['high_watermark'] = max(buy_price, curr_price); self.my_holdings[code]['buy_time'] = datetime.now(); self.my_holdings[code]['half_sold'] = False
-                stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.2f} -> {curr_price:,.2f} ({profit_rate:+.2f}%)\n"
-            else: stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.2f} -> 통신지연\n"
+            # 현재가 가져오기
+            df = self.api_manager.fetch_minute_data(code)
+            pnl_str = "0.00%"
+            curr_price = buy_price
+            
+            if code not in self.my_holdings: continue
+
+            if df is not None and not df.empty:
+                curr_price = df.iloc[-1]['close']
+                profit_rate = ((curr_price - buy_price) / buy_price) * 100
+                pnl_str = f"{profit_rate:.2f}%"
                 
-            total_invested += (buy_price * buy_qty); total_current_val += (curr_price * buy_qty)
+                # 데이터 갱신
+                self.my_holdings[code]['high_watermark'] = max(self.my_holdings[code].get('high_watermark', buy_price), curr_price)
+                self.my_holdings[code]['buy_time'] = datetime.now()
+                
+                stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.0f} -> {curr_price:,.0f} ({profit_rate:+.2f}%)\n"
+            else: 
+                stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.0f} -> 통신지연\n"
+                
+            total_invested += (buy_price * buy_qty)
+            total_current_val += (curr_price * buy_qty)
             now_time = datetime.now().strftime('%H:%M:%S')
-            account_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '보유수량': buy_qty, '평균매입가': f"{buy_price:,.0f}", '현재가': f"{curr_price:,.0f}", '평가손익금': pnl_str, '수익률': pnl_str, '상태': "보유중" })
+            
+            # 보유 종목 행 추가 (딕셔너리 키 이름을 아래 DB 합치기 쪽과 100% 통일해야 함)
+            account_rows.append({
+                '시간': now_time, 
+                '종목코드': code, 
+                '종목명': stock_name, 
+                '보유수량': str(buy_qty), 
+                '평균매입가': f"{buy_price:,.0f}", 
+                '현재가': f"{curr_price:,.0f}", 
+                '평가손익금': f"{(curr_price - buy_price) * buy_qty:,.0f}", 
+                '수익률': pnl_str, 
+                '상태': "보유중",
+                '주문가능금액': f"{my_cash_float:,.0f}" if is_first else ""
+            })
             is_first = False
 
-        # -------------------------------------------------------------
-        # 🔥 [수정 3] 새로고침 시 증발 방지! 로컬 DB에서 '매도완료', '주문취소' 내역을 긁어와 정확한 형식으로 합칩니다.
+        # 4. 🔥 오늘 매도완료/주문취소 내역 합치기 (위표 누적)
         try:
             conn = self.db._get_connection(self.db.shared_db_path)
-            # 시간은 시:분:초만 자르고, 필요한 정보를 모두 불러옵니다.
             query = """
                 SELECT strftime('%H:%M:%S', time) AS short_time, symbol_name, quantity, price, Status, order_yield, symbol
                 FROM TradeHistory 
@@ -1609,84 +1615,95 @@ class FormMain(QtWidgets.QMainWindow):
                 status = r[4]
                 s_code = r[6]       
                 
-                # 🚀 [% 기호 제거 방어막] 여기서 누락되었던 방어막을 추가합니다!
+                # [% 기호 제거 방어막]
                 raw_yield = str(r[5]).replace('%', '').replace(',', '').strip() if r[5] else '0.0'
                 try: fixed_yield = float(raw_yield)
                 except: fixed_yield = 0.0
 
                 if s_code in current_holding_codes:
-                    continue # 현재 보유중이면 위표에 중복 표시 안 함
+                    continue # 이미 다시 사서 보유 중인 종목이면 매도완료 행은 건너뜀 (중복 방지)
 
                 if status == '매도완료':
                     eval_profit = (buy_price * qty) * (fixed_yield / 100.0) 
-                    # 🔥 [수정] '주문가능금액' 컬럼에 명시적으로 빈칸("")을 넣어 nan을 방지합니다.
-                    account_rows.append({'시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", '평균매입가': f"{buy_price:,.0f}", '현재가': f"{buy_price:,.0f}", '평가손익금': f"{eval_profit:,.0f}", '수익률': f"{fixed_yield:.2f}%", '상태': "매도완료", '주문가능금액': ""})
+                    account_rows.append({
+                        '시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", 
+                        '평균매입가': f"{buy_price:,.0f}", '현재가': "-", # 매도된 건 현재가 의미 없음
+                        '평가손익금': f"{eval_profit:,.0f}", '수익률': f"{fixed_yield:.2f}%", 
+                        '상태': "매도완료", '주문가능금액': ""
+                    })
                 elif status == '주문취소':
-                    account_rows.append({'시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", '평균매입가': f"{buy_price:,.0f}", '현재가': f"{buy_price:,.0f}", '평가손익금': "0", '수익률': "0.00%", '상태': "주문취소", '주문가능금액': ""})
+                    account_rows.append({
+                        '시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", 
+                        '평균매입가': f"{buy_price:,.0f}", '현재가': "-", 
+                        '평가손익금': "0", '수익률': "0.00%", 
+                        '상태': "주문취소", '주문가능금액': ""
+                    })
         except Exception as e:
             print(f"과거 내역 위표 합치기 실패: {e}")
-        # -------------------------------------------------------------
 
-        total_unrealized_profit = total_current_val - total_invested; total_asset = my_cash_float + total_current_val
+        # 5. 자산 브리핑 로그 출력
+        total_unrealized_profit = total_current_val - total_invested
+        total_asset = my_cash_float + total_current_val
 
         try: realized_profit = float(self.db.get_shared_setting("ACCOUNT", "CUMULATIVE_REALIZED_PROFIT", "0.0"))
         except: realized_profit = 0.0
             
         briefing_msg = f"📊 [수동 잔고조회]\n    💎 자산: {int(total_asset):,}원 | 누적손익: {int(realized_profit):+,}원 | 보유손익: {int(total_unrealized_profit):+,}원"
         if len(self.my_holdings) > 0: briefing_msg += f"\n\n{stock_details_str.rstrip()}"
-            
         self.add_log(briefing_msg, "send")
             
+        # 6. 위표 UI 업데이트 (DataFrame 생성 및 nan 제거)
         if account_rows: 
             df_acc = pd.DataFrame(account_rows)
-            acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금', '수익률','상태']
-            for c in acc_cols:
-                if c not in df_acc.columns: df_acc[c] = ""
+            # 🔥 [중요] 모든 빈 칸을 ""으로 채워서 nan 발생을 원천 차단합니다.
+            df_acc.fillna("", inplace=True)
+            
+            # 컬럼 순서 고정
+            acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금', '수익률','상태','주문가능금액']
+            
+            # 없는 컬럼 방어
+            for col in acc_cols:
+                if col not in df_acc.columns:
+                    df_acc[col] = ""
+            
             TradeData.account.df = df_acc[acc_cols]
+            # 0.5초 뒤 안전하게 표 갱신
             QtCore.QTimer.singleShot(500, lambda: self.update_table(self.tbAccount, TradeData.account.df))
 
-        # =====================================================================
-        # 🚀 [추가] 스마트폰/HTS 예약매도, 예약매수(미체결) 완벽 동기화!
-        # =====================================================================
+        # 7. 예약 주문(미체결) 동기화 (이미 작성하신 코드 유지)
         try:
-            # 1. KIS 서버에서 미체결(예약) 리스트를 싹 다 긁어옵니다.
-            # 🔥 [경로 에러 수정] 총괄 매니저가 아니라, 통신 전담반(api)에게 직접 지시하도록 '.api'를 추가했습니다!
             if hasattr(self.api_manager, 'api') and hasattr(self.api_manager.api, 'get_unfilled_orders'):
                 unfilled_orders = self.api_manager.api.get_unfilled_orders()
             else:
                 unfilled_orders = self.api_manager.get_unfilled_orders()
             
-            # 2. 중복 등록을 막기 위해 현재 UI 표에 있는 주문번호를 검사합니다.
             existing_ord_nos = []
             for row in range(self.tbOrder.rowCount()):
-                item = self.tbOrder.item(row, 0) # 0번 컬럼 = 주문번호
+                item = self.tbOrder.item(row, 0)
                 if item: existing_ord_nos.append(item.text())
 
             sync_count = 0
             for order in unfilled_orders:
                 ord_no = order['주문번호']
-                if ord_no in existing_ord_nos: continue # 이미 UI에 띄워진 내역이면 패스
+                if ord_no in existing_ord_nos: continue 
                 
-                # 시간 포맷 예쁘게 깎기 (143000 -> 14:30:00)
                 raw_t = order['주문시간']
                 time_str = f"{raw_t[:2]}:{raw_t[2:4]}:{raw_t[4:]}" if len(raw_t) == 6 else raw_t
                 
-                # 표와 DB에 집어넣기 위한 주머니(딕셔너리) 세팅
                 order_info = {
                     '주문번호': ord_no,
                     '종목코드': order['종목코드'],
                     '종목명': order['종목명'],
-                    '주문종류': f"예약{order['주문종류']}", # 예약매수, 예약매도
+                    '주문종류': f"예약{order['주문종류']}", 
                     '주문가격': f"{order['주문가격']:,.0f}",
                     '주문수량': order['주문수량'],
-                    '체결수량': order['주문수량'] - order['미체결수량'], # 일부만 체결된 수량 반영
+                    '체결수량': order['주문수량'] - order['미체결수량'],
                     '주문시간': time_str,
                     '상태': '미체결',
                     '수익률': '0.00%',
-                    'is_restore': True  # 🚀 [추가] 이건 불러온 과거 데이터니까 DB에 또 넣지 말라고 이름표를 붙여줍니다!
+                    'is_restore': True  
                 }
                 
-                # 표에 띄우고 DB에 저장! (이제부터 주삐 탐정이 이 주문도 감시합니다)
                 if hasattr(self, 'trade_worker') and self.trade_worker is not None: 
                     self.trade_worker.sig_order_append.emit(order_info)
                 else:
