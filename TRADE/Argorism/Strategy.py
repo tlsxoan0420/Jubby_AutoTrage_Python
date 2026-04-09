@@ -322,10 +322,13 @@ class JubbyStrategy:
         
         if atr > avg_buy_price * 0.01:
             target_price = avg_buy_price + (atr * atr_target_multi)
-            stop_price = avg_buy_price - (atr * atr_stop_multi)
+            dynamic_stop = avg_buy_price - (atr * atr_stop_multi)
+            
+            # 🔥 [수정] ATR 변동성이 아무리 커도, 절대 사용자가 설정한 '기본 손절선' 밑으로 내려가지 못하게 강제 고정!
+            max_loss_price = avg_buy_price * (1.0 - stop_rate) 
+            stop_price = max(dynamic_stop, max_loss_price) # 둘 중 더 높은 가격(덜 잃는 가격)을 선택
             
         return target_price, stop_price
-
     # =====================================================================
     # 🚀 [최종 통합본] 실전 매수/매도 타점 판독 (AI 3중 필터 + 매도 비상 탈출)
     # =====================================================================

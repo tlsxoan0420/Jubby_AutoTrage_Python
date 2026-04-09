@@ -287,18 +287,30 @@ class KIS_API:
             }
             headers = {"Content-Type": "application/json; charset=utf-8", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
             try:
-
                 # 🔥 [렉 방지 마법] timeout=5.0을 추가해서 한투 서버가 느려도 5초 뒤엔 쿨하게 넘어가도록 설정!
                 res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=5.0)
-                data = res.json()
+                
+                # 🚀 [핵심 방어막] 한투 서버가 렉에 걸려 아무런 대답도 안 줬을 때(빈 화면) 파싱 에러를 막습니다!
+                if not res.text.strip():
+                    self._log_msg(f"⚠️ 주문취소 지연: 한투 서버 무응답. 다음 턴에 재시도합니다.", "warning")
+                    return False
+
+                # 빈 응답이 아닐 때만 안전하게 JSON 변환 시도
+                try:
+                    data = res.json()
+                except json.JSONDecodeError:
+                    self._log_msg(f"⚠️ 주문취소 지연: 한투 서버 데이터 깨짐. 다음 턴에 재시도합니다.", "warning")
+                    return False
+
                 if data.get('rt_cd') == '0':
                     self._log_msg(f"✅ 주문취소 성공 [원주문번호:{order_no}]", "success")
                     return True
-
                 else:
                     self._log_msg(f"⚠️ 주문취소 실패: {data.get('msg1')}", "warning")
+
             except Exception as e:
                 self._log_msg(f"🚨 주문취소 통신 에러: {e}", "error")
+                
         return False
 
 # =====================================================================

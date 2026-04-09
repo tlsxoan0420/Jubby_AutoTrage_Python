@@ -50,6 +50,9 @@ class RealWebSocketWorker(QThread):
         ws_url = "ws://ops.koreainvestment.com:31000" if self.is_mock else "ws://ops.koreainvestment.com:21000"
         self.sig_execution_msg.emit(f"📡 한투 서버 접속 중... ({'모의' if self.is_mock else '실전'})", "info")
 
+        # 🔥 [핵심 추가] 웹소켓이 살아있는 동안 평생 재사용할 전용 DB 고속도로 개통!
+        self.ws_conn = self.db._get_connection(self.db.shared_db_path)
+
         # 실시간 데이터 수신 시 처리부
         def on_message(ws, message):
             if message in ["0", "1"]: return # 하트비트 무시
@@ -89,10 +92,8 @@ class RealWebSocketWorker(QThread):
                                 symbol = content[0] 
                                 curr_price = float(content[2])
                                 
-                                # DB에 현재가를 직접 업데이트 (AutoTradeWorker가 이 값을 보고 수익률 계산함)
-                                conn = self.db._get_connection(self.db.shared_db_path)
-                                conn.execute("UPDATE MarketStatus SET last_price = ? WHERE symbol = ?", (curr_price, symbol))
-                                conn.close() # 🔥 오토커밋 모드이므로 무조건 commit() 삭제!
+                                # 🔥 [수정] 매번 DB를 열지 않고, 뚫어둔 고속도로(ws_conn)를 재사용합니다.
+                                self.ws_conn.execute("UPDATE MarketStatus SET last_price = ? WHERE symbol = ?", (curr_price, symbol))
                             except: pass
 
                     # ---------------------------------------------------------
@@ -106,10 +107,9 @@ class RealWebSocketWorker(QThread):
                                 total_ask_size = float(content[43])
                                 total_bid_size = float(content[73])
                                 
-                                conn = self.db._get_connection(self.db.shared_db_path)
-                                conn.execute("UPDATE MarketStatus SET ask_size = ?, bid_size = ? WHERE symbol = ?", 
+                                # 🔥 [수정] 동일하게 재사용합니다.
+                                self.ws_conn.execute("UPDATE MarketStatus SET ask_size = ?, bid_size = ? WHERE symbol = ?", 
                                             (total_ask_size, total_bid_size, symbol))
-                                conn.close() # 🔥 여기도 commit() 무조건 삭제!
                             except: pass
             else:
                 # 시스템 메시지 처리 (JSON)
@@ -129,10 +129,12 @@ class RealWebSocketWorker(QThread):
                        "body": {"input": {"tr_id": tr_id, "tr_key": self.hts_id}}}
             ws.send(json.dumps(sub_msg))
             
-            # 2. 기존 감시 종목들도 즉시 실시간 추적 시작
-            if self.main_ui and hasattr(self.main_ui, 'DYNAMIC_STOCK_DICT'):
-                for code in self.main_ui.DYNAMIC_STOCK_DICT.keys():
-                    self.subscribe_stock_realtime(code)
+            # 🚀 [완벽 수정] 전체 명단(2500개)이 아니라, '현재 내 계좌에 있는 종목'만 조용히 구독합니다!
+            if self.main_ui and hasattr(self.main_ui, 'my_holdings'):
+                for code in list(self.main_ui.my_holdings.keys()):
+                    if code not in self.tracked_symbols:
+                        self.subscribe_stock_realtime(code)
+                        self.tracked_symbols.add(code)
 
         # 웹소켓 앱 구동
         self.ws = websocket.WebSocketApp(
@@ -149,6 +151,10 @@ class RealWebSocketWorker(QThread):
     def stop(self):
         self.is_running = False
         if self.ws: self.ws.close()
+        # 🔥 [핵심 추가] 스레드가 종료될 때 DB 고속도로도 깔끔하게 닫아줍니다.
+        if hasattr(self, 'ws_conn') and self.ws_conn:
+            try: self.ws_conn.close()
+            except: pass
         self.quit(); self.wait()
 
     def subscribe_stock_realtime(self, code):
@@ -214,6 +220,14 @@ class FormTicker(QtWidgets.QWidget):
         item.setForeground(QtGui.QColor(colors.get(msg_type, "#A0A0A0")))
         self.lst_ticker.addItem(item); self.lst_ticker.scrollToBottom()
 
+        # 🔥 [새로 추가] 화면에 띄움과 동시에 TickerLogs 테이블에도 저장합니다!
+        try:
+            # self.db가 FormMain에 선언되어 있으므로 이를 사용합니다.
+            self.db.insert_ticker_log(msg_type.upper(), msg)
+        except Exception as e:
+            # DB 저장에 실패하더라도 화면 표시는 문제없이 넘어가도록 예외 처리
+            print(f"Ticker DB 저장 실패: {e}")
+
     def update_main_ui_order(self, exec_data):
         """ [최종 완성본] 무한 렉 및 DB 충돌 완벽 해결 버전 """
         if not self.main_ui: return
@@ -264,29 +278,18 @@ class FormTicker(QtWidgets.QWidget):
             ono_item = table.item(row, ono_col)
             if ono_item and ono_item.text() == target_ono:
                 status_item = table.item(row, stat_col)
-                
-                # 중복 방지: 이미 처리된 행이면 무시
                 if status_item and status_item.text() == db_status: break 
 
                 if status_item and status_item.text() in ["미체결", "부분체결"]:
-                    status_item.setText(db_status)
-                    # 상태에 따른 색깔 지정
-                    if db_status == "주문취소": status_item.setForeground(QtGui.QColor("gray"))
-                    elif db_status == "부분체결": status_item.setForeground(QtGui.QColor("orange"))
-                    else: status_item.setForeground(QtGui.QColor("lime"))
-                    
-                    table.item(row, qty_col).setText(str(filled_qty))
-                    table.item(row, price_col).setText(f"{real_price:,.0f}")
-                    
-                    # 🔥 [여기에 2줄 추가!] DB는 바꿨으니, 이제 메인 화면한테 "빨리 표 다시 그려!" 라고 명령합니다.
+                    # 🚀 [완벽 수정 2] 일꾼이 UI를 직접 만지면 프로그램이 팅깁니다! 강제 조작 코드 삭제!
+                    # DB에 값은 이미 써뒀으니, 메인 UI한테 "안전하게 표 다시 그려!"라고 지시만 내리고 빠집니다.
                     if self.main_ui:
                         QtCore.QMetaObject.invokeMethod(self.main_ui, "refresh_order_table", QtCore.Qt.QueuedConnection)
                     
-                    # (기존 코드)
                     order_type = table.item(row, headers.index('주문종류')).text()
                     stock_name = table.item(row, headers.index('종목명')).text()
                     
-                    # 로그 출력
+                    # (아래 로그 출력과 구독 코드는 기존과 완벽히 동일하게 유지)
                     if is_cancel:
                         self.add_ticker_log(f"🗑️ [취소완료] {stock_name} | 30초 경과 주문 정리됨", "warning")
                     else:
@@ -294,12 +297,10 @@ class FormTicker(QtWidgets.QWidget):
                         log_icon = "🔵" if "매수" in order_type or "불타기" in order_type else "🔴"
                         self.add_ticker_log(f"{prefix} {log_icon} {stock_name} | {db_status} | {real_price:,.0f}원 | {filled_qty}주", "success")
                     
-                    # 🌟 4. [렉 방지 핵심] 시세 추적 무한 반복 방어막 실행!
                     if db_status == "체결완료" and not is_cancel:
-                        # 1단계에서 만든 바구니(tracked_symbols)에 종목이 없을 때만 딱 1번 실행!
-                        if target_symbol not in self.tracked_symbols:
+                        if target_symbol not in self.ws_worker.tracked_symbols:
                             self.ws_worker.subscribe_stock_realtime(target_symbol)
-                            self.tracked_symbols.add(target_symbol) # 바구니에 추가
+                            self.ws_worker.tracked_symbols.add(target_symbol)
                     break
                 
     def snap_to_main(self):

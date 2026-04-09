@@ -114,6 +114,15 @@ class JubbyDB_Manager:
                     except Exception as e:
                         pass # 이미 있거나 충돌나면 무시하고 다음으로 넘어감
 
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS TickerLogs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    level TEXT,
+                    message TEXT
+                )
+            """)
+
             # =================================================================
             # 🚀 [MarketStatus 컬럼 보정]
             # =================================================================
@@ -337,3 +346,16 @@ class JubbyDB_Manager:
                         ("RISK", "IS_LOCKED", val))
         finally:
             conn.close()
+    
+    def insert_ticker_log(self, level, message):
+        """ Ticker 전용 로그를 DB에 저장하는 함수 """
+        try:
+            # 💡 get_shared_db_path를 사용하여 공유 DB에 저장
+            conn = self._get_connection(self.shared_db_path)
+            # 한국 시간으로 저장하기 위해 datetime 사용
+            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute("INSERT INTO TickerLogs (time, level, message) VALUES (?, ?, ?)", 
+                        (now, level, message))
+            conn.close()
+        except Exception as e:
+            print(f"❌ Ticker 로그 저장 실패: {e}")

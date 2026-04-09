@@ -190,7 +190,10 @@ class DetectiveWorker(QThread):
             conn = self.mw.db._get_connection(self.mw.db.shared_db_path)
             cursor = conn.execute("SELECT order_no, symbol, type, quantity, price, time FROM TradeHistory WHERE Status = '미체결'")
             unfilled_orders = cursor.fetchall()
-        except: return
+        except Exception as e: 
+            # 🔥 [수정] DB 조회 실패 시 원인을 파악할 수 있도록 반드시 로그를 남깁니다.
+            self.sig_log.emit(f"⚠️ [탐정단] 미체결 조회 중 DB 접근 실패 (사유: {e})", "warning")
+            return
         finally:
             if 'conn' in locals() and conn: conn.close()
 
@@ -223,12 +226,23 @@ class DetectiveWorker(QThread):
                     except: pass
                     finally:
                         if up_conn: up_conn.close()
+
+                    # -------------------------------------------------------------
+                    # 🔥 [수정 1] 유령 업데이트 방지 및 위표(잔고표)에 '주문취소' 상태 영구 보존!
+                    if symbol in self.mw.my_holdings:
+                        del self.mw.my_holdings[symbol] # 주머니에서 삭제해서 계산 멈춤
+                        
+                    if hasattr(self.mw, 'accumulated_account') and symbol in self.mw.accumulated_account:
+                        self.mw.accumulated_account[symbol]['보유수량'] = "0 (주문취소)"
+                        self.mw.accumulated_account[symbol]['평가손익금'] = "0"
+                        self.mw.accumulated_account[symbol]['수익률'] = "0.00%"
+                    # -------------------------------------------------------------
                     
                     exec_data = {"주문번호": str(order_no), "종목코드": symbol, "체결수량": 0, "체결가": 0, "is_cancel": True}
                     if hasattr(self.mw, 'ticker_window'):
                         self.mw.ticker_window.ws_worker.sig_real_execution.emit(exec_data)
                     
-                    continue 
+                    continue
             except Exception: pass
 
             # 🕵️‍♂️ (기존) 탐정 동기화 로직
@@ -374,8 +388,20 @@ class AutoTradeWorker(QThread):
             if prob == -1.0 or df_feat is None or df_feat.empty: return None
             if self.mw.strategy_engine.check_trade_signal(df_feat, code) != "BUY": return None
             
-            # 🔥 재시도할 때도 무조건 시장가로 돌진!
-            res_odno = self.mw.api_manager.buy_market_price(code, qty)
+            # 🔥 [버그 수정] 새로운 가격(new_price)에 맞춰 내가 살 수 있는 수량(qty)을 재계산합니다!
+            budget = new_price * qty # 원래 사려고 했던 총 예산
+            new_qty = int(budget // new_price)
+            
+            my_cash = getattr(self.mw, 'last_known_cash', 0)
+            if new_qty * new_price > my_cash: 
+                new_qty = int(my_cash // new_price)
+                
+            if new_qty <= 0:
+                self.sig_log.emit(f"🚨 [{stock_name}] 갭상승으로 인해 잔고가 부족하여 진입을 포기합니다.", "error")
+                return None
+
+            # 재계산된 수량(new_qty)으로 재주문!
+            res_odno = self.mw.api_manager.buy_market_price(code, new_qty)
             if res_odno: return res_odno
             
             time.sleep(retry_delay)
@@ -474,6 +500,12 @@ class AutoTradeWorker(QThread):
         try: global_api_delay = float(db_temp.get_shared_setting("API", "GLOBAL_API_DELAY", "0.06"))
         except: global_api_delay = 0.06
 
+        # 🚀 [사이클 매수 제한] DB에서 1사이클 최대 매수 횟수 로드 (기본값 6)
+        try: max_buys_per_cycle = int(db_temp.get_shared_setting("TRADE", "MAX_BUYS_PER_CYCLE", "6"))
+        except: max_buys_per_cycle = 6
+        
+        current_cycle_buys = 0  # 🌟 이번 1분 사이클 동안 매수한 횟수를 기록하는 카운터!
+
         api_cash = self.mw.api_manager.get_balance()
         my_cash = api_cash if api_cash is not None else getattr(self.mw, 'last_known_cash', 0)
         self.mw.last_known_cash = my_cash; cash_str = f"{my_cash:,}" 
@@ -494,8 +526,17 @@ class AutoTradeWorker(QThread):
         
         if not self.is_running: return 
         
-        time.sleep(global_api_delay) # 교통정리
-        market_etf = self.mw.api_manager.fetch_minute_data(market_ticker)
+        # 🚀 [완벽 수정 1] ETF도 개별 종목처럼 1분에 딱 1번만 API를 호출하도록 캐시 방어막 추가!
+        current_minute = datetime.now().strftime("%H:%M")
+        if self.mw.last_fetch_time.get(market_ticker) != current_minute:
+            time.sleep(global_api_delay) # 교통정리
+            market_etf = self.mw.api_manager.fetch_minute_data(market_ticker)
+            if market_etf is not None and len(market_etf) > 1:
+                self.mw.df_cache[market_ticker] = market_etf
+                self.mw.last_fetch_time[market_ticker] = current_minute
+        else:
+            market_etf = self.mw.df_cache.get(market_ticker)
+
         if market_etf is not None and len(market_etf) > 1:
             etf_now = market_etf.iloc[-1]['close']; etf_prev = market_etf.iloc[-2]['close']
             self.mw.strategy_engine.market_return_1m = ((etf_now - etf_prev) / etf_prev) * 100.0
@@ -699,9 +740,9 @@ class AutoTradeWorker(QThread):
                     if code not in self.mw.my_holdings: continue 
                     cur_qty = self.mw.my_holdings[code]['qty'] if is_sell_half else buy_qty
                     
-                    # 🚀 [버그 수정 1] 잔고 표(Account)에도 '시간' 데이터 추가!
-                    account_rows.append({'시간': now_time_str, '종목코드': code, '종목명': stock_name, '보유수량': cur_qty, '평균매입가': f"{buy_price:,.2f}", '현재가': f"{curr_price:,.2f}", '평가손익금': f"{profit_amt:,.0f}", '수익률': f"{profit_rate:.2f}%", '주문가능금액': 0})
-                    
+                    # 🚀 [양식 통일] '상태' 컬럼 적용 및 가격 소수점 제거
+                    account_rows.append({'시간': now_time_str, '종목코드': code, '종목명': stock_name, '보유수량': cur_qty, '평균매입가': f"{buy_price:,.0f}", '현재가': f"{curr_price:,.0f}", '평가손익금': f"{profit_amt:,.0f}", '수익률': f"{profit_rate:.2f}%", '상태': '보유중'})
+
                     stock_details_str += f"  🔸 {stock_name}: 매입 {buy_price:,.2f} -> 현재 {curr_price:,.2f} ({profit_rate:+.2f}%)\n"
 
                 ma5_val = float(df.iloc[-1].get('MA5', curr_price)); ma20_val = float(df.iloc[-1].get('MA20', curr_price)); rsi_val = float(df.iloc[-1].get('RSI', 50.0))
@@ -1007,16 +1048,28 @@ class AutoTradeWorker(QThread):
                                     '수익률': '0.00%' 
                                 })
                                 
-                                account_rows.append({'시간': now_time_str, '종목코드': code, '종목명': stock_name, '보유수량': new_total_qty if is_pyramiding else buy_qty, '평균매입가': f"{new_avg_price if is_pyramiding else curr_price:,.2f}", '현재가': f"{curr_price:,.2f}", '평가손익금': "0", '수익률': "0.00%", '주문가능금액': 0})
-                                if account_rows: account_rows[0]['주문가능금액'] = f"{my_cash:,}" 
+                                account_rows.append({'시간': now_time_str, '종목코드': code, '종목명': stock_name, '보유수량': new_total_qty 
+                                                     if is_pyramiding else buy_qty, '평균매입가': f"{new_avg_price if is_pyramiding else curr_price:,.0f}",
+                                                       '현재가': f"{curr_price:,.0f}", '평가손익금': "0", '수익률': "0.00%", '상태': '보유중'})
                                 
-                                acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','주문가능금액']
+                                acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','상태']
                                 temp_df = pd.DataFrame(account_rows)
                                 for c in acc_cols:
                                     if c not in temp_df.columns: temp_df[c] = ""
                                 self.sig_account_df.emit(temp_df[acc_cols].copy()); self.sig_sync_cs.emit()
                                 
                                 needed_count -= 1
+
+                                # 🚀 [매수 카운트 1 증가]
+                                current_cycle_buys += 1 
+                                
+                                # 🔥 뇌동 폭풍 매수 방지! 한 번 샀으면 흥분을 가라앉히고 0.2초간 무조건 멈춥니다.
+                                time.sleep(0.2)
+                                
+                                # 🌟 [핵심 방어막] 사이클 내 최대 매수 허용치에 도달하면 즉시 신규 매수 탐색을 중단!
+                                if current_cycle_buys >= max_buys_per_cycle:
+                                    self.sig_log.emit(f"🛡️ [안전 장치] 1사이클 최대 매수 한도({max_buys_per_cycle}회) 도달. 이번 턴 신규 진입을 마감합니다.", "warning")
+                                    break # 반복문을 빠져나가므로 더 이상 매수하지 않음!
                                 
                                 if needed_count <= 0:
                                     break
@@ -1108,31 +1161,56 @@ class AutoTradeWorker(QThread):
 
         for row in market_rows: self.mw.accumulated_market[row['종목코드']] = row
         for row in strategy_rows: self.mw.accumulated_strategy[row['종목코드']] = row
-        for row in account_rows: self.mw.accumulated_account[row['종목코드']] = row
+        
+        # 🔥 [핵심 완벽 수정] 더 이상 위표 데이터를 파괴하는 편법을 쓰지 않고 DB에서 직접 확실한 매도/취소 데이터를 가져옵니다.
+        try:
+            conn = db_temp._get_connection(db_temp.shared_db_path)
+            query = """
+                SELECT strftime('%H:%M:%S', time) AS short_time, symbol_name, quantity, price, Status, order_yield, symbol
+                FROM TradeHistory 
+                WHERE Status IN ('매도완료', '주문취소') 
+                AND time >= date('now', 'localtime')
+            """
+            cursor = conn.execute(query)
+            past_rows = cursor.fetchall()
+            conn.close()
 
-        for code in list(self.mw.accumulated_account.keys()):
-            if code not in self.mw.my_holdings:
-                # 🚀 [요청 반영] 매도 완료된 종목도 마지막으로 확정된 수익률과 손익금을 예쁘게 남겨둡니다!
-                self.mw.accumulated_account[code]['보유수량'] = "0 (매도됨)"
-                # 평가손익금, 현재가, 수익률은 '-' 로 지우지 않고 체결 순간의 기록을 영구 보존합니다.
+            current_holding_codes = list(self.mw.my_holdings.keys())
+
+            for r in past_rows:
+                short_time = r[0]; s_name = r[1]; qty = int(r[2]); buy_price = float(r[3])
+                status = r[4]; s_code = r[6]
+                
+                # 🚀 [% 기호 제거 방어막] DB에 '%'가 섞여 있어도 안전하게 숫자만 빼옵니다!
+                raw_yield = str(r[5]).replace('%', '').replace(',', '').strip() if r[5] else '0.0'
+                try: fixed_yield = float(raw_yield)
+                except: fixed_yield = 0.0
+
+                if s_code in current_holding_codes: continue
+
+                if status == '매도완료':
+                    eval_profit = (buy_price * qty) * (fixed_yield / 100.0) 
+                    # 🔥 [수정] '주문가능금액' 컬럼에 명시적으로 빈칸("")을 넣어 nan을 방지합니다.
+                    account_rows.append({'시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", '평균매입가': f"{buy_price:,.0f}", '현재가': f"{buy_price:,.0f}", '평가손익금': f"{eval_profit:,.0f}", '수익률': f"{fixed_yield:.2f}%", '상태': "매도완료", '주문가능금액': ""})
+                elif status == '주문취소':
+                    account_rows.append({'시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", '평균매입가': f"{buy_price:,.0f}", '현재가': f"{buy_price:,.0f}", '평가손익금': "0", '수익률': "0.00%", '상태': "주문취소", '주문가능금액': ""})
+        except Exception as e: pass
 
         market_rows = list(self.mw.accumulated_market.values())
         strategy_rows = list(self.mw.accumulated_strategy.values())
-        account_rows = list(self.mw.accumulated_account.values())
-
-        for i in range(len(account_rows)): account_rows[i]['주문가능금액'] = ""
-        if account_rows: account_rows[0]['주문가능금액'] = f"{my_cash:,.0f}" 
-        else: account_rows.append({'시간': '-', '종목코드': '-', '종목명': '보유종목 없음', '보유수량': 0, '평균매입가': '0', '현재가': '0', '평가손익금': '0', '수익률': '0.00%', '주문가능금액': f"{my_cash:,.0f}"})
         
-        acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','주문가능금액']
+        acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','상태']
         mkt_cols = ['시간','종목코드','종목명','현재가','시가','고가','저가','1분등락률','거래대금','거래량에너지','이격도','거래량']
         str_cols = ['시간','종목코드','종목명','상승확률','MA_5','MA_20','RSI','MACD','전략신호']
 
         if account_rows:
             df_acc = pd.DataFrame(account_rows)
+            # 🔥 [추가] 표에 렌더링하기 직전에 df 내부의 모든 nan, NaN을 완전한 빈칸("")으로 청소합니다!
+            df_acc.fillna("", inplace=True) 
+            
             for c in acc_cols:
                 if c not in df_acc.columns: df_acc[c] = ""
-            self.sig_account_df.emit(df_acc[acc_cols].copy()) 
+            self.sig_account_df.emit(df_acc[acc_cols].copy())
 
         if market_rows:  
             df_mkt = pd.DataFrame(market_rows)
@@ -1324,43 +1402,65 @@ class FormMain(QtWidgets.QMainWindow):
     def append_order_table_slot(self, order_info):
         if not order_info: return 
         
-        # 1. DB 저장은 기존 로직 그대로 수행
-        try:
-            order_no = order_info.get('주문번호', '00000000')
-            code = order_info.get('종목코드', '')
-            # 🔥 [버그 완벽 수정] 한글 '매수'와 '불타기'도 정확히 BUY로 인식하게 수정!
-            order_str = str(order_info.get('주문종류', '')).upper()
-            o_type = "BUY" if "매수" in order_str or "불타기" in order_str or "BUY" in order_str else "SELL"
-            
-            price = float(str(order_info.get('주문가격', '0')).replace(',', ''))
-            qty = int(order_info.get('주문수량', 0))
-            y_rate = float(str(order_info.get('수익률', '0')).replace('%', ''))
-            self.db.insert_trade_history(order_no, code, o_type, price, qty, y_rate)
-        except Exception: pass
+        order_no = order_info.get('주문번호', '00000000')
+        
+        # 🚀 [중복 방지 1] 이미 화면 표(tbOrder)에 똑같은 주문번호가 있으면 무시하고 돌아갑니다!
+        # (과거 복구 데이터가 아니더라도, 어떤 이유로든 표에 두 번 그려지는 것을 원천 차단)
+        for row in range(self.tbOrder.rowCount()):
+            item = self.tbOrder.item(row, 0)
+            if item and item.text() == order_no:
+                return
 
-        # 2. 표 컬럼 순서 (Flag.py와 100% 일치)
-        ord_cols = ['주문번호', '시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태']
+        if not order_info.get('is_restore', False):
+            try:
+                code = order_info.get('종목코드', '')
+                s_name = order_info.get('종목명', '') 
+                order_str = str(order_info.get('주문종류', '')).upper()
+                o_type = "BUY" if "매수" in order_str or "불타기" in order_str or "BUY" in order_str else "SELL"
+                
+                price = float(str(order_info.get('주문가격', '0')).replace(',', ''))
+                qty = int(order_info.get('주문수량', 0))
+                # 🚀 [% 기호 제거 후 안전한 float 변환]
+                raw_y_rate = str(order_info.get('수익률', '0')).replace('%', '').replace(',', '').strip()
+                y_rate = float(raw_y_rate) if raw_y_rate else 0.0
+                
+                self.db.insert_trade_history(order_no, code, o_type, price, qty, y_rate)
+                
+                conn = self.db._get_connection(self.db.shared_db_path)
+                conn.execute("UPDATE TradeHistory SET symbol_name = ? WHERE order_no = ?", (s_name, order_no))
+                conn.commit()
+                conn.close()
+            except Exception: pass
 
+        ord_cols = ['주문번호', '시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태', '수익률']
+
+        # 🚀 [UI 중복 렌더링 방어막 2] 새로고침(refresh)이 호출될 예정이라면 굳이 여기서 행을 안 만들어도 됩니다.
+        # 하지만 혹시 모르니 빈 줄을 먼저 만들고 덮어씁니다.
         row_idx = self.tbOrder.rowCount()
         self.tbOrder.insertRow(row_idx)
         
         for col_idx, col_name in enumerate(ord_cols):
-            # '주문시간' 키값을 '시간' 컬럼에 매핑
             if col_name == '시간':
                 val = str(order_info.get('주문시간', datetime.now().strftime("%H:%M:%S")))
+            elif col_name == '수익률':
+                # 🚀 [수익률 소수점 완벽 커팅] 어떤 값이 들어오든 무조건 소수점 2자리까지만 반올림해서 %를 붙입니다!
+                raw_val = str(order_info.get(col_name, '0')).replace('%', '').replace(',', '').strip()
+                try:
+                    num_val = float(raw_val)
+                    val = f"{num_val:.2f}%"
+                except:
+                    val = "0.00%"
             else:
                 val = str(order_info.get(col_name, ''))
             
-            # 미체결 상태 기본값 세팅
             if col_name == '상태' and not order_info.get('상태'): val = "미체결"
+            if col_name == '수익률' and not val: val = "0.00%"
 
             item = QtWidgets.QTableWidgetItem(val)
             item.setTextAlignment(QtCore.Qt.AlignCenter)
             self.tbOrder.setItem(row_idx, col_idx, item)
             
-        # 🚀 Ticker 작동을 위해 주문번호(0번)는 존재해야 하지만, 사용자 눈엔 숨깁니다.
         self.tbOrder.setColumnHidden(0, True) 
-        
         if self.tbOrder.rowCount() > 500: self.tbOrder.removeRow(0)
 
     @QtCore.pyqtSlot() 
@@ -1444,18 +1544,35 @@ class FormMain(QtWidgets.QMainWindow):
             else: self.add_log("💼 [보유 종목] 현재 보유 종목 없음", "info")
         except Exception as e: self.add_log(f"🚨 잔고 로드 에러: {e}", "error"); return
             
-        my_cash = self.api_manager.get_balance(); my_cash_float = float(my_cash) if my_cash is not None else 0.0
-        cash_str = f"{my_cash_float:,.0f}" if my_cash is not None else "0"
+        # 🚀 [방어막 1] 서버 오류로 잔고가 None이나 0이 오면 기존 잔고를 지켜냅니다!
+        api_cash = self.api_manager.get_balance()
+        if api_cash is None or float(api_cash) <= 0:
+            my_cash_float = getattr(self, 'last_known_cash', 0.0)
+        else:
+            my_cash_float = float(api_cash)
+            self.last_known_cash = my_cash_float # 정상일 때만 업데이트
+            
+        cash_str = f"{my_cash_float:,.0f}"
         
         account_rows = []; is_first = True; total_invested = 0; total_current_val = 0; stock_details_str = ""
         
         for code, info in list(self.my_holdings.items()):
             # ✅ 여기를 0.2으로 수정하세요! (기존 0.2 또는 0.25)
             time.sleep(0.2)
+            
+            # 🚀 [추가된 방어막 1] 0.2초 쉬는 동안 탐정이나 자동매매 일꾼이 팔아서 지워버렸으면 즉시 건너뜁니다!
+            if code not in self.my_holdings: 
+                continue
+                
             buy_price = info['price']; buy_qty = info['qty']; stock_name = self.DYNAMIC_STOCK_DICT.get(code, f"알수없음_{code}")
             self.my_holdings[code]['high_watermark'] = buy_price
 
             df = self.api_manager.fetch_minute_data(code); pnl_str = "0.00%"; curr_price = buy_price
+            
+            # 🚀 [추가된 방어막 2] 한투 서버랑 통신(fetch)하느라 시간 걸리는 동안 또 팔려서 지워졌으면 안전하게 건너뜁니다!
+            if code not in self.my_holdings: 
+                continue
+
             if df is not None:
                 curr_price = df.iloc[-1]['close']; profit_rate = ((curr_price - buy_price) / buy_price) * 100; pnl_str = f"{profit_rate:.2f}%"
                 self.my_holdings[code]['high_watermark'] = max(buy_price, curr_price); self.my_holdings[code]['buy_time'] = datetime.now(); self.my_holdings[code]['half_sold'] = False
@@ -1464,10 +1581,54 @@ class FormMain(QtWidgets.QMainWindow):
                 
             total_invested += (buy_price * buy_qty); total_current_val += (curr_price * buy_qty)
             now_time = datetime.now().strftime('%H:%M:%S')
-            account_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '보유수량': buy_qty, '평균매입가': f"{buy_price:,.0f}", '현재가': f"{curr_price:,.0f}", '평가손익금': pnl_str, '수익률': pnl_str, '주문가능금액': cash_str if is_first else "" })
+            account_rows.append({'시간': now_time, '종목코드': code, '종목명': stock_name, '보유수량': buy_qty, '평균매입가': f"{buy_price:,.0f}", '현재가': f"{curr_price:,.0f}", '평가손익금': pnl_str, '수익률': pnl_str, '상태': "보유중" })
             is_first = False
 
+        # -------------------------------------------------------------
+        # 🔥 [수정 3] 새로고침 시 증발 방지! 로컬 DB에서 '매도완료', '주문취소' 내역을 긁어와 정확한 형식으로 합칩니다.
+        try:
+            conn = self.db._get_connection(self.db.shared_db_path)
+            # 시간은 시:분:초만 자르고, 필요한 정보를 모두 불러옵니다.
+            query = """
+                SELECT strftime('%H:%M:%S', time) AS short_time, symbol_name, quantity, price, Status, order_yield, symbol
+                FROM TradeHistory 
+                WHERE Status IN ('매도완료', '주문취소') 
+                AND time >= date('now', 'localtime')
+            """
+            cursor = conn.execute(query)
+            past_rows = cursor.fetchall()
+            conn.close()
+
+            current_holding_codes = list(self.my_holdings.keys())
+
+            for r in past_rows:
+                short_time = r[0]   
+                s_name = r[1]       
+                qty = int(r[2])
+                buy_price = float(r[3])
+                status = r[4]
+                s_code = r[6]       
+                
+                # 🚀 [% 기호 제거 방어막] 여기서 누락되었던 방어막을 추가합니다!
+                raw_yield = str(r[5]).replace('%', '').replace(',', '').strip() if r[5] else '0.0'
+                try: fixed_yield = float(raw_yield)
+                except: fixed_yield = 0.0
+
+                if s_code in current_holding_codes:
+                    continue # 현재 보유중이면 위표에 중복 표시 안 함
+
+                if status == '매도완료':
+                    eval_profit = (buy_price * qty) * (fixed_yield / 100.0) 
+                    # 🔥 [수정] '주문가능금액' 컬럼에 명시적으로 빈칸("")을 넣어 nan을 방지합니다.
+                    account_rows.append({'시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", '평균매입가': f"{buy_price:,.0f}", '현재가': f"{buy_price:,.0f}", '평가손익금': f"{eval_profit:,.0f}", '수익률': f"{fixed_yield:.2f}%", '상태': "매도완료", '주문가능금액': ""})
+                elif status == '주문취소':
+                    account_rows.append({'시간': short_time, '종목코드': s_code, '종목명': s_name, '보유수량': "0", '평균매입가': f"{buy_price:,.0f}", '현재가': f"{buy_price:,.0f}", '평가손익금': "0", '수익률': "0.00%", '상태': "주문취소", '주문가능금액': ""})
+        except Exception as e:
+            print(f"과거 내역 위표 합치기 실패: {e}")
+        # -------------------------------------------------------------
+
         total_unrealized_profit = total_current_val - total_invested; total_asset = my_cash_float + total_current_val
+
         try: realized_profit = float(self.db.get_shared_setting("ACCOUNT", "CUMULATIVE_REALIZED_PROFIT", "0.0"))
         except: realized_profit = 0.0
             
@@ -1478,7 +1639,7 @@ class FormMain(QtWidgets.QMainWindow):
             
         if account_rows: 
             df_acc = pd.DataFrame(account_rows)
-            acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금', '수익률','주문가능금액']
+            acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금', '수익률','상태']
             for c in acc_cols:
                 if c not in df_acc.columns: df_acc[c] = ""
             TradeData.account.df = df_acc[acc_cols]
@@ -1521,7 +1682,8 @@ class FormMain(QtWidgets.QMainWindow):
                     '체결수량': order['주문수량'] - order['미체결수량'], # 일부만 체결된 수량 반영
                     '주문시간': time_str,
                     '상태': '미체결',
-                    '수익률': '0.00%'
+                    '수익률': '0.00%',
+                    'is_restore': True  # 🚀 [추가] 이건 불러온 과거 데이터니까 DB에 또 넣지 말라고 이름표를 붙여줍니다!
                 }
                 
                 # 표에 띄우고 DB에 저장! (이제부터 주삐 탐정이 이 주문도 감시합니다)
@@ -1770,7 +1932,6 @@ class FormMain(QtWidgets.QMainWindow):
         self.btnAutoDataTest.setStyleSheet("background-color: rgb(5,5,15); color: Silver;")
 
     def btnAutoTradingSwitch(self):
-        # 🛡️ [방어막] 버튼 클릭 시 발생하는 모든 에러를 흡수하여 팅김을 방지합니다.
         try:
             if getattr(self, 'is_stopping', False): return
                 
@@ -1778,8 +1939,8 @@ class FormMain(QtWidgets.QMainWindow):
                 try:
                     conn = self.db._get_connection(self.db.shared_db_path)
                     conn.execute("DELETE FROM TradeHistory"); conn.close()
-                    # 🚀 [버그 수정] 컬럼 개수를 9개로 정확히 맞춰서 Ticker 오류 방지
-                    TradeData.order.df = pd.DataFrame(columns=['주문번호','시간','종목코드','종목명','주문종류','주문가격','주문수량','체결수량','상태'])
+                    # 🚀 [완벽 수정 3] 수익률 컬럼을 반드시 포함시켜 10개로 짝을 맞춰야 에러가 안 납니다!
+                    TradeData.order.df = pd.DataFrame(columns=['주문번호','시간','종목코드','종목명','주문종류','주문가격','주문수량','체결수량','상태','수익률'])
                     self.tbOrder.setRowCount(0)
                 except Exception: pass
 
@@ -1953,10 +2114,16 @@ class FormMain(QtWidgets.QMainWindow):
                     msg = f"🚨 [수동 매도 완료] {stock_name} | {curr_price:,.0f}원 | 손익: {int(realized_profit):+,}원 ({profit_rate:.2f}%)"
                     self.add_log(msg, "sell")
                     
-                    # 주문 내역 표에도 기록 (Ticker가 체결완료로 바꿀 수 있게 미체결 상태로 보냄)
-                    # 🚀 [추가] C# 화면과 동기화를 위해 DB에도 수동 매도 기록을 남깁니다!
+                    # 🚀 [수정] 수동 매도는 즉시 시장가 처리되므로, DB에 넣을 때 상태를 아예 '체결완료'로 박아버리고,
+                    # 체결 수량(filled_qty)도 꽉 채워서 보냅니다.
                     try:
-                        self.db.insert_trade_history(res_odno, code, "SELL", curr_price, qty, profit_rate)
+                        self.db.insert_trade_history(res_odno, code, "SELL", curr_price, qty, profit_rate, status="체결완료", filled_qty=qty)
+                        
+                        # 종목명 업데이트
+                        conn = self.db._get_connection(self.db.shared_db_path)
+                        conn.execute("UPDATE TradeHistory SET symbol_name = ? WHERE order_no = ?", (stock_name, res_odno))
+                        conn.commit()
+                        conn.close()
                     except Exception as e:
                         print(f"수동 매도 DB 기록 에러: {e}")
 
@@ -1969,10 +2136,10 @@ class FormMain(QtWidgets.QMainWindow):
                             '주문종류': '수동매도', 
                             '주문가격': f"{curr_price:,.0f}", 
                             '주문수량': qty, 
-                            '체결수량': 0, 
+                            '체결수량': qty,            # 👈 0 대신 꽉 찬 수량으로 변경!
                             '주문시간': now_str, 
-                            '상태': '미체결', 
-                            '수익률': f"{profit_rate:.2f}%"
+                            '상태': '체결완료',          # 👈 미체결 대신 체결완료로 변경!
+                            '수익률': f"{profit_rate:.2f}%" # 소수점 둘째 자리 포맷팅
                         })
                 else:
                     error_msg = getattr(self.api_manager.api, 'last_error_msg', '알 수 없는 오류')
@@ -2084,9 +2251,20 @@ class FormMain(QtWidgets.QMainWindow):
                 for j, col in enumerate(df.columns):
                     val = str(df.iloc[i, j]); item = tableWidget.item(i, j)     
                     if item is None: 
-                        item = QtWidgets.QTableWidgetItem(val); item.setTextAlignment(QtCore.Qt.AlignCenter); tableWidget.setItem(i, j, item)
+                        item = QtWidgets.QTableWidgetItem(val)
+                        item.setTextAlignment(QtCore.Qt.AlignCenter)
+                        tableWidget.setItem(i, j, item)
                     else:
                         if item.text() != val: item.setText(val)
+                    
+                    # -------------------------------------------------------------
+                    # 🎨 [수정 4] 글자에 특정 단어가 포함되어 있으면 무조건 색상을 입힙니다!
+                    if val == '체결완료': item.setForeground(QtGui.QColor("lime"))
+                    elif val == '미체결': item.setForeground(QtGui.QColor("yellow"))
+                    elif '주문취소' in val: item.setForeground(QtGui.QColor("red"))
+                    elif '매도완료' in val: item.setForeground(QtGui.QColor("skyblue"))
+                    else: item.setForeground(QtGui.QColor("black")) # 테마 기본 텍스트 색상
+                    # -------------------------------------------------------------
                             
         except Exception: pass
         finally: tableWidget.setUpdatesEnabled(True)
@@ -2096,7 +2274,8 @@ class FormMain(QtWidgets.QMainWindow):
         """ [신규] 취소 등 상태 변화를 화면에 즉시 반영하기 위해 주문 표 새로고침 """
         try:
             conn = self.db._get_connection(self.db.shared_db_path)
-            query = "SELECT order_no, time, symbol, symbol_name, type, price, quantity, filled_quantity, Status, order_yield FROM TradeHistory WHERE time >= date('now', 'localtime') ORDER BY time DESC"
+            # 🔥 [시간 잘림 수정] 시간을 년/월/일 빼고 시:분:초만 가져옵니다!
+            query = "SELECT order_no, strftime('%H:%M:%S', time) AS time, symbol, symbol_name, type, price, quantity, filled_quantity, Status, order_yield FROM TradeHistory WHERE time >= date('now', 'localtime') ORDER BY time DESC"
             df = pd.read_sql(query, conn)
             conn.close()
             if not df.empty:
@@ -2108,14 +2287,15 @@ class FormMain(QtWidgets.QMainWindow):
         """ [신규] 재시작 시 DB에서 미체결 내역을 읽어와 표에 표시 (탐정이 취소할 수 있게 함) """
         try:
             conn = self.db._get_connection(self.db.shared_db_path)
-            cursor = conn.execute("SELECT order_no, symbol, symbol_name, type, price, quantity, filled_quantity, time FROM TradeHistory WHERE Status = '미체결'")
+            # 🔥 [시간 잘림 수정] 여기도 맨 뒤의 time을 시:분:초만 가져오게 바꿉니다.
+            cursor = conn.execute("SELECT order_no, symbol, symbol_name, type, price, quantity, filled_quantity, strftime('%H:%M:%S', time) FROM TradeHistory WHERE Status = '미체결'")
             rows = cursor.fetchall()
             conn.close()
             for row in rows:
-                self.sig_order_append.emit({'주문번호': str(row[0]), '종목코드': row[1], '종목명': row[2], '주문종류': row[3], '주문가격': f"{row[4]:,.0f}", '주문수량': row[5], '체결수량': row[6], '주문시간': row[7], '상태': '미체결', '수익률': '0.00%'})
+                # 🚀 [추가] 맨 뒤에 'is_restore': True 이름표를 달아줍니다!
+                self.sig_order_append.emit({'주문번호': str(row[0]), '종목코드': row[1], '종목명': row[2], '주문종류': row[3], '주문가격': f"{row[4]:,.0f}", '주문수량': row[5], '체결수량': row[6], '주문시간': row[7], '상태': '미체결', '수익률': '0.00%', 'is_restore': True})
         except: pass
 
-    # (이 아래는 기존 코드입니다)
     def btnDataClearClickEvent(self): 
         self.tbAccount.setRowCount(0); self.tbStrategy.setRowCount(0); self.tbOrder.setRowCount(0); self.tbMarket.setRowCount(0)
 
