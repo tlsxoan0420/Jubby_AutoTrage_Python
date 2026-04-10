@@ -16,8 +16,8 @@ from COMMON.DB_Manager import JubbyDB_Manager
 # 🛡️ [추가] LSTM 방어막(관측수) 클래스 구조 정의
 # =========================================================================
 class JubbyLSTM(nn.Module):
-    # 🚨 [수정됨] 뇌 용량(64)과 층수(2)를 트레이너와 똑같이 맞춤
-    def __init__(self, input_size, hidden_size=64, num_layers=2): 
+    # 💡 [핵심 수정] 교과서 데이터가 19개이므로 뇌의 입력선(input_size)도 19개로 늘려야 합니다!
+    def __init__(self, input_size=19, hidden_size=64, num_layers=2): 
         super(JubbyLSTM, self).__init__()
         # 🚨 [수정됨] dropout=0.2 도 똑같이 추가해줍니다.
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
@@ -106,7 +106,8 @@ class JubbyStrategy:
 
             if os.path.exists(lstm_path):
                 try:
-                    self.lstm_model = JubbyLSTM(input_size=18).to(self.device)
+                    # 💡 [핵심 수정] 여기서도 19개로 지정해 줍니다!
+                    self.lstm_model = JubbyLSTM(input_size=19).to(self.device)
                     self.lstm_model.load_state_dict(torch.load(lstm_path, map_location=self.device))
                     self.lstm_model.eval() 
                     self.send_log(f"🛡️ [시스템] 휩쏘 방어용 LSTM 시계열 패턴 관측수({os.path.basename(lstm_path)}) 장착 완료!", "success")
@@ -139,17 +140,13 @@ class JubbyStrategy:
         [2차 방어: 실시간 수급]을 확인하여 '가짜 돌파(휩쏘)'를 완벽히 걸러냅니다.
         """
         try:
-            # 웹소켓(FormTicker)이 실시간으로 업데이트 중인 최신 잔량 데이터를 꺼내옵니다.
-            conn = self.db._get_connection(self.db.shared_db_path)
-            try:
-                cursor = conn.execute("SELECT ask_size, bid_size FROM MarketStatus WHERE symbol = ?", (code,))
-                row = cursor.fetchone()
-            except Exception as e:
-                # 에러 발생 시 프로그램이 터지지 않고 안전하게 빈 값(None) 처리
-                row = None 
-            finally:
-                # 🌟 핵심: 위에서 무슨 일이 있었든 간에, 이 구역을 빠져나갈 땐 무조건 문을 닫습니다.
-                conn.close()
+            # 💡 [핵심 수정] DB_Manager의 만능 래퍼를 사용하여 Lock 충돌을 100% 방어합니다!
+            row = self.db.execute_with_retry(
+                self.db.shared_db_path, 
+                "SELECT ask_size, bid_size FROM MarketStatus WHERE symbol = ?", 
+                (code,), 
+                fetch='one'
+            )
 
             if row:
                 ask_size = float(row[0])
@@ -189,6 +186,10 @@ class JubbyStrategy:
             df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
             df['TP_Volume'] = df['Typical_Price'] * df['volume']
             df['VWAP'] = df['TP_Volume'].cumsum() / (df['volume'].cumsum() + 1e-9)
+
+            # 💡 [알고리즘 추가 1] VWAP 이격도: 현재 주가가 오늘 하루 평균 매매가보다 얼마나 높은지/낮은지 비율
+            # 100보다 크면 세력도 수익중, 100보다 작으면 세력도 물려있음을 의미함
+            df['VWAP_Disparity'] = (df['close'] / (df['VWAP'] + 1e-9)) * 100
 
             df['MA5_Vol'] = df['volume'].rolling(window=5).mean()
             df['Vol_Energy'] = df['volume'] / (df['MA5_Vol'] + 1e-9)
@@ -245,7 +246,7 @@ class JubbyStrategy:
             'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
             'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
             'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
-            'Disparity_60', 'Disparity_120', 'Macro_Trend'
+            'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' # 👈 추가
         ]
         
         if 'Disparity_60' not in df.columns: df['Disparity_60'] = 100.0
@@ -272,11 +273,12 @@ class JubbyStrategy:
     def get_ai_sequence_features(self, df, seq_length=10):
         if df is None or len(df) < seq_length: return None
         
+        # 💡 [핵심 수정] LSTM 뇌에 들어가는 데이터 순서도 완벽하게 똑같이 맞춰줍니다!
         features = [
             'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
             'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
             'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
-            'Disparity_60', 'Disparity_120', 'Macro_Trend'
+            'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' # 💡 이거 추가!
         ]
         
         seq_df = df[features].tail(seq_length).copy()
@@ -329,10 +331,12 @@ class JubbyStrategy:
             stop_price = max(dynamic_stop, max_loss_price) # 둘 중 더 높은 가격(덜 잃는 가격)을 선택
             
         return target_price, stop_price
+    
     # =====================================================================
     # 🚀 [최종 통합본] 실전 매수/매도 타점 판독 (AI 3중 필터 + 매도 비상 탈출)
     # =====================================================================
-    def check_trade_signal(self, df, code):
+    # 🔥 [핵심 1] is_sell_mode=False 라는 스위치를 추가합니다.
+    def check_trade_signal(self, df, code, is_sell_mode=False):
         if len(df) < 26: return "WAIT"
         
         current = df.iloc[-1]
@@ -340,7 +344,36 @@ class JubbyStrategy:
         ai_prob = 0.0 
         buy_signal = False 
         pretty_name = self.get_pretty_name(code)
+
+        # =================================================================
+        # 🚨 [최우선 판단] 초단타 비상 탈출구 (매수 조건보다 무조건 먼저 검사!)
+        # 만약 차트가 박살나고 있다면, AI가 당장 사라고 해도 무조건 팔아야 합니다.
+        # =================================================================
+        # 1. 추세 붕괴 신호 (데드크로스 + 이평선 이탈)
+        if current['MACD'] < current['Signal_Line'] and curr_price < current.get('MA5', curr_price):
+            # 로그 없이 즉각 SELL 반환 (속도가 생명)
+            return "SELL"
+            
+        # 2. 고점 과열 및 매도 폭탄(긴 윗꼬리) 감지
+        try: sell_rsi = float(self.db.get_shared_setting("TRADE", "SELL_RSI", "75.0"))
+        except: sell_rsi = 75.0
+
+        body_size = abs(current['open'] - current['close'])
+        # 윗꼬리가 몸통보다 길면 누군가 위에서 강하게 찍어누르고 있다는 뜻!
+        is_heavy_selling_pressure = current['High_Tail'] > body_size and current['High_Tail'] > 0
         
+        if current['RSI'] >= sell_rsi and is_heavy_selling_pressure:
+            # 🔥 [도배 방지] 여기서 무한으로 로그를 찍지 않고 조용히 결과만 넘깁니다!
+            return "SELL"
+
+        # =================================================================
+        # 🔥 [핵심 2 버그 완벽 해결] 
+        # 매도 감시 일꾼이 호출한 경우, 여기까지만 (팔지 말지만) 검사하고 빠져나갑니다!
+        # 이렇게 하면 무거운 AI 연산을 생략하여 컴퓨터 렉을 방지하고, 매수 로그 무한 도배를 차단합니다.
+        # =================================================================
+        if is_sell_mode:
+            return "WAIT"
+
         # -----------------------------------------------------------------
         # 🤖 [1단계] AI 모델 및 기술적 지표 1차 판독 (매수 탐색)
         # -----------------------------------------------------------------
@@ -368,7 +401,15 @@ class JubbyStrategy:
             if self.lstm_model is not None and self.scaler is not None and len(df) >= 10:
                 seq_features = self.get_ai_sequence_features(df, seq_length=10)
                 if seq_features is not None and len(seq_features) == 10:
+                    # 🔴 [여기를 추가하세요] 데이터 결측치(NaN)를 0으로 강제 변환
+                    seq_features = np.nan_to_num(seq_features, nan=0.0) 
+                    
+                    # 데이터 스케일링 (transform 사용)
                     seq_features_scaled = self.scaler.transform(seq_features)
+                    
+                    # 🔴 [여기를 추가하세요] 값이 너무 튀지 않게 0~1 사이로 제한
+                    seq_features_scaled = np.clip(seq_features_scaled, 0.0, 1.0)
+                    
                     seq_tensor = torch.tensor(seq_features_scaled, dtype=torch.float32).unsqueeze(0).to(self.device)
                     
                     with torch.no_grad():
@@ -397,26 +438,8 @@ class JubbyStrategy:
                 buy_signal = False
 
         # -----------------------------------------------------------------
-        # 💸 [매도 조건] : 초단타 비상 탈출구 (보유 중인 종목을 위한 로직)
-        # -----------------------------------------------------------------
-        # 1. 추세 붕괴 신호 (데드크로스 + 이평선 이탈)
-        if current['MACD'] < current['Signal_Line'] and curr_price < current.get('MA5', curr_price):
-            # 로그 없이 즉각 SELL 반환 (속도가 생명)
-            return "SELL"
-            
-        # 2. 고점 과열 및 매도 폭탄(긴 윗꼬리) 감지
-        try: sell_rsi = float(self.db.get_shared_setting("TRADE", "SELL_RSI", "75.0"))
-        except: sell_rsi = 75.0
-
-        body_size = abs(current['open'] - current['close'])
-        # 윗꼬리가 몸통보다 길면 누군가 위에서 강하게 찍어누르고 있다는 뜻!
-        is_heavy_selling_pressure = current['High_Tail'] > body_size and current['High_Tail'] > 0
-        
-        if current['RSI'] >= sell_rsi and is_heavy_selling_pressure:
-            self.send_log(f"💡 [비상 탈출] {pretty_name} 고점 매도 폭탄 감지! 즉시 수익 보존!", "info")
-            return "SELL"
-
         # 모든 조건이 아니면 대기
+        # -----------------------------------------------------------------
         try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "분석 및 탐색 중...")
         except: pass
         

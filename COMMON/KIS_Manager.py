@@ -4,6 +4,7 @@ import time
 import pandas as pd
 import numpy as np
 import os
+import threading
 
 # =====================================================================
 # 🌐 시스템 전역 설정 및 DB 매니저
@@ -27,6 +28,9 @@ class KIS_API:
         self.log = log_callback 
         self.last_error_msg = ""  # 에러 발생 시 UI에 뿌려줄 메시지 저장소
         self.db = JubbyDB_Manager()
+        
+        self.api_lock = threading.Lock()
+        self.last_api_call = 0.0
 
     def _log_msg(self, msg, log_type="error"):
         """ 로그 출력 및 C# 공유용 DB 저장 """
@@ -96,61 +100,89 @@ class KIS_API:
         return None
 
     def get_account_balance(self):
-        """ 예수금(주문가능금액) 조회 """
-        time.sleep(0.1)
-        if SystemConfig.MARKET_MODE == "DOMESTIC":
-            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
-            tr_id = "VTTC8908R" if self.is_mock else "TTTC8908R"
-            params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "PDNO": "", "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "N", "OVRS_ICLD_YN": "N"}
-        # (중략: 해외/해선 로직은 기존과 동일)
-        else: return 0.0
-
-        headers = {"Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=5.0)
-            data = self._safe_json_parse(res)
-            if data.get('rt_cd') == '0':
-                balance = float(data.get('output', {}).get('ord_psbl_cash', 0))
-                self.db.set_shared_setting("ACCOUNT", "CASH", str(balance))
-                return balance
-        except: pass
-        return None # 🔥 통신 에러 시 0원이 아니라 None을 반환하여 이전 잔고를 유지하게 합니다!
+        """ 예수금(주문가능금액) 조회 (안전망 적용) """
+        PATH = "uapi/domestic-stock/v1/trading/inquire-psbl-order"
+        URL = f"{self.base_url}/{PATH}"
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": "VTTC8908R" if self.is_mock else "TTTC8908R",
+            "custtype": "P",
+        }
+        params = {
+            "CANO": self.account_no[:8],
+            "ACNT_PRDT_CD": self.account_no[8:],
+            "PDNO": "",
+            "ORD_UNPR": "",
+            "ORD_DVSN": "01",
+            "CMA_EVLU_AMT_ICLD_YN": "Y",
+            "OVRS_ICLD_YN": "N"
+        }
+        
+        # 💡 [핵심 수정] 프로그램 시작 직후 씹힘 현상을 막기 위해 최대 3번까지 재시도합니다!
+        for attempt in range(3):
+            self._wait_for_api_rate_limit()
+            try:
+                res = requests.get(URL, headers=headers, params=params)
+                data = res.json()
+                
+                # 성공 시 즉시 돈 반환
+                if res.status_code == 200 and data["rt_cd"] == "0":
+                    return int(data["output"]["ord_psbl_cash"])
+                else:
+                    # 실패 시 0.3초 대기 후 다시 물어봄
+                    self.last_error_msg = data.get("msg1", "")
+                    time.sleep(0.3)
+            except Exception as e:
+                time.sleep(0.3)
+                
+        # 3번 다 실패했을 때만 0원 반환
+        return 0
 
     def get_account_holdings(self):
-        """ 보유 종목 리스트 조회 """
-        time.sleep(0.1)
-        holdings = {}
-        if SystemConfig.MARKET_MODE == "DOMESTIC":
-            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
-            tr_id = "VTTC8434R" if self.is_mock else "TTTC8434R"
-            params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
-            # (해외 로직 등은 기존 유지)
-        else:
-            return {}
-
-        headers = {"Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=5.0)
-            data = self._safe_json_parse(res)
-            if data.get('rt_cd') == '0':
-                for item in data.get('output1', []):
-                    # 🔥 [핵심 수정] 예약 매도 중인 물량도 화면에 표시하기 위해 '총 보유수량(hldg_qty)'을 가져옵니다!
-                    qty = int(float(item.get('hldg_qty', 0))) 
-                    
-                    if qty > 0:
-                        # 🚀 [정보 보강] 메인 UI에서 종목명, 수익률 등을 제대로 표기할 수 있게 꽉 채워서 보냅니다.
-                        holdings[item['pdno']] = {
-                            'name': item.get('prdt_name', ''),
-                            'qty': qty, 
-                            'price': float(item.get('pchs_avg_pric', 0)),     # 기존 코드 호환용 매입가
-                            'buy_price': float(item.get('pchs_avg_pric', 0)), # 신규 코드 호환용 매입가
-                            'curr_price': float(item.get('prpr', 0)),         # 현재가
-                            'profit_rate': float(item.get('evlu_pfls_rt', 0)) # 수익률
-                        }
-        except Exception as e: 
-            print(f"보유 종목 로드 에러: {e}")
-            
-        return holdings
+        """ 보유 종목 리스트 조회 (안전망 적용) """
+        PATH = "uapi/domestic-stock/v1/trading/inquire-balance"
+        URL = f"{self.base_url}/{PATH}"
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": "VTTC8434R" if self.is_mock else "TTTC8434R",
+            "custtype": "P",
+        }
+        params = {
+            "CANO": self.account_no[:8],
+            "ACNT_PRDT_CD": self.account_no[8:],
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": ""
+        }
+        
+        # 💡 [핵심 수정] 잔고 조회 실패 시 빈 깡통을 반환하지 않도록 3번 재시도!
+        for attempt in range(3):
+            self._wait_for_api_rate_limit()
+            try:
+                res = requests.get(URL, headers=headers, params=params)
+                data = res.json()
+                
+                if res.status_code == 200 and data["rt_cd"] == "0":
+                    return data["output1"]
+                else:
+                    self.last_error_msg = data.get("msg1", "")
+                    time.sleep(0.3)
+            except Exception as e:
+                time.sleep(0.3)
+        
+        return []
     
     def get_unfilled_orders(self):
         """ 🔍 서버에서 '진짜' 예약매수/예약매도(미체결) 내역을 가져옵니다. """
@@ -210,8 +242,7 @@ class KIS_API:
         - limit_price > 0 이면 지정가(00)
         - limit_price == 0 이면 prcs_dv(기본 시장가 01) 적용
         """
-        time.sleep(0.2)
-        
+        self._wait_for_api_rate_limit() # 💡 추가!
         # 가격이 있으면 지정가(00), 없으면 시장가 혹은 최우선지정가(prcs_dv)
         ord_dvsn = "00" if limit_price > 0 else prcs_dv
         price_str = str(int(limit_price)) if limit_price > 0 else "0"
@@ -243,9 +274,25 @@ class KIS_API:
         except Exception as e:
             self.last_error_msg = str(e)
             return None
+        
+    def _wait_for_api_rate_limit(self):
+        """
+        💡 [상세 설명]
+        한투 API는 초당 20회 제한이 있습니다. 
+        여러 스레드(매수일꾼, 매도일꾼)가 동시에 요청하는 것을 방지하기 위해
+        자물쇠(Lock)를 채우고, 이전 호출로부터 최소 0.06초의 간격을 강제합니다.
+        """
+        with self.api_lock:
+            now = time.time()
+            elapsed = now - self.last_api_call
+            if elapsed < 0.06: # 안전하게 0.06초 (초당 약 16회)
+                time.sleep(0.06 - elapsed)
+            self.last_api_call = time.time()
 
     def fetch_minute_data(self, stock_code):
         """ 최근 1분봉 데이터 조회 (3회 리트라이 방어막 포함) """
+        self._wait_for_api_rate_limit() # 💡 API 호출 직전에 무조건 대기
+
         target_time = "153000" if SystemConfig.MARKET_MODE == "DOMESTIC" else "160000"
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
         headers = {"content-type": "application/json", "authorization": f"Bearer {self.access_token}", "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": "FHKST03010200", "custtype": "P"}
@@ -270,6 +317,7 @@ class KIS_API:
         return None
 
     def cancel_order(self, order_no):
+        self._wait_for_api_rate_limit() # 💡 추가!
         """ [B전략] 미체결 주문 강제 취소 전송 """
         if SystemConfig.MARKET_MODE == "DOMESTIC":
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecnl"
@@ -312,7 +360,35 @@ class KIS_API:
                 self._log_msg(f"🚨 주문취소 통신 에러: {e}", "error")
                 
         return False
+    
+    # --- KIS_Manager.py 맨 아래 덮어쓰기 ---
+    def get_d2_deposit(self):
+        try:
+            # 1차 시도: 주문가능금액조회(8908 API)
+            headers = {
+                "content-type": "application/json; charset=utf-8",
+                "authorization": f"Bearer {self.api.access_token}",
+                "appkey": self.api.app_key, "appsecret": self.api.app_secret,
+                "tr_id": "VTTC8908R" if self.api.is_mock else "TTTC8908R", "custtype": "P"
+            }
+            params = {
+                "CANO": self.api.account_no[:8],
+                "ACNT_PRDT_CD": self.api.account_no[8:] if len(self.api.account_no) > 8 else "01",
+                "PDNO": "005930", "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N"
+            }
+            res = requests.get(f"{self.api.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order", headers=headers, params=params, timeout=5)
+            data = res.json()
+            d2_val = int(float(data.get("output", {}).get("n2_dn_expect_cash_amt", "0")))
 
+            # 💡 만약 0원이라면? 2차 예비 수단(8434 API) 가동
+            if d2_val <= 0:
+                headers["tr_id"] = "VTTC8434R" if self.api.is_mock else "TTTC8434R"
+                res2 = requests.get(f"{self.api.base_url}/uapi/domestic-stock/v1/trading/inquire-balance", headers=headers, params=params, timeout=5)
+                d2_val = int(float(res2.json().get("output2", [{}])[0].get("prcs_arrc_excc_amt", "0")))
+
+            return d2_val
+        except:
+            return 0
 # =====================================================================
 # 👔 [2] KIS_Manager 클래스 (사용자 편의용 래퍼 클래스)
 # =====================================================================
@@ -380,6 +456,50 @@ class KIS_Manager:
 
     # --- 조회 함수들 ---
     def get_balance(self): return self.api.get_account_balance()
-    def get_real_holdings(self): return self.api.get_account_holdings()
+    
+    # 🔥 [버그 수정] API에서 받은 리스트 형태의 잔고를 딕셔너리 형태로 예쁘게 포장해서 넘겨줍니다!
+    def get_real_holdings(self): 
+        raw_list = self.api.get_account_holdings()
+        holdings_dict = {}
+        if isinstance(raw_list, list):
+            for item in raw_list:
+                code = item.get('pdno', '') # 종목코드
+                qty = int(item.get('hldg_qty', '0')) # 보유수량
+                if code and qty > 0:
+                    holdings_dict[code] = {
+                        'price': float(item.get('pchs_avg_pric', '0')), # 매입단가
+                        'qty': qty
+                    }
+        return holdings_dict
+
+    # --- KIS_Manager.py 맨 아래 덮어쓰기 ---
+    def get_d2_deposit(self):
+        try:
+            # 1차 시도: 주문가능금액조회(8908 API)
+            headers = {
+                "content-type": "application/json; charset=utf-8",
+                "authorization": f"Bearer {self.api.access_token}",
+                "appkey": self.api.app_key, "appsecret": self.api.app_secret,
+                "tr_id": "VTTC8908R" if self.api.is_mock else "TTTC8908R", "custtype": "P"
+            }
+            params = {
+                "CANO": self.api.account_no[:8],
+                "ACNT_PRDT_CD": self.api.account_no[8:] if len(self.api.account_no) > 8 else "01",
+                "PDNO": "005930", "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N"
+            }
+            res = requests.get(f"{self.api.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order", headers=headers, params=params, timeout=5)
+            data = res.json()
+            d2_val = int(float(data.get("output", {}).get("n2_dn_expect_cash_amt", "0")))
+
+            # 💡 만약 0원이라면? 2차 예비 수단(8434 API) 가동
+            if d2_val <= 0:
+                headers["tr_id"] = "VTTC8434R" if self.api.is_mock else "TTTC8434R"
+                res2 = requests.get(f"{self.api.base_url}/uapi/domestic-stock/v1/trading/inquire-balance", headers=headers, params=params, timeout=5)
+                d2_val = int(float(res2.json().get("output2", [{}])[0].get("prcs_arrc_excc_amt", "0")))
+
+            return d2_val
+        except:
+            return 0
+
     def fetch_minute_data(self, code): return self.api.fetch_minute_data(code)
     def cancel_order(self, order_no): return self.api.cancel_order(order_no)

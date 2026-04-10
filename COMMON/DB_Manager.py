@@ -2,6 +2,7 @@ import sqlite3
 import os
 import datetime
 import pandas as pd  
+import time
 
 # 방금 만든 공통 경로를 불러옵니다.
 from COMMON.Flag import SystemConfig 
@@ -160,6 +161,30 @@ class JubbyDB_Manager:
         finally:
             conn.close()
 
+    # =======================================================================
+    # 🛡️ 다발적 덮어쓰기(executemany) 전용 Database is Locked 완벽 방어 래퍼
+    # =======================================================================
+    def execute_many_with_retry(self, db_path, delete_query, insert_query, data_list):
+        max_retries = 5
+        for attempt in range(max_retries):
+            conn = self._get_connection(db_path)
+            try:
+                conn.execute("BEGIN TRANSACTION;")
+                if delete_query:
+                    conn.execute(delete_query)
+                conn.executemany(insert_query, data_list)
+                conn.execute("COMMIT;")
+                return True
+            except sqlite3.OperationalError as e:
+                conn.execute("ROLLBACK;")
+                if "locked" in str(e).lower() and attempt < max_retries - 1:
+                    time.sleep(0.05)
+                    continue
+                print(f"🚨 [DB 다중 쿼리 에러] {e}")
+                return False
+            finally:
+                conn.close()
+
     def update_system_status(self, module, status, progress=0):
         conn = self._get_connection(self.shared_db_path)
         try:
@@ -177,49 +202,41 @@ class JubbyDB_Manager:
 
     def update_market_table(self, data_list):
         if not data_list: return
-        conn = self._get_connection(self.shared_db_path)
-        try:
-            conn.execute("BEGIN TRANSACTION;")
-            conn.execute("DELETE FROM MarketStatus") 
-            # 🔥 [핵심 수정] INSERT INTO -> REPLACE INTO 로 변경하여 UNIQUE 에러 완벽 차단!
-            conn.executemany('REPLACE INTO MarketStatus (symbol, symbol_name, last_price, open_price, high_price, low_price, return_1m, trade_amount, vol_energy, disparity, volume) VALUES (:symbol, :symbol_name, :last_price, :open_price, :high_price, :low_price, :return_1m, :trade_amount, :vol_energy, :disparity, :volume)', data_list) 
-            conn.execute("COMMIT;")
-        except Exception as e:
-            conn.execute("ROLLBACK;")
-            print(f"🔥 Market DB 에러: {e}")
-        finally:
-            conn.close()
+        self.execute_many_with_retry(
+            self.shared_db_path,
+            "DELETE FROM MarketStatus",
+            "REPLACE INTO MarketStatus (symbol, symbol_name, last_price, open_price, high_price, low_price, return_1m, trade_amount, vol_energy, disparity, volume) VALUES (:symbol, :symbol_name, :last_price, :open_price, :high_price, :low_price, :return_1m, :trade_amount, :vol_energy, :disparity, :volume)",
+            data_list
+        )
 
     def update_account_table(self, data_list):
         if not data_list: return
-        conn = self._get_connection(self.shared_db_path)
-        try:
-            conn.execute("BEGIN TRANSACTION;")
-            conn.execute("DELETE FROM AccountStatus")
-            # 🌟 [수정 확인] REPLACE INTO 가 아주 잘 적용되어 있습니다!
-            conn.executemany('REPLACE INTO AccountStatus (symbol, symbol_name, quantity, avg_price, current_price, pnl_amt, pnl_rate, available_cash) VALUES (:symbol, :symbol_name, :quantity, :avg_price, :current_price, :pnl_amt, :pnl_rate, :available_cash)', data_list)
-            conn.execute("COMMIT;")
-        except Exception as e: 
-            conn.execute("ROLLBACK;")
-            print(f"🔥 Account DB 에러: {e}") 
-        finally:
-            conn.close()
+        self.execute_many_with_retry(
+            self.shared_db_path,
+            "DELETE FROM AccountStatus",
+            "REPLACE INTO AccountStatus (symbol, symbol_name, quantity, avg_price, current_price, pnl_amt, pnl_rate, available_cash) VALUES (:symbol, :symbol_name, :quantity, :avg_price, :current_price, :pnl_amt, :pnl_rate, :available_cash)",
+            data_list
+        )
 
     def update_strategy_table(self, data_list):
         if not data_list: return
         conn = self._get_connection(self.shared_db_path)
         try:
             conn.execute("BEGIN TRANSACTION;")
+            # 🔥 [핵심 수정] REPLACE INTO는 기존 줄을 삭제해버리므로 메시지가 날아갑니다.
+            # INSERT ... ON CONFLICT를 사용하여 'status_msg'는 절대로 덮어쓰지 않게 보호합니다!
             conn.executemany('''
-                REPLACE INTO StrategyStatus (symbol, symbol_name, ai_prob, ma_5, ma_20, RSI, macd, signal, status_msg) 
+                INSERT INTO StrategyStatus (symbol, symbol_name, ai_prob, ma_5, ma_20, RSI, macd, signal, status_msg) 
                 VALUES (:symbol, :symbol_name, :ai_prob, :ma_5, :ma_20, :RSI, :macd, :signal, :status_msg)
+                ON CONFLICT(symbol) DO UPDATE SET
+                ai_prob=excluded.ai_prob, ma_5=excluded.ma_5, ma_20=excluded.ma_20, 
+                RSI=excluded.RSI, macd=excluded.macd, signal=excluded.signal
             ''', data_list)
             conn.execute("COMMIT;")
         except Exception:
             conn.execute("ROLLBACK;")
         finally:
             conn.close()
-
     def update_realtime(self, symbol, current_price, ai_score, holding_str, status_msg):
         conn = self._get_connection(self.shared_db_path)
         try:
@@ -325,27 +342,22 @@ class JubbyDB_Manager:
         finally: conn.close()
 
     def get_realtime_price(self, symbol):
-        conn = self._get_connection(self.shared_db_path)
-        try:
-            cursor = conn.execute("SELECT last_price FROM MarketStatus WHERE symbol = ?", (symbol,))
-            row = cursor.fetchone()
-            return float(row[0]) if row and row[0] is not None else 0.0
-        except: return 0.0
-        finally: conn.close()
+        row = self.execute_with_retry(
+            self.shared_db_path, 
+            "SELECT last_price FROM MarketStatus WHERE symbol = ?", 
+            (symbol,), 
+            fetch='one' # 💡 1개만 가져와!
+        )
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     def update_shared_risk_status(self, is_locked):
-        """
-        [상세 설명]
-        오늘 손실이 너무 크면 C# UI와 공유하는 DB에 '잠금' 상태를 기록합니다.
-        C#은 이 값을 읽어서 화면에 '자동매매 중단' 경고를 띄울 수 있습니다.
-        """
-        conn = self._get_connection(self.shared_db_path)
-        try:
-            val = "Y" if is_locked else "N"
-            conn.execute("INSERT OR REPLACE INTO SharedSettings (category, key, value) VALUES (?, ?, ?)",
-                        ("RISK", "IS_LOCKED", val))
-        finally:
-            conn.close()
+        val = "Y" if is_locked else "N"
+        self.execute_with_retry(
+            self.shared_db_path,
+            "INSERT OR REPLACE INTO SharedSettings (category, key, value) VALUES (?, ?, ?)",
+            ("RISK", "IS_LOCKED", val)
+            # 💡 fetch=None 이 기본값이므로 생략 (읽어올 게 없으니까!)
+        )
     
     def insert_ticker_log(self, level, message):
         """ Ticker 전용 로그를 DB에 저장하는 함수 """
@@ -359,3 +371,45 @@ class JubbyDB_Manager:
             conn.close()
         except Exception as e:
             print(f"❌ Ticker 로그 저장 실패: {e}")
+
+    # =======================================================================
+    # 🛡️ [핵심 추가] Database is Locked 완벽 방어 만능 래퍼 함수
+    # =======================================================================
+    def execute_with_retry(self, db_path, query, params=(), fetch=None):
+        """
+        [상세 설명]
+        모든 DB 읽기/쓰기를 이 함수를 거치게 하여, 동시 다발적 접근으로 인한 
+        잠김(Lock) 발생 시 튕기지 않고 자동으로 0.05초 대기 후 재시도합니다.
+        
+        - fetch='one' : 결과 1개만 가져올 때 (fetchone)
+        - fetch='all' : 결과 전부를 가져올 때 (fetchall)
+        - fetch=None  : 읽어올 결과가 없을 때 (INSERT, UPDATE, DELETE 용)
+        """
+        max_retries = 5 # 최대 5번(총 0.25초)까지 문을 두드림
+        
+        for attempt in range(max_retries):
+            conn = self._get_connection(db_path)
+            try:
+                cursor = conn.execute(query, params)
+                
+                # 1. 목적에 맞게 데이터 읽어오기
+                if fetch == 'one':
+                    result = cursor.fetchone()
+                elif fetch == 'all':
+                    result = cursor.fetchall()
+                else:
+                    result = cursor.rowcount # 반영된 줄 수 리턴
+                    
+                return result # 성공하면 즉시 결과 돌려주고 함수 종료!
+                
+            except sqlite3.OperationalError as e:
+                # 2. 에러가 났는데 만약 "Locked" (잠김) 이라면?
+                if "locked" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        time.sleep(0.05) # 0.05초만 숨 고르고 다시 시도(continue)
+                        continue
+                # 3. 잠김 에러가 아니거나, 3번 다 실패하면 에러를 무시하고 None 반환
+                print(f"🚨 [DB 에러] {e} (Query: {query})")
+                return None
+            finally:
+                conn.close() # 성공하든 실패하든 무조건 닫아줌

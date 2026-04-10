@@ -161,12 +161,19 @@ def fetch_data_logic_fast(api, stock_code, is_market_index=False, log_func=None)
     return df.reset_index(drop=True)
 
 # =====================================================================
-# 🧠 [지표 계산 및 정답지 생성] (기존 로직과 완전히 동일하게 유지)
+# 🧠 [지표 계산 및 정답지 생성] 
 # =====================================================================
 def calculate_indicators_logic(df, market_dict, future_window=10, profit_target=1.5, stop_loss=1.0):
     if df is None or len(df) < 30: return None
     df['return'] = df['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) * 100 
     df['vol_change'] = df['volume'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) 
+
+    # 💡 [추가된 부분] VWAP 및 이격도 계산
+    df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
+    df['TP_Volume'] = df['Typical_Price'] * df['volume']
+    df['VWAP'] = df['TP_Volume'].cumsum() / (df['volume'].cumsum() + 1e-9)
+    df['VWAP_Disparity'] = (df['close'] / (df['VWAP'] + 1e-9)) * 100
+
     delta = df['close'].diff()
     up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
     rs = up.ewm(com=13).mean() / (down.ewm(com=13).mean() + 1e-9)
@@ -196,10 +203,14 @@ def calculate_indicators_logic(df, market_dict, future_window=10, profit_target=
     df['High_Tail'] = df['high'] - df[['open', 'close']].max(axis=1)
     df['Low_Tail'] = df[['open', 'close']].min(axis=1) - df['low']
     df['Buying_Pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-9)
-    df['Market_Return_1m'] = df['time'].map(market_dict).fillna(0.0)
+    df['Market_Return_1m'] = df['time'].map(market_dict) if market_dict else 0.0
     df['future_max'] = df['close'].shift(-future_window).rolling(window=future_window, min_periods=1).max()
     df['future_min'] = df['close'].shift(-future_window).rolling(window=future_window, min_periods=1).min()
     df['Target_Buy'] = np.where((df['future_max'] >= df['close'] * (1 + profit_target/100)) & (df['future_min'] > df['close'] * (1 - stop_loss/100)), 1, 0)
+    
+    # 💡 불필요한 계산용 찌꺼기 컬럼 삭제
+    df.drop(['Typical_Price', 'TP_Volume'], axis=1, inplace=True, errors='ignore')
+    
     return df.dropna().reset_index(drop=True)
 
 # =====================================================================
@@ -266,6 +277,46 @@ class UltraDataCollector:
         try: self.db.insert_log(log_type.upper(), msg)
         except: pass
 
+    # =====================================================================
+    # 🚀 [스마트 업데이트] 기존 DB에 누락된 지표(VWAP)가 있으면 5초만에 싹 채워주는 기능
+    # =====================================================================
+    def smart_update_existing_db(self):
+        import sqlite3
+        if not os.path.exists(self.db.python_db_path): return
+        
+        conn = sqlite3.connect(self.db.python_db_path)
+        try:
+            tables_to_check = ['TrainData_Domestic', 'TrainData_Overseas', 'TrainData_Futures'] 
+            
+            for table_name in tables_to_check:
+                cursor = conn.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';")
+                if cursor.fetchone():
+                    df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
+                    
+                    if not df.empty and 'VWAP_Disparity' not in df.columns:
+                        self.send_log(f"🛠️ [스마트 점검] 구버전 {table_name} 발견! 누락된 지표 고속 계산 중...", "WARNING")
+                        
+                        df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
+                        df['TP_Volume'] = df['Typical_Price'] * df['volume']
+                        
+                        # 💡 종목별(code)로 그룹을 묶어서 계산해야 엉뚱한 종목과 섞이지 않습니다!
+                        df['TP_Volume_cumsum'] = df.groupby('code')['TP_Volume'].cumsum()
+                        df['Volume_cumsum'] = df.groupby('code')['volume'].cumsum()
+                        
+                        df['VWAP'] = df['TP_Volume_cumsum'] / (df['Volume_cumsum'] + 1e-9)
+                        df['VWAP_Disparity'] = (df['close'] / (df['VWAP'] + 1e-9)) * 100
+                        
+                        df.drop(['Typical_Price', 'TP_Volume', 'TP_Volume_cumsum', 'Volume_cumsum'], axis=1, inplace=True, errors='ignore')
+                        df = df.dropna().reset_index(drop=True)
+                        
+                        df.to_sql(table_name, conn, if_exists='replace', index=False)
+                        self.send_log(f"🎉 [스마트 점검] {table_name} 고속 업데이트 100% 완료!", "SUCCESS")
+                        
+        except Exception as e:
+            self.send_log(f"🚨 DB 스마트 업데이트 중 에러: {e}", "ERROR")
+        finally:
+            conn.close()
+
     def get_already_collected_stocks(self, table_name):
         conn = None # 🌟 변수 미리 선언
         try:
@@ -286,6 +337,9 @@ class UltraDataCollector:
                 conn.close()
 
     def run_collection(self, stock_list):
+        # 💡 [핵심 추가] 수집을 시작하기 전에 내 DB가 구버전인지 점검하고 빈칸을 먼저 채웁니다!
+        self.smart_update_existing_db()
+
         if not self.access_token:
             self.send_log("🚨 토큰 발급에 최종 실패했습니다. 수집을 중단합니다.", "ERROR")
             return "FAILED"
@@ -355,6 +409,7 @@ class UltraDataCollector:
     
 if __name__ == "__main__":
     db = JubbyDB_Manager()
+
     APP_KEY = db.get_shared_setting("KIS_API", "APP_KEY", "PSargEXRJo0zf5vOG1HAAKr7bKX9VKDzBhjy")
     APP_SECRET = db.get_shared_setting("KIS_API", "APP_SECRET", "3IS6VELZscyON3lhpinnbWf9I6+oCfFR+k5+XyreSvnwgi1IFaOFlN4M35ZL8IvTidXiSWws+qCe8Y015l/w2VN8kVC/BHmncRwLBVZUxICBE6RcVt3JsPp/xlHyjo1meR0XWqU8yqlIUkOcib3HfSamhnpiCKFalhlVeyYcgU3uP/1UWP8=")
     ACCOUNT = db.get_shared_setting("KIS_API", "FUTURES_ACCOUNT" if SystemConfig.MARKET_MODE == "OVERSEAS_FUTURES" else "STOCK_ACCOUNT", "60039684")

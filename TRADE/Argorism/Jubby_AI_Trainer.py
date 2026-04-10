@@ -69,7 +69,7 @@ def train_jubby_brain(log_callback=None):
         'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
         'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
         'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
-        'Disparity_60', 'Disparity_120', 'Macro_Trend'  # 🔥 새롭게 추가된 3대장
+        'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' # 💡 이거 무조건 추가!
     ]
     
     X = df[features]
