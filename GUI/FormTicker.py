@@ -65,14 +65,25 @@ class MessageProcessorWorker(QThread):
                         self.sig_real_execution.emit(exec_data)
                     except: pass
                     
-                # 2. 실시간 현재가 DB 저장 (H0STCNT0)
+                # 2. 실시간 현재가 및 체결강도 DB 저장 (H0STCNT0)
                 elif tr_id_recv == "H0STCNT0":
                     content = parts[3].split('^')
-                    if len(content) >= 3:
+                    # 💡 [체결강도 획득] KIS API의 22번 방이 '체결강도'입니다. (100 이상이면 매수세 우위)
+                    if len(content) >= 23:
+                        try:
+                            symbol = content[0]
+                            curr_price = float(content[2])
+                            vol_power = float(content[22]) # 🚀 체결강도 추출!
+                            
+                            # MarketStatus의 vol_energy 컬럼에 체결강도를 덮어씁니다.
+                            self.ws_conn.execute("UPDATE MarketStatus SET last_price = ?, vol_energy = ? WHERE symbol = ?", 
+                                                 (curr_price, vol_power, symbol))
+                        except: pass 
+                    elif len(content) >= 3:
                         try:
                             symbol = content[0]; curr_price = float(content[2])
                             self.ws_conn.execute("UPDATE MarketStatus SET last_price = ? WHERE symbol = ?", (curr_price, symbol))
-                        except: pass 
+                        except: pass
 
                 # 3. 실시간 호가 잔량 DB 저장 (H0STASP0)
                 elif tr_id_recv == "H0STASP0":
@@ -158,8 +169,20 @@ class RealWebSocketWorker(QThread):
                         return
                 except: pass
 
-            # 🚀 [극한의 다이어트] 그 외의 모든 메시지는 파싱 없이 바구니에 던지고 즉시 끝냅니다!
-            self.msg_queue.put(message)
+            # 🚨 [수정 전] 무조건 바구니에 밀어넣음 (바구니가 꽉 차면 여기서 프로그램이 영원히 멈춤/데드락)
+            # self.msg_queue.put(message)
+
+            # 💡 [수정 후] 바구니가 꽉 찼으면, 가장 오래된 쓸모없는 데이터를 1개 버리고 방금 온 최신 데이터를 넣습니다!
+            try:
+                # put_nowait은 대기하지 않고 즉시 넣습니다.
+                self.msg_queue.put_nowait(message)
+            except queue.Full:
+                # 바구니가 꽉 찼다면? (큐 처리 속도보다 데이터 들어오는 속도가 빠를 때)
+                try:
+                    self.msg_queue.get_nowait()          # 1. 젤 오래된 데이터 1개를 버림
+                    self.msg_queue.put_nowait(message)   # 2. 방금 들어온 따끈따끈한 새 데이터를 넣음
+                except:
+                    pass
 
         def on_open(ws):
             self.sig_execution_msg.emit("🌐 실시간 서버 접속 완료!", "success")
@@ -230,8 +253,11 @@ class FormTicker(QtWidgets.QWidget):
         self.lst_ticker.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: 'Consolas'; font-size: 11px;")
         layout.addWidget(self.lst_ticker)
         
-        # 🧺 두 스레드가 데이터를 주고받을 안전한 바구니 생성
-        self.msg_queue = queue.Queue()
+        # 🚨 [수정 전] 무한정 쌓이는 바구니 (메모리 폭발 위험)
+        # self.msg_queue = queue.Queue()
+
+        # 💡 [수정 후] 1000개까지만 담는 바구니 (약 1초~2초 분량의 최신 데이터만 유지)
+        self.msg_queue = queue.Queue(maxsize=1000)
 
         # 👨‍🔧 1. 처리 전담 스레드 생성 및 시작 (Consumer)
         self.msg_processor = MessageProcessorWorker(self.msg_queue, main_ui=self.main_ui)

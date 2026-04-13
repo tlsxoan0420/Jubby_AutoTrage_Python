@@ -33,12 +33,30 @@ class JubbyDB_Manager:
         return self._get_connection(self.shared_db_path)
 
     def _get_connection(self, db_path):
-        # 🔥 [마법의 락 해제 옵션]
-        # timeout을 30초로 넉넉히 주고, 매번 연결할 때마다 WAL(동시 읽기/쓰기) 모드와 동기화 설정을 강제 주입합니다!
-        conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+        """
+        [상세 주석]
+        스레드별 안전한 DB 접근을 위한 SQLite 연결 객체 생성 함수입니다.
+        초단타(스캘핑) 자동매매의 수많은 스레드가 동시에 읽기/쓰기를 요청할 때
+        락(Lock)이 걸리거나 튕기지 않도록 최적의 방어 옵션을 주입합니다.
+        """
+        # 🔥 check_same_thread=False : PyQt5의 여러 일꾼(QThread)들이 동시에 접근해도 파이썬이 에러를 뿜지 않게 강제 허용합니다.
+        # 🔥 timeout=30 : 동시 접근으로 DB가 잠기더라도 뻗지 않고 최대 30초까지 인내심을 갖고 대기합니다.
+        # 🔥 isolation_level=None : 자동 커밋(Auto-Commit) 모드로 전환하여 락(Lock)이 걸려있는 시간을 극단적으로 짧게 만듭니다.
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30, isolation_level=None)
+        
+        # 🔥 WAL (Write-Ahead Logging) 모드 : 쓰는 중에도 다른 스레드가 동시에 읽을 수 있게 해주는 마법의 락 해제 옵션입니다!
         conn.execute('PRAGMA journal_mode = WAL;')  
+        
+        # 🔥 NORMAL 동기화 : 디스크 쓰기 속도를 대폭 향상시켜 초단타 틱 데이터 저장 시 병목 현상을 없앱니다.
         conn.execute('PRAGMA synchronous = NORMAL;')
+        
+        # 🔥 busy_timeout : SQLite 엔진 내부적으로 DB가 바쁠 때 5초(5000ms) 동안 알아서 재시도하게 만듭니다.
         conn.execute('PRAGMA busy_timeout = 5000;') 
+        
+        # 🚀 [추가 최적화] cache_size : 하드디스크 대신 RAM 메모리(약 64MB)를 캐시로 사용하여 
+        # 조회(SELECT) 및 쓰기(INSERT) 속도를 비약적으로 끌어올립니다.
+        conn.execute('PRAGMA cache_size = -64000;')
+        
         return conn
 
     # =======================================================================

@@ -1781,19 +1781,29 @@ class AutoTradeWorker(QThread):
                             max_remaining_for_stock = max_allowed_for_stock - current_invested_in_stock
                             target_budget = min(target_budget, max_remaining_for_stock)
                         else:
+                            # 🔥 [2. 다이내믹 비중 조절 (Dynamic Position Sizing) 적용]
+                            # DB에서 비중 설정값을 불러옵니다. (없으면 공격적 30%, 표준 15%, 보수적 5% 적용)
                             try: 
-                                weight_high = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_HIGH", "20.0")) / 100.0
-                                weight_mid = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_MID", "10.0")) / 100.0
-                                weight_low = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_LOW", "5.0")) / 100.0
+                                weight_high = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_HIGH", "30.0")) / 100.0
+                                weight_mid = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_MID", "20.0")) / 100.0
+                                weight_low = float(db_temp.get_shared_setting("TRADE", "BUDGET_WEIGHT_LOW", "15.0")) / 100.0
                             except: 
-                                weight_high, weight_mid, weight_low = 0.20, 0.10, 0.05
+                                weight_high, weight_mid, weight_low = 0.30, 0.20, 0.15
                             
-                            if prob >= 0.85: weight = weight_high    
-                            elif prob >= 0.70: weight = weight_mid  
-                            else: weight = weight_low               
+                            # AI의 확신도(prob)에 따라 들어갈 시드(돈)의 덩치를 결정합니다!
+                            if prob >= 0.80: 
+                                weight = weight_high
+                                self.sig_log.emit(f"👑 [비중 조절] AI 확신도 최상({prob*100:.1f}%) ➔ 비중 {weight_high*100}% 공격적 베팅!", "success")
+                            elif prob >= 0.70: 
+                                weight = weight_mid  
+                                self.sig_log.emit(f"⚖️ [비중 조절] AI 확신도 중간({prob*100:.1f}%) ➔ 비중 {weight_mid*100}% 표준 베팅.", "info")
+                            else: 
+                                weight = weight_low               
+                                self.sig_log.emit(f"💧 [비중 조절] AI 확신도 턱걸이({prob*100:.1f}%) ➔ 정찰병 비중 {weight_low*100}%만 보수적 진입.", "warning")
                             
                             base_target_budget = float(total_asset * weight)
                             
+                            # (이후 ATR 변동성에 따른 비중 축소 로직은 기존 코드 그대로 유지됩니다)
                             try: 
                                 atr_high_limit = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_LIMIT", "5.0"))
                                 atr_high_ratio = float(db_temp.get_shared_setting("TRADE", "ATR_HIGH_RATIO", "50.0")) / 100.0
@@ -2658,6 +2668,7 @@ class FormMain(QtWidgets.QMainWindow):
             ("TRADE", "COOLDOWN_MINUTES", "10", "매도(청산) 후 재진입 금지 시간 (분) - 복수혈전 방지"),
             ("TRADE", "USE_SMART_LIMIT", "Y", "시장가 대신 스마트 지정가 사용 여부 (Y/N) - 슬리피지 방어"),
             ("API", "GLOBAL_API_DELAY", "0.05", "API 초당 호출 제한 방어용 딜레이 (초) - 트래픽 교통정리"),
+            ("TRADE", "MIN_VOL_POWER", "105.0", "매수 승인 최소 체결강도 (100 이상이어야 매수세 우위)"),
 
             # 💸 [리스크 및 컷오프(손/익절) 설정] (이 부분을 찾아서 아래처럼 덮어쓰거나 추가하세요)
             ("TRADE", "PROFIT_RATE", "2.0", "기본 기계적 익절 라인 (%) - 초단타용"),

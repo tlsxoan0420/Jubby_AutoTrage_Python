@@ -172,6 +172,44 @@ class JubbyStrategy:
         
         # 데이터 오류 시 안전을 위해 우선 통과 (1차 LSTM 방어막이 있으므로)
         return True
+    
+    # =====================================================================
+    # 🌪️ [궁극의 3차 방어막] 진짜 돈이 들어오는지 (체결강도) 검사
+    # =====================================================================
+    def check_volume_power_and_money(self, code):
+        """
+        아무리 호가창 매도잔량이 많아 보여도, 실제로 시장가로 긁어가는 '매수세(체결강도)'가 없으면 가짜입니다.
+        체결강도가 100 이상이면 파는 사람보다 사는 사람이 더 많다는 뜻입니다.
+        """
+        try:
+            row = self.db.execute_with_retry(
+                self.db.shared_db_path, 
+                "SELECT vol_energy FROM MarketStatus WHERE symbol = ?", 
+                (code,), 
+                fetch='one'
+            )
+
+            if row:
+                vol_power = float(row[0])
+                
+                try: min_vol_power = float(self.db.get_shared_setting("TRADE", "MIN_VOL_POWER", "105.0"))
+                except: min_vol_power = 105.0
+
+                # 체결강도가 기준치(기본 105) 이상일 때만 승인
+                if vol_power >= min_vol_power:
+                    # 🔥 [수정된 부분] 방어막을 무사히 통과했을 때 성공 로그를 남깁니다!
+                    self.send_log(f"✅ [3차 방어막 통과] {self.get_pretty_name(code)} 체결강도 우수 ({vol_power:.1f} >= {min_vol_power}). 진짜 돈이 들어옵니다!", "success")
+                    return True
+                else:
+                    # 방어막에 걸려서 탈락했을 때의 로그
+                    self.send_log(f"🛡️ [3차 방어막 작동] {self.get_pretty_name(code)} 체결강도 부족 ({vol_power:.1f} < {min_vol_power}). 가짜 반등 의심!", "warning")
+                    return False
+        except Exception as e:
+            # 🔥 [추가된 부분] 통신 지연 등으로 DB에서 값을 못 가져왔을 때 조용히 넘어가지 않고 로그를 남깁니다.
+            self.send_log(f"⚠️ [3차 방어막 예외] {self.get_pretty_name(code)} 체결강도 조회 실패. 1, 2차 방어막을 믿고 강제 통과합니다.", "warning")
+            pass
+            
+        return True # 데이터 오류 시 1,2차 방어막을 믿고 통과
 
     # =====================================================================
     # 📊 1. [초단타 퀀트 지표] VWAP, 거래량 돌파 에너지 등 실시간 계산
@@ -386,14 +424,22 @@ class JubbyStrategy:
                 except: ai_threshold = 0.70
                 
                 if ai_prob >= ai_threshold:
-                    is_above_vwap = curr_price >= current.get('VWAP', curr_price)
-                    is_above_ma5 = curr_price >= current.get('MA5', curr_price)
-                    is_macd_good = current.get('MACD', 0) >= current.get('Signal_Line', 0)
-                    is_rsi_oversold = current.get('RSI', 50) <= 40.0 
+                    # 🔥 [1. VWAP 당일 세력 평단가 필터 적용]
+                    curr_vwap = float(current.get('VWAP', curr_price))
+                    
+                    if curr_price < curr_vwap:
+                        # 주가가 세력 평단가 아래면 찐반등이 아닐 확률이 높으므로 매수를 포기합니다.
+                        self.send_log(f"🛑 [VWAP 필터] {pretty_name} 주가({curr_price:,.0f}원)가 세력 평단가({curr_vwap:,.0f}원) 밑에 있습니다. 저항 돌파 불가로 매수 포기!", "warning")
+                        buy_signal = False
+                    else:
+                        # VWAP 위에 있다면 기존의 보조지표들을 체크하여 승인합니다.
+                        is_above_ma5 = curr_price >= current.get('MA5', curr_price)
+                        is_macd_good = current.get('MACD', 0) >= current.get('Signal_Line', 0)
+                        is_rsi_oversold = current.get('RSI', 50) <= 40.0 
 
-                    if is_above_vwap or is_above_ma5 or is_macd_good or is_rsi_oversold:
-                        self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 포착! (확률: {ai_prob*100:.1f}%)", "buy")
-                        buy_signal = True 
+                        if is_above_ma5 or is_macd_good or is_rsi_oversold:
+                            self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 포착! (확률: {ai_prob*100:.1f}%) ➔ VWAP 지지 확인 완료!", "success")
+                            buy_signal = True
 
         # -----------------------------------------------------------------
         # 🛡️ [2단계] LSTM 시계열 패턴 방어막
@@ -426,14 +472,19 @@ class JubbyStrategy:
                         self.send_log(f"✅ [2차 승인] {pretty_name} 시계열 패턴 우수 ({lstm_prob*100:.1f}%)", "success")
 
         # -----------------------------------------------------------------
-        # ⚖️ [3단계] 최종 관문: 실시간 호가 수급 비율 검사
+        # ⚖️ [3단계] 최종 관문: 실시간 호가 수급 + 체결강도 검사
         # -----------------------------------------------------------------
         if buy_signal:
+            # 1. 호가창 매도/매수 잔량 비율 검사 통과 시
             if self.check_orderbook_imbalance(code):
-                self.send_log(f"🚀 [최종 승인] {pretty_name} 모든 조건 충족! 강력 매수 진입!", "success")
-                try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "🔥 강력 매수 신호!")
-                except: pass
-                return "BUY" 
+                # 🚀 2. 체결강도(진짜 돈이 들어오는지) 검사 통과 시 최종 진입!
+                if self.check_volume_power_and_money(code):
+                    self.send_log(f"🚀 [최종 승인] {pretty_name} 모든 조건 충족! 강력 매수 진입!", "success")
+                    try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "🔥 강력 매수 신호!")
+                    except: pass
+                    return "BUY" 
+                else:
+                    buy_signal = False # 체결강도 부족으로 탈락
             else:
                 self.send_log(f"🛡️ [수급 불량 취소] {pretty_name} 매수 잔량 과다(개미 꼬시기). 진입 취소!", "warning")
                 buy_signal = False
