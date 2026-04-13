@@ -2,6 +2,7 @@ import json
 import time
 import websocket # 🚨 CMD에서 pip install websocket-client 필수
 import threading
+import queue     # 👈 [추가] 바구니 역할을 할 모듈
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -10,14 +11,105 @@ from COMMON.DB_Manager import JubbyDB_Manager
 from COMMON.KIS_Manager import KIS_API
 
 # =====================================================================
+# 👨‍🔧 [신규 추가] 데이터 처리 전담 스레드 (Consumer)
+# =====================================================================
+class MessageProcessorWorker(QThread):
+    sig_execution_msg = pyqtSignal(str, str) # Ticker 창에 텍스트 띄우기용
+    sig_real_execution = pyqtSignal(dict)    # 메인 UI로 데이터 넘기기용
+
+    def __init__(self, msg_queue, main_ui=None):
+        super().__init__()
+        self.msg_queue = msg_queue
+        self.main_ui = main_ui
+        self.is_running = True
+        self.db = JubbyDB_Manager()
+        self.ws_conn = None
+
+    def run(self):
+        # 🔥 스레드가 시작될 때 자기만의 DB 연결 고속도로를 뚫습니다.
+        self.ws_conn = self.db._get_connection(self.db.shared_db_path)
+        
+        while self.is_running:
+            try:
+                # 1. 바구니(Queue)에서 메시지를 꺼냅니다. (데이터 없으면 최대 1초 대기)
+                raw_message = self.msg_queue.get(timeout=1.0)
+                
+                # 2. 메시지 파싱 및 DB 저장
+                self.process_message(raw_message)
+                
+                # 3. 작업 완료 처리
+                self.msg_queue.task_done()
+            except queue.Empty:
+                continue 
+            except Exception as e:
+                pass
+
+    def process_message(self, message):
+        if message in ["0", "1"]: return 
+        
+        if "|" in message:
+            parts = message.split("|")
+            if len(parts) >= 4:
+                tr_id_recv = parts[1]
+                
+                # 1. 내 계좌 체결 통보 파싱 (H0STCNI0 / H0STCNI9)
+                if tr_id_recv in ["H0STCNI0", "H0STCNI9"]:
+                    content = parts[3].split('^')
+                    if len(content) < 12: return
+                    try:
+                        exec_data = {
+                            "주문번호": content[1], "종목코드": content[3], 
+                            "체결수량": int(content[5]), "체결가": float(content[6]), 
+                            "체결시간": f"{content[7][:2]}:{content[7][2:4]}:{content[7][4:6]}"
+                        }
+                        self.sig_real_execution.emit(exec_data)
+                    except: pass
+                    
+                # 2. 실시간 현재가 DB 저장 (H0STCNT0)
+                elif tr_id_recv == "H0STCNT0":
+                    content = parts[3].split('^')
+                    if len(content) >= 3:
+                        try:
+                            symbol = content[0]; curr_price = float(content[2])
+                            self.ws_conn.execute("UPDATE MarketStatus SET last_price = ? WHERE symbol = ?", (curr_price, symbol))
+                        except: pass 
+
+                # 3. 실시간 호가 잔량 DB 저장 (H0STASP0)
+                elif tr_id_recv == "H0STASP0":
+                    content = parts[3].split('^')
+                    if len(content) >= 74:
+                        try:
+                            symbol = content[0]
+                            total_ask_size = float(content[43]); total_bid_size = float(content[73])
+                            self.ws_conn.execute("UPDATE MarketStatus SET ask_size = ?, bid_size = ? WHERE symbol = ?", 
+                                        (total_ask_size, total_bid_size, symbol))
+                        except: pass
+        else:
+            # 4. 시스템 메시지 처리
+            try:
+                res = json.loads(message)
+                msg1 = res.get('body', {}).get('msg1', '')
+                if msg1: self.sig_execution_msg.emit(f"✅ {msg1}", "success")
+            except: pass
+
+    def stop(self):
+        self.is_running = False
+        if self.ws_conn:
+            try: self.ws_conn.close()
+            except: pass
+        self.quit()
+        self.wait()
+
+# =====================================================================
 # 📡 [실전용] 한투 실시간 웹소켓 체결 수신 스레드
 # =====================================================================
 class RealWebSocketWorker(QThread):
     sig_execution_msg = pyqtSignal(str, str) # Ticker 창에 텍스트 띄우기용 (메시지, 타입)
     sig_real_execution = pyqtSignal(dict)    # 메인 UI(FormMain)로 데이터 넘기기용
 
-    def __init__(self, main_ui=None):
+    def __init__(self, msg_queue, main_ui=None):
         super().__init__()
+        self.msg_queue = msg_queue # 👈 바구니 연결
         self.main_ui = main_ui
         self.is_running = True
         self.db = JubbyDB_Manager()
@@ -55,70 +147,19 @@ class RealWebSocketWorker(QThread):
 
         # 실시간 데이터 수신 시 처리부
         def on_message(ws, message):
-            if message in ["0", "1"]: return # 하트비트 무시
-            
-            if "|" in message:
-                parts = message.split("|")
-                if len(parts) >= 4:
-                    tr_id_recv = parts[1]
-                    
-                    # ---------------------------------------------------------
-                    # 🟢 1. 내 계좌 체결 통보 수신 (H0STCNI0 / H0STCNI9)
-                    # ---------------------------------------------------------
-                    if tr_id_recv in ["H0STCNI0", "H0STCNI9"]:
-                        content = parts[3].split('^')
-                        if len(content) < 12: return
-                        
-                        try:
-                            exec_data = {
-                                "주문번호": content[1], 
-                                "종목코드": content[3], 
-                                "체결수량": int(content[5]), 
-                                "체결가": float(content[6]), 
-                                "체결시간": f"{content[7][:2]}:{content[7][2:4]}:{content[7][4:6]}"
-                            }
-                            # UI 업데이트 신호 쏘기 (FormMain으로 데이터 전송)
-                            self.sig_real_execution.emit(exec_data)
-                            # 🔥 상세 로그는 표에서 종목명을 찾은 뒤 update_main_ui_order 함수에서 출력하도록 위임합니다!
-                        except Exception as e: pass
-                        
-                    # ---------------------------------------------------------
-                    # 🚀 2. 실시간 현재가/체결가 수신 (H0STCNT0) -> 수익률 갱신의 핵심!
-                    # ---------------------------------------------------------
-                    elif tr_id_recv == "H0STCNT0":
-                        content = parts[3].split('^')
-                        if len(content) >= 3:
-                            try:
-                                symbol = content[0] 
-                                curr_price = float(content[2])
-                                
-                                # 🔥 [수정] 매번 DB를 열지 않고, 뚫어둔 고속도로(ws_conn)를 재사용합니다.
-                                self.ws_conn.execute("UPDATE MarketStatus SET last_price = ? WHERE symbol = ?", (curr_price, symbol))
-                            except: pass
+            if message in ["0", "1"]: return 
 
-                    # ---------------------------------------------------------
-                    # 🚀 3. 실시간 호가 잔량 수신 (H0STASP0) -> 2차 방어막용
-                    # ---------------------------------------------------------
-                    elif tr_id_recv == "H0STASP0":
-                        content = parts[3].split('^')
-                        if len(content) >= 74:
-                            try:
-                                symbol = content[0]
-                                total_ask_size = float(content[43])
-                                total_bid_size = float(content[73])
-                                
-                                # 🔥 [수정] 동일하게 재사용합니다.
-                                self.ws_conn.execute("UPDATE MarketStatus SET ask_size = ?, bid_size = ? WHERE symbol = ?", 
-                                            (total_ask_size, total_bid_size, symbol))
-                            except: pass
-            else:
-                # 시스템 메시지 처리 (JSON)
+            # 🏓 핑퐁(PINGPONG) 메시지는 즉시 웹소켓으로 응답해야 연결이 유지됩니다!
+            if "PINGPONG" in message:
                 try:
                     res = json.loads(message)
-                    if res.get("header", {}).get("tr_id") == "PINGPONG": ws.send(message)
-                    msg1 = res.get('body', {}).get('msg1', '')
-                    if msg1: self.sig_execution_msg.emit(f"✅ {msg1}", "success")
+                    if res.get("header", {}).get("tr_id") == "PINGPONG":
+                        ws.send(message)
+                        return
                 except: pass
+
+            # 🚀 [극한의 다이어트] 그 외의 모든 메시지는 파싱 없이 바구니에 던지고 즉시 끝냅니다!
+            self.msg_queue.put(message)
 
         def on_open(ws):
             self.sig_execution_msg.emit("🌐 실시간 서버 접속 완료!", "success")
@@ -150,12 +191,13 @@ class RealWebSocketWorker(QThread):
 
     def stop(self):
         self.is_running = False
-        if self.ws: self.ws.close()
-        # 🔥 [핵심 추가] 스레드가 종료될 때 DB 고속도로도 깔끔하게 닫아줍니다.
-        if hasattr(self, 'ws_conn') and self.ws_conn:
-            try: self.ws_conn.close()
-            except: pass
-        self.quit(); self.wait()
+        if self.ws: 
+            self.ws.close()
+        
+        # 🚨 웹소켓 스레드는 이제 DB를 안 쓰므로 ws_conn.close() 관련 코드는 전부 삭제합니다!
+        
+        self.quit()
+        self.wait()
 
     def subscribe_stock_realtime(self, code):
         """ [중요] 특정 종목을 실시간 감시 리스트에 추가합니다 (수익률 업데이트용) """
@@ -188,9 +230,18 @@ class FormTicker(QtWidgets.QWidget):
         self.lst_ticker.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: 'Consolas'; font-size: 11px;")
         layout.addWidget(self.lst_ticker)
         
-        self.ws_worker = RealWebSocketWorker(main_ui=self.main_ui)
+        # 🧺 두 스레드가 데이터를 주고받을 안전한 바구니 생성
+        self.msg_queue = queue.Queue()
+
+        # 👨‍🔧 1. 처리 전담 스레드 생성 및 시작 (Consumer)
+        self.msg_processor = MessageProcessorWorker(self.msg_queue, main_ui=self.main_ui)
+        self.msg_processor.sig_execution_msg.connect(self.add_ticker_log)
+        self.msg_processor.sig_real_execution.connect(self.update_main_ui_order)
+        self.msg_processor.start()
+
+        # 📡 2. 수신 전담 스레드 생성 및 시작 (Producer) -> 바구니를 건네줍니다
+        self.ws_worker = RealWebSocketWorker(self.msg_queue, main_ui=self.main_ui)
         self.ws_worker.sig_execution_msg.connect(self.add_ticker_log)
-        self.ws_worker.sig_real_execution.connect(self.update_main_ui_order)
         self.ws_worker.start()
 
         self.is_locked = True  
@@ -239,6 +290,11 @@ class FormTicker(QtWidgets.QWidget):
         
         is_cancel = exec_data.get('is_cancel', False)
         is_detective = exec_data.get('is_detective', False)
+
+        # 🚨 [치명적 버그 수정] 한투 서버의 '주문 접수' 알림(0주 체결)을 무시합니다.
+        # 이걸 무시하지 않으면 0주 체결인데 표에서는 '체결완료'로 덮어씌워져서 앱이랑 달라집니다!
+        if filled_qty == 0 and not is_cancel:
+            return
 
         # 🌟 1. 상태 판별 (취소인지, 체결인지, 부분체결인지)
         db_status = "체결완료"

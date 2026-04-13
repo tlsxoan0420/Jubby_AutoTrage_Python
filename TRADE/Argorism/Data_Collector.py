@@ -189,6 +189,8 @@ def calculate_indicators_logic(df, market_dict, future_window=10, profit_target=
     df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
     df['BB_Lower'] = df['MA20'] - (df['close'].rolling(20).std() * 2)
     df['BB_Width'] = ((df['BB_Upper'] - df['BB_Lower']) / (df['MA20'] + 1e-9)) * 100
+    # 👇 [여기에 이 한 줄을 추가합니다!] (볼린저밴드 위치 비율)
+    df['BB_PctB'] = (df['close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower'] + 1e-9)
     df['Disparity_5'] = (df['close'] / (df['MA5'] + 1e-9)) * 100
     df['Disparity_20'] = (df['close'] / (df['MA20'] + 1e-9)) * 100
     df['Vol_Energy'] = df['volume'] / (df['volume'].rolling(20).mean() + 1e-9)
@@ -277,8 +279,8 @@ class UltraDataCollector:
         try: self.db.insert_log(log_type.upper(), msg)
         except: pass
 
-    # =====================================================================
-    # 🚀 [스마트 업데이트] 기존 DB에 누락된 지표(VWAP)가 있으면 5초만에 싹 채워주는 기능
+   # =====================================================================
+    # 🚀 [스마트 업데이트] 기존 DB에 누락된 지표(VWAP, BB_PctB 등)가 있으면 5초만에 싹 채워주는 기능
     # =====================================================================
     def smart_update_existing_db(self):
         import sqlite3
@@ -293,22 +295,41 @@ class UltraDataCollector:
                 if cursor.fetchone():
                     df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
                     
-                    if not df.empty and 'VWAP_Disparity' not in df.columns:
+                    # 🔥 [핵심 수정] VWAP_Disparity 나 BB_PctB 가 없으면 고속 업데이트(패치)를 진행합니다!
+                    needs_update = False
+                    if not df.empty:
+                        if 'VWAP_Disparity' not in df.columns: needs_update = True
+                        if 'BB_PctB' not in df.columns: needs_update = True
+                        
+                    if needs_update:
                         self.send_log(f"🛠️ [스마트 점검] 구버전 {table_name} 발견! 누락된 지표 고속 계산 중...", "WARNING")
                         
-                        df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
-                        df['TP_Volume'] = df['Typical_Price'] * df['volume']
+                        def apply_patch(group):
+                            # 1. VWAP_Disparity 패치
+                            if 'VWAP_Disparity' not in group.columns:
+                                group['Typical_Price'] = (group['high'] + group['low'] + group['close']) / 3
+                                group['TP_Volume'] = group['Typical_Price'] * group['volume']
+                                group['VWAP'] = group['TP_Volume'].cumsum() / (group['volume'].cumsum() + 1e-9)
+                                group['VWAP_Disparity'] = (group['close'] / (group['VWAP'] + 1e-9)) * 100
+                            
+                            # 2. BB_PctB 패치
+                            if 'BB_PctB' not in group.columns:
+                                ma20 = group['close'].rolling(20).mean()
+                                std = group['close'].rolling(20).std()
+                                bb_upper = ma20 + (std * 2)
+                                bb_lower = ma20 - (std * 2)
+                                group['BB_PctB'] = (group['close'] - bb_lower) / (bb_upper - bb_lower + 1e-9)
+                                
+                            return group
+                            
+                        # 종목(code) 별로 그룹화해서 누락된 수식 일괄 적용!
+                        df = df.groupby('code', group_keys=False).apply(apply_patch)
                         
-                        # 💡 종목별(code)로 그룹을 묶어서 계산해야 엉뚱한 종목과 섞이지 않습니다!
-                        df['TP_Volume_cumsum'] = df.groupby('code')['TP_Volume'].cumsum()
-                        df['Volume_cumsum'] = df.groupby('code')['volume'].cumsum()
-                        
-                        df['VWAP'] = df['TP_Volume_cumsum'] / (df['Volume_cumsum'] + 1e-9)
-                        df['VWAP_Disparity'] = (df['close'] / (df['VWAP'] + 1e-9)) * 100
-                        
-                        df.drop(['Typical_Price', 'TP_Volume', 'TP_Volume_cumsum', 'Volume_cumsum'], axis=1, inplace=True, errors='ignore')
+                        # 계산용 찌꺼기와 옛날 지표(BB_Lower) 삭제
+                        df.drop(['Typical_Price', 'TP_Volume', 'VWAP', 'BB_Lower'], axis=1, inplace=True, errors='ignore')
                         df = df.dropna().reset_index(drop=True)
                         
+                        # DB 덮어쓰기
                         df.to_sql(table_name, conn, if_exists='replace', index=False)
                         self.send_log(f"🎉 [스마트 점검] {table_name} 고속 업데이트 100% 완료!", "SUCCESS")
                         

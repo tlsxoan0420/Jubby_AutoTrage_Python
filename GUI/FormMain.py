@@ -262,15 +262,19 @@ class DetectiveWorker(QThread):
                         except: pass
                         finally:
                             if up_conn: up_conn.close()
-
-                        # -------------------------------------------------------------
+# -------------------------------------------------------------
                         # 🔥 [수정 1] 유령 업데이트 방지 및 스레드 자물쇠(Lock) 적용!
                         # -------------------------------------------------------------
                         with self.mw.holdings_lock:
                             if symbol in self.mw.my_holdings:
-                                del self.mw.my_holdings[symbol] # 주머니에서 안전하게 삭제
+                                # 🚨 [치명적 버그 수정] 매도(SELL) 주문이 취소된 거라면 주식은 여전히 내 주머니에 있어야 합니다!
+                                # 무조건 삭제하지 말고, 신규 매수(BUY)가 취소되었을 때만 주머니에서 지웁니다.
+                                if o_type == "BUY":
+                                    del self.mw.my_holdings[symbol] # 주머니에서 안전하게 삭제
+                                else:
+                                    self.sig_log.emit(f"🛡️ [{stock_name}] 매도 취소 확인! 주식을 보유 상태로 유지하며 다시 감시합니다.", "info")
                                 
-                        if hasattr(self.mw, 'accumulated_account') and symbol in self.mw.accumulated_account:
+                        if o_type == "BUY" and hasattr(self.mw, 'accumulated_account') and symbol in self.mw.accumulated_account:
                             self.mw.accumulated_account[symbol]['보유수량'] = "0 (주문취소)"
                             self.mw.accumulated_account[symbol]['평가손익금'] = "0"
                             self.mw.accumulated_account[symbol]['수익률'] = "0.00%"
@@ -281,7 +285,7 @@ class DetectiveWorker(QThread):
                         
                         exec_data = {"주문번호": str(order_no), "종목코드": symbol, "체결수량": 0, "체결가": 0, "is_cancel": True}
                         if hasattr(self.mw, 'ticker_window'):
-                            self.mw.ticker_window.ws_worker.sig_real_execution.emit(exec_data)
+                            self.mw.ticker_window.msg_processor.sig_real_execution.emit(exec_data)
                     
             except Exception: pass
 
@@ -307,7 +311,7 @@ class DetectiveWorker(QThread):
                 
                 exec_data = {"주문번호": str(order_no), "종목코드": symbol, "체결수량": int(qty), "체결가": float(price), "is_detective": True}
                 if hasattr(self.mw, 'ticker_window'):
-                    self.mw.ticker_window.ws_worker.sig_real_execution.emit(exec_data)
+                    self.mw.ticker_window.msg_processor.sig_real_execution.emit(exec_data)
 
 # =====================================================================
 # 🛡️ [일꾼 3호] 매도 수호자 (SellGuardianWorker) - 전체 코드
@@ -550,7 +554,7 @@ class SellGuardianWorker(QThread):
 
             if getattr(self.mw, 'loss_streak_cnt', 0) >= max_loss_cnt or asset_pnl_pct <= limit_pnl:
                 db_temp.set_shared_setting("RISK", "IS_LOCKED", "Y")
-                self.sig_log.emit(f"🚨 [긴급 셧다운] 뇌동매매 방지를 위해 주삐 매수를 잠급니다.", "error")
+                self.sig_log.emit(f"🚨 [긴급 셧다운] 자동매매 방지를 위해 주삐 매수를 잠급니다.", "error")
 
         # 🚀 [원본 복구 2] 1분 과거 매도 내역 합치기
         try:
@@ -1507,7 +1511,7 @@ class AutoTradeWorker(QThread):
                         # 🌟 [수정 4] 계산된 총 자산 대비 수익률(asset_pnl_pct)로 셧다운 발동 검사
                         if self.loss_streak_cnt >= max_loss_cnt or asset_pnl_pct <= limit_pnl:
                             db_temp.set_shared_setting("RISK", "IS_LOCKED", "Y")
-                            self.sig_log.emit(f"🚨 [긴급 셧다운] {self.loss_streak_cnt}연패 또는 총 자산 대비 누적손실({asset_pnl_pct:.2f}%) 도달! 뇌동매매 방지를 위해 주삐 매수를 잠급니다.", "error")
+                            self.sig_log.emit(f"🚨 [긴급 셧다운] {self.loss_streak_cnt}연패 또는 총 자산 대비 누적손실({asset_pnl_pct:.2f}%) 도달! 자동매매 방지를 위해 주삐 매수를 잠급니다.", "error")
                             
                         if is_sell_all: sold_codes.append(code)
                         else:
@@ -2659,7 +2663,7 @@ class FormMain(QtWidgets.QMainWindow):
             ("TRADE", "PROFIT_RATE", "2.0", "기본 기계적 익절 라인 (%) - 초단타용"),
             ("TRADE", "STOP_RATE", "1.0", "기본 기계적 손절 라인 (%) - 밀림 방지용 짧은 손절"),
             ("TRADE", "TRAILING_STOP_GAP", "0.5", "최고점 대비 하락 허용 폭 (%) - 0.5%만 꺾여도 즉시 익절"),
-            ("TRADE", "STRAT_PROFIT_PRESERVE", "0.3", "전략 매도 시 최소 수익 보존 라인 (%)"),
+            ("TRADE", "STRAT_PROFIT_PRESERVE", "1.0", "전략 매도 시 최소 수익 보존 라인 (%)"),
         ]
 
         try:
@@ -2797,10 +2801,10 @@ class FormMain(QtWidgets.QMainWindow):
             self.add_log(msg, "error"); self.send_kakao_msg(msg)
             
             # 🔥 [팅김 방지 3] 매도 일꾼이 청산하는 동안, 매수 일꾼이 안전하게 멈출 때까지 잠시 기다려 충돌을 완벽 차단합니다!
+            # 🔥 [수정] 팅김의 주범이었던 wait() 함수를 과감하게 지웁니다! 스위치만 꺼주면 알아서 퇴근합니다.
             if hasattr(self, 'buy_worker') and self.buy_worker:
                 self.buy_worker.is_running = False
-                if self.buy_worker.isRunning():
-                    self.buy_worker.wait(500) # 스레드가 안전하게 종료될 때까지 최대 0.5초 대기
+                # wait(500) 삭제 완료!
 
             self.panic_mode = True # 🔥 메인 공유 변수 발동!
         except Exception as e:
@@ -2903,14 +2907,14 @@ class FormMain(QtWidgets.QMainWindow):
                 self.btnAutoDataTest.setText("감시망 종료 대기중...")
                 self.btnAutoDataTest.setStyleSheet("background-color: rgb(40, 40, 40); color: Gray;")
                 
-                # 🔥 [팅김 방지 4] 스레드 종료 신호를 보내고 깔끔하게 마무리되도록 0.5초간 기다려줍니다.
+                # 퇴근 스위치만 내려줍니다.
                 if self.buy_worker: self.buy_worker.is_running = False
                 if self.sell_worker: self.sell_worker.is_running = False 
                 if hasattr(self, 'detective_worker') and self.detective_worker: 
                     self.detective_worker.is_running = False
                     
-                if self.buy_worker and self.buy_worker.isRunning(): 
-                    self.buy_worker.wait(500)
+                # 🚨 [삭제] self.buy_worker.wait(500) 부분 삭제 완료! (데드락 방지)
+                
         except Exception as e:
             self.add_log(f"🚨 스위치 에러: {e}", "error")
 
@@ -3032,10 +3036,17 @@ class FormMain(QtWidgets.QMainWindow):
                     if "초과" in error_msg or "초당" in error_msg:
                         self.add_log(f"⏳ [{stock_name}] 서버 트래픽 초과! 1초 대기 후 재시도합니다... ({i+1}/5)", "warning")
                         time.sleep(1.0)
-                        QtWidgets.QApplication.processEvents() # 🔥 대기하는 1초 동안 프로그램 화면이 멈추지(렉) 않게 풀어주는 마법!
+                        QtWidgets.QApplication.processEvents() # 🔥 대기하는 1초 동안 렉 방지
                     elif "잔고" in error_msg:
-                        self.add_log(f"🚨 [{stock_name}] 이미 팔렸거나 매도할 잔고가 없습니다.", "error")
-                        break # 잔고가 없으면 재시도 포기
+                        # 🚨 [치명적 버그 수정] 이미 매도된 유령 잔고라면, 
+                        # 무한 클릭 방지를 위해 주머니(my_holdings)와 UI 표에서 강제로 지워버립니다!
+                        self.add_log(f"🚨 [{stock_name}] 이미 팔렸거나 매도할 잔고가 없습니다. 유령 잔고를 청소합니다.", "error")
+                        
+                        if code in self.my_holdings:
+                            del self.my_holdings[code] # 내 주머니에서 삭제
+                        self.tbAccount.removeRow(row)  # UI 표에서 해당 줄 삭제
+                        
+                        break # 잔고가 없으면 더 이상 재시도할 필요가 없으므로 반복문 탈출!
                     else:
                         break # 기타 알 수 없는 에러도 포기
 

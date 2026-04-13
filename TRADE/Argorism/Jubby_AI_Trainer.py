@@ -66,10 +66,10 @@ def train_jubby_brain(log_callback=None):
 
     # 🟢 [핵심 수정] 실전(Strategy.py)과 동일하게 18개의 지표를 모두 교재에 넣습니다!
     features = [
-        'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
+        'return', 'vol_change', 'RSI', 'MACD', 'BB_PctB', 'BB_Width', # 👈 BB_Lower를 BB_PctB로 이름 변경!
         'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
         'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
-        'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' # 💡 이거 무조건 추가!
+        'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' 
     ]
     
     X = df[features]
@@ -279,7 +279,13 @@ def train_jubby_brain(log_callback=None):
     lstm_model = JubbyLSTM(input_size=X_seq.shape[2]).to(device)
     
     # 3. 모델 학습 
-    criterion = nn.BCELoss()
+    # 🔥 [핵심 고도화] 성공(1)을 맞췄을 때 칭찬(가중치)을 더 해줘서 AI가 겁먹고 무조건 0으로 찍는 것을 방지합니다!
+    pos_count = y_seq.sum().item()
+    neg_count = len(y_seq) - pos_count
+    weight_ratio = neg_count / (pos_count + 1e-5) # 실패 데이터가 몇 배 더 많은지 계산
+    
+    # 평균 내지 않고 개별 로스를 받도록 'none' 설정
+    criterion = nn.BCELoss(reduction='none') 
     optimizer = optim.Adam(lstm_model.parameters(), lr=0.001)
 
     lstm_model.train()
@@ -290,7 +296,12 @@ def train_jubby_brain(log_callback=None):
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
             optimizer.zero_grad()
             outputs = lstm_model(batch_X)
+            
+            # 🔥 정답이 1(성공)인 데이터의 로스에 weight_ratio를 곱해서 더 중요하게 학습시킴!
             loss = criterion(outputs, batch_y)
+            weight = torch.where(batch_y == 1, torch.tensor(weight_ratio).to(device), torch.tensor(1.0).to(device))
+            loss = (loss * weight).mean() # 가중치 곱한 후 최종 평균
+            
             loss.backward()
             optimizer.step()
             total_loss += loss.item()

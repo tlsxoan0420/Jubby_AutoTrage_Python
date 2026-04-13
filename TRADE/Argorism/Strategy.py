@@ -207,7 +207,8 @@ class JubbyStrategy:
             df['BB_Upper'] = df['MA20'] + (df['close'].rolling(20).std() * 2)
             df['BB_Lower'] = df['MA20'] - (df['close'].rolling(20).std() * 2)
             df['BB_Width'] = ((df['BB_Upper'] - df['BB_Lower']) / (df['MA20'] + 1e-9)) * 100
-            
+            df['BB_PctB'] = (df['close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower'] + 1e-9)
+
             df['Disparity_5'] = (df['close'] / (df['MA5'] + 1e-9)) * 100
             df['Disparity_20'] = (df['close'] / (df['MA20'] + 1e-9)) * 100
 
@@ -243,10 +244,10 @@ class JubbyStrategy:
         if df is None or len(df) < 26: return None
         
         features = [
-            'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
+            'return', 'vol_change', 'RSI', 'MACD', 'BB_PctB', 'BB_Width', # 👈 BB_Lower를 BB_PctB로 이름 변경!
             'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
             'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
-            'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' # 👈 추가
+            'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' 
         ]
         
         if 'Disparity_60' not in df.columns: df['Disparity_60'] = 100.0
@@ -275,10 +276,10 @@ class JubbyStrategy:
         
         # 💡 [핵심 수정] LSTM 뇌에 들어가는 데이터 순서도 완벽하게 똑같이 맞춰줍니다!
         features = [
-            'return', 'vol_change', 'RSI', 'MACD', 'BB_Lower', 'BB_Width', 
+            'return', 'vol_change', 'RSI', 'MACD', 'BB_PctB', 'BB_Width', # 👈 여기도 BB_Lower를 BB_PctB로 이름 변경!
             'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
             'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
-            'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' # 💡 이거 추가!
+            'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' 
         ]
         
         seq_df = df[features].tail(seq_length).copy()

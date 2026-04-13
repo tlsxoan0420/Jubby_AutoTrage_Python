@@ -30,6 +30,7 @@ class KIS_API:
         self.db = JubbyDB_Manager()
         
         self.api_lock = threading.Lock()
+        self.last_order_time = 0.0
         self.last_api_call = 0.0
 
     def _log_msg(self, msg, log_type="error"):
@@ -51,15 +52,18 @@ class KIS_API:
         """ KIS API 접속 토큰 발급 (파일 캐싱 적용으로 1분 제한 방어) """
         token_path = os.path.join(SystemConfig.PROJECT_ROOT, "kis_token.txt")
         
-        # 1단계: 기존 토큰 재사용 (20시간 이내)
-        if os.path.exists(token_path):
-            if time.time() - os.path.getmtime(token_path) < 72000:
-                with open(token_path, "r") as f:
-                    cached_token = f.read().strip()
-                if cached_token:
-                    if self.log: self.log("♻️ 기존에 발급받은 KIS 토큰을 재사용합니다.", "info")
-                    self.access_token = cached_token 
-                    return cached_token
+        # [수정] 다중 스레드(매수/매도 일꾼)가 동시에 토큰 만료를 감지하고 
+        # 발급 API를 중복 호출하는 것을 막기 위해 자물쇠(Lock)를 채웁니다.
+        with self.api_lock:
+            # (기존 코드 유지) 파일 캐싱 확인 및 토큰 재사용...
+            if os.path.exists(token_path):
+                if time.time() - os.path.getmtime(token_path) < 72000: # 20시간 이내
+                    with open(token_path, "r") as f:
+                        cached_token = f.read().strip()
+                    if cached_token:
+                        if self.log: self.log("♻️ 기존에 발급받은 KIS 토큰을 재사용합니다.", "info")
+                        self.access_token = cached_token 
+                        return cached_token
 
         # 2단계: 신규 토큰 발급
         url = f"{self.base_url}/oauth2/tokenP"
@@ -278,15 +282,14 @@ class KIS_API:
     def _wait_for_api_rate_limit(self):
         """
         💡 [상세 설명]
-        한투 API는 초당 20회 제한이 있습니다. 
-        여러 스레드(매수일꾼, 매도일꾼)가 동시에 요청하는 것을 방지하기 위해
-        자물쇠(Lock)를 채우고, 이전 호출로부터 최소 0.06초의 간격을 강제합니다.
+        주문 에러(초당 거래건수 초과) 방지를 위해 딜레이를 0.25초(초당 4회)로 넉넉하게 늘립니다.
+        이렇게 하면 주문 튕김 현상이 사라져 슬리피지가 발생하지 않습니다!
         """
         with self.api_lock:
             now = time.time()
             elapsed = now - self.last_api_call
-            if elapsed < 0.06: # 안전하게 0.06초 (초당 약 16회)
-                time.sleep(0.06 - elapsed)
+            if elapsed < 0.20: # 🔥 0.06 -> 0.20로 변경!
+                time.sleep(0.20 - elapsed)
             self.last_api_call = time.time()
 
     def fetch_minute_data(self, stock_code):
@@ -463,16 +466,22 @@ class KIS_Manager:
         holdings_dict = {}
         if isinstance(raw_list, list):
             for item in raw_list:
-                code = item.get('pdno', '') # 종목코드
-                qty = int(item.get('hldg_qty', '0')) # 보유수량
-                if code and qty > 0:
+                code = item.get('pdno', '') 
+                
+                # 🔥 [핵심 버그 수정] 실제 보유수량과 주문가능수량을 둘 다 파악합니다!
+                hldg_qty = int(item.get('hldg_qty', '0'))
+                ord_psbl_qty = int(item.get('ord_psbl_qty', hldg_qty))
+                
+                # 🚨 ord_psbl_qty가 0이더라도, '실제 보유수량(hldg_qty)'이 있으면 무조건 딕셔너리에 넣습니다.
+                # 이렇게 해야 탐정이 "주식이 사라졌다"고 오해하지 않습니다!
+                if code and hldg_qty > 0:
                     holdings_dict[code] = {
-                        'price': float(item.get('pchs_avg_pric', '0')), # 매입단가
-                        'qty': qty
+                        'price': float(item.get('pchs_avg_pric', '0')), 
+                        'qty': ord_psbl_qty,  # 매매 일꾼은 이것만 봄 (무한루프 방지용)
+                        'hldg_qty': hldg_qty  # 주삐 탐정은 이것도 봄 (유령 오해 방지용)
                     }
         return holdings_dict
 
-    # --- KIS_Manager.py 맨 아래 덮어쓰기 ---
     def get_d2_deposit(self):
         try:
             # 1차 시도: 주문가능금액조회(8908 API)

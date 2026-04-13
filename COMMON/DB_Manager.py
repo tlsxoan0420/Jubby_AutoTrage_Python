@@ -165,7 +165,7 @@ class JubbyDB_Manager:
     # 🛡️ 다발적 덮어쓰기(executemany) 전용 Database is Locked 완벽 방어 래퍼
     # =======================================================================
     def execute_many_with_retry(self, db_path, delete_query, insert_query, data_list):
-        max_retries = 5
+        max_retries = 10
         for attempt in range(max_retries):
             conn = self._get_connection(db_path)
             try:
@@ -176,12 +176,13 @@ class JubbyDB_Manager:
                 conn.execute("COMMIT;")
                 return True
             except sqlite3.OperationalError as e:
-                conn.execute("ROLLBACK;")
-                if "locked" in str(e).lower() and attempt < max_retries - 1:
-                    time.sleep(0.05)
-                    continue
-                print(f"🚨 [DB 다중 쿼리 에러] {e}")
-                return False
+                if "locked" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        # 🔥 대기 시간을 0.05초 -> 0.1초로 늘려 DB가 숨쉴 틈을 더 줍니다.
+                        time.sleep(0.1) 
+                        continue
+                print(f"🚨 [DB 에러] {e} (Query: {delete_query})")
+                return None
             finally:
                 conn.close()
 
