@@ -235,6 +235,20 @@ class RealWebSocketWorker(QThread):
         
         self.sig_execution_msg.emit(f"📡 [{code}] 실시간 시세 추적 가동!", "info")
 
+    def unsubscribe_stock_realtime(self, code):
+        """ [추가] 매도 완료된 종목의 실시간 추적을 해제하여 40개 한도 꽉 참을 방지합니다. """
+        if not self.ws or not self.ws.sock or not self.ws.sock.connected: return
+        
+        # 🔥 tr_type "2"가 바로 '구독 해제(Unsubscribe)' 명령입니다.
+        self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "2", "content-type": "utf-8"},
+                                 "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}}}))
+        self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "2", "content-type": "utf-8"},
+                                 "body": {"input": {"tr_id": "H0STASP0", "tr_key": code}}}))
+        
+        if code in self.tracked_symbols:
+            self.tracked_symbols.remove(code)
+        self.sig_execution_msg.emit(f"🔌 [{code}] 매도 완료! 실시간 시세 추적 해제 (웹소켓 트래픽 확보)", "warning")
+
 # =====================================================================
 # 🖥️ Ticker UI 메인 윈도우
 # =====================================================================

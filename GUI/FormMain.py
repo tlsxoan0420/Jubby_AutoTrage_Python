@@ -1528,7 +1528,11 @@ class AutoTradeWorker(QThread):
                             db_temp.set_shared_setting("RISK", "IS_LOCKED", "Y")
                             self.sig_log.emit(f"🚨 [긴급 셧다운] {self.loss_streak_cnt}연패 또는 총 자산 대비 누적손실({asset_pnl_pct:.2f}%) 도달! 자동매매 방지를 위해 주삐 매수를 잠급니다.", "error")
                             
-                        if is_sell_all: sold_codes.append(code)
+                        if is_sell_all: 
+                            sold_codes.append(code)
+                            # 🔥 [추가] 전량 매도 시 웹소켓 추적을 즉시 해제합니다!
+                            if hasattr(self.mw, 'ticker_window') and self.mw.ticker_window:
+                                self.mw.ticker_window.ws_worker.unsubscribe_stock_realtime(code)
                         else:
                             self.mw.my_holdings[code]['qty'] -= sell_qty
                             self.mw.my_holdings[code]['half_sold'] = True
@@ -2381,8 +2385,10 @@ class FormMain(QtWidgets.QMainWindow):
 
     def load_real_holdings(self):
         try:
-            # 1. KIS API에서 현재 보유 잔고 긁어오기
-            self.my_holdings = self.api_manager.get_real_holdings()
+            # ✅ [수정된 코드] 자물쇠를 꽉 채우고 교체합니다!
+            with self.holdings_lock:
+                self.my_holdings = self.api_manager.get_real_holdings()
+
             if self.my_holdings:
                 self.add_log(f"💼 [보유 종목 로드] {len(self.my_holdings)}개 확인", "success")
             else: 
@@ -3078,7 +3084,7 @@ class FormMain(QtWidgets.QMainWindow):
 
                 if res_odno: # 매도 주문 성공 (주문번호를 받음)
                     # 💡 [버그 완벽 해결] 성급하게 수익금을 더하거나 종목을 지우지 않고, 웹소켓(Ticker)에게 체결 확인을 맡깁니다!
-                    profit_rate = ((curr_price - buy_price) / buy_price) * 100
+                    profit_rate = ((curr_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0.0
 
                     # 1. Ticker 창 및 로그에 '수동 매도 접수' 기록
                     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3261,13 +3267,16 @@ class FormMain(QtWidgets.QMainWindow):
         """ [신규] 재시작 시 DB에서 미체결 내역을 읽어와 표에 표시 (탐정이 취소할 수 있게 함) """
         try:
             conn = self.db._get_connection(self.db.shared_db_path)
-            # 🔥 [시간 잘림 수정] 여기도 맨 뒤의 time을 시:분:초만 가져오게 바꿉니다.
             cursor = conn.execute("SELECT order_no, symbol, symbol_name, type, price, quantity, filled_quantity, strftime('%H:%M:%S', time) FROM TradeHistory WHERE Status = '미체결'")
             rows = cursor.fetchall()
             conn.close()
             for row in rows:
-                # 🚀 [추가] 맨 뒤에 'is_restore': True 이름표를 달아줍니다!
-                self.sig_order_append.emit({'주문번호': str(row[0]), '종목코드': row[1], '종목명': row[2], '주문종류': row[3], '주문가격': f"{row[4]:,.0f}", '주문수량': row[5], '체결수량': row[6], '주문시간': row[7], '상태': '미체결', '수익률': '0.00%', 'is_restore': True})
+                self.append_order_table_slot({
+                    '주문번호': str(row[0]), '종목코드': row[1], '종목명': row[2], 
+                    '주문종류': row[3], '주문가격': f"{row[4]:,.0f}", '주문수량': row[5], 
+                    '체결수량': row[6], '주문시간': row[7], '상태': '미체결', 
+                    '수익률': '0.00%', 'is_restore': True
+                })
         except: pass
 
     def btnDataClearClickEvent(self): 
