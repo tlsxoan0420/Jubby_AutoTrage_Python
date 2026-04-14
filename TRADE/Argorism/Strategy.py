@@ -416,77 +416,95 @@ class JubbyStrategy:
         # -----------------------------------------------------------------
         # 🤖 [1단계] AI 모델 및 기술적 지표 1차 판독 (매수 탐색)
         # -----------------------------------------------------------------
-        if self.ai_model is not None:
-            features = self.get_ai_features(df)
-            if features is not None:
-                ai_prob = self.ai_model.predict_proba(features)[0][1]
-                try: ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
-                except: ai_threshold = 0.70
-                
-                if ai_prob >= ai_threshold:
-                    # 🔥 [1. VWAP 당일 세력 평단가 필터 적용]
-                    curr_vwap = float(current.get('VWAP', curr_price))
-                    
-                    if curr_price < curr_vwap:
-                        # 주가가 세력 평단가 아래면 찐반등이 아닐 확률이 높으므로 매수를 포기합니다.
-                        self.send_log(f"🛑 [VWAP 필터] {pretty_name} 주가({curr_price:,.0f}원)가 세력 평단가({curr_vwap:,.0f}원) 밑에 있습니다. 저항 돌파 불가로 매수 포기!", "warning")
-                        buy_signal = False
-                    else:
-                        # VWAP 위에 있다면 기존의 보조지표들을 체크하여 승인합니다.
-                        is_above_ma5 = curr_price >= current.get('MA5', curr_price)
-                        is_macd_good = current.get('MACD', 0) >= current.get('Signal_Line', 0)
-                        is_rsi_oversold = current.get('RSI', 50) <= 40.0 
+        buy_signal = False
+        ai_prob = 0.0
 
-                        if is_above_ma5 or is_macd_good or is_rsi_oversold:
-                            self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 포착! (확률: {ai_prob*100:.1f}%) ➔ VWAP 지지 확인 완료!", "success")
-                            buy_signal = True
+        if self.ai_model is not None:
+            try:
+                features = self.get_ai_features(df)
+                if features is not None:
+                    ai_prob = self.ai_model.predict_proba(features)[0][1]
+                    try: ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
+                    except: ai_threshold = 0.70
+                    
+                    if ai_prob >= ai_threshold:
+                        # 🔥 [1. VWAP 당일 세력 평단가 필터 적용]
+                        curr_vwap = float(current.get('VWAP', curr_price))
+                        
+                        if curr_price < curr_vwap:
+                            self.send_log(f"🛑 [VWAP 필터] {pretty_name} 주가({curr_price:,.0f}원)가 세력 평단가 아래에 위치. 탈락!", "warning")
+                            buy_signal = False
+                        else:
+                            is_above_ma5 = curr_price >= current.get('MA5', curr_price)
+                            is_macd_good = current.get('MACD', 0) >= current.get('Signal_Line', 0)
+                            is_rsi_oversold = current.get('RSI', 50) <= 40.0 
+
+                            if is_above_ma5 or is_macd_good or is_rsi_oversold:
+                                self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 포착! (확률: {ai_prob*100:.1f}%) ➔ VWAP 지지 확인 완료!", "success")
+                                buy_signal = True
+                            else:
+                                # 💡 [추가] 왜 1차에서 탈락했는지 사유를 밝힙니다.
+                                self.send_log(f"⚠️ [1차 보조지표 미달] {pretty_name} 확률({ai_prob*100:.1f}%)은 높으나 차트 지표(MA5/MACD) 불량으로 매수 포기.", "warning")
+            except Exception as e:
+                self.send_log(f"🚨 [1단계 연산 에러] {pretty_name} AI 판독 중 오류 발생: {e}", "error")
 
         # -----------------------------------------------------------------
         # 🛡️ [2단계] LSTM 시계열 패턴 방어막
         # -----------------------------------------------------------------
         if buy_signal:
-            if self.lstm_model is not None and self.scaler is not None and len(df) >= 10:
-                seq_features = self.get_ai_sequence_features(df, seq_length=10)
-                if seq_features is not None and len(seq_features) == 10:
-                    # 🔴 [여기를 추가하세요] 데이터 결측치(NaN)를 0으로 강제 변환
-                    seq_features = np.nan_to_num(seq_features, nan=0.0) 
-                    
-                    # 데이터 스케일링 (transform 사용)
-                    seq_features_scaled = self.scaler.transform(seq_features)
-                    
-                    # 🔴 [여기를 추가하세요] 값이 너무 튀지 않게 0~1 사이로 제한
-                    seq_features_scaled = np.clip(seq_features_scaled, 0.0, 1.0)
-                    
-                    seq_tensor = torch.tensor(seq_features_scaled, dtype=torch.float32).unsqueeze(0).to(self.device)
-                    
-                    with torch.no_grad():
-                        lstm_prob = self.lstm_model(seq_tensor).item()
-                    
-                    try: lstm_threshold = float(self.db.get_shared_setting("AI", "LSTM_THRESHOLD", "30.0")) / 100.0
-                    except: lstm_threshold = 0.30
+            if self.lstm_model is not None and self.scaler is not None:
+                if len(df) >= 10:
+                    try:
+                        seq_features = self.get_ai_sequence_features(df, seq_length=10)
+                        if seq_features is not None and len(seq_features) == 10:
+                            seq_features = np.nan_to_num(seq_features, nan=0.0) 
+                            seq_features_scaled = self.scaler.transform(seq_features)
+                            seq_features_scaled = np.clip(seq_features_scaled, 0.0, 1.0)
+                            seq_tensor = torch.tensor(seq_features_scaled, dtype=torch.float32).unsqueeze(0).to(self.device)
+                            
+                            with torch.no_grad():
+                                lstm_prob = self.lstm_model(seq_tensor).item()
+                            
+                            try: lstm_threshold = float(self.db.get_shared_setting("AI", "LSTM_THRESHOLD", "30.0")) / 100.0
+                            except: lstm_threshold = 0.30
 
-                    if lstm_prob < lstm_threshold:
-                        self.send_log(f"🛑 [LSTM 매수취소] {pretty_name} 패턴 불량 ({lstm_prob*100:.1f}%). 진입 포기!", "error")
+                            if lstm_prob < lstm_threshold:
+                                self.send_log(f"🛑 [LSTM 매수취소] {pretty_name} 패턴 불량 ({lstm_prob*100:.1f}%). 진입 포기!", "error")
+                                buy_signal = False 
+                            else:
+                                self.send_log(f"✅ [2차 승인] {pretty_name} 시계열 패턴 우수 ({lstm_prob*100:.1f}%)", "success")
+                        else:
+                            # 💡 [추가] 시퀀스 추출 실패 시 조용히 넘기지 않고 알림
+                            self.send_log(f"⚠️ [LSTM 취소] {pretty_name} 시퀀스 데이터 변환 실패.", "warning")
+                            buy_signal = False
+                    except Exception as e:
+                        self.send_log(f"🚨 [LSTM 연산 에러] {pretty_name} 분석 중 문제 발생: {e}", "error")
                         buy_signal = False 
-                    else:
-                        self.send_log(f"✅ [2차 승인] {pretty_name} 시계열 패턴 우수 ({lstm_prob*100:.1f}%)", "success")
+                else:
+                    # 💡 [추가] 수집된 데이터가 짧아서 분석을 못 했을 때 알림
+                    self.send_log(f"⚠️ [LSTM 취소] {pretty_name} 수집된 틱 데이터가 10개 미만이라 분석 불가.", "warning")
+                    buy_signal = False
 
         # -----------------------------------------------------------------
         # ⚖️ [3단계] 최종 관문: 실시간 호가 수급 + 체결강도 검사
         # -----------------------------------------------------------------
         if buy_signal:
-            # 1. 호가창 매도/매수 잔량 비율 검사 통과 시
-            if self.check_orderbook_imbalance(code):
-                # 🚀 2. 체결강도(진짜 돈이 들어오는지) 검사 통과 시 최종 진입!
-                if self.check_volume_power_and_money(code):
-                    self.send_log(f"🚀 [최종 승인] {pretty_name} 모든 조건 충족! 강력 매수 진입!", "success")
-                    try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "🔥 강력 매수 신호!")
-                    except: pass
-                    return "BUY" 
+            try:
+                # 1. 호가창 매도/매수 잔량 비율 검사 통과 시
+                if self.check_orderbook_imbalance(code):
+                    # 🚀 2. 체결강도(진짜 돈이 들어오는지) 검사 통과 시 최종 진입!
+                    if self.check_volume_power_and_money(code):
+                        self.send_log(f"🚀 [최종 승인] {pretty_name} 모든 조건 충족! 강력 매수 진입!", "success")
+                        try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "🔥 강력 매수 신호!")
+                        except: pass
+                        return "BUY" 
+                    else:
+                        buy_signal = False # (check_volume_power_and_money 함수 내부에 이미 취소 로그가 있습니다)
                 else:
-                    buy_signal = False # 체결강도 부족으로 탈락
-            else:
-                self.send_log(f"🛡️ [수급 불량 취소] {pretty_name} 매수 잔량 과다(개미 꼬시기). 진입 취소!", "warning")
+                    self.send_log(f"🛡️ [수급 불량 취소] {pretty_name} 매수 잔량 과다(개미 꼬시기). 진입 취소!", "warning")
+                    buy_signal = False
+            except Exception as e:
+                self.send_log(f"🚨 [3단계 수급 검사 에러] {pretty_name} 호가/체결강도 확인 중 오류 발생: {e}", "error")
                 buy_signal = False
 
         # -----------------------------------------------------------------

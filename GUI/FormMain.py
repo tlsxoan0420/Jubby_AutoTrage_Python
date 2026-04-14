@@ -347,8 +347,8 @@ class SellGuardianWorker(QThread):
                 self.sig_log.emit(f"🚨 [{stock_name}] 매도할 잔고 없음. 보유목록에서 삭제합니다.", "error")
                 return "ALREADY_SOLD" 
             
-            if "초과" in error_msg or "초당" in error_msg: time.sleep(1.5)
-            else: time.sleep(retry_delay) 
+            if "초과" in error_msg or "초당" in error_msg: time.sleep(0.4) 
+            else: time.sleep(retry_delay)
             if not self.is_running and not getattr(self.mw, 'panic_mode', False): break
         return None
 
@@ -579,10 +579,22 @@ class SellGuardianWorker(QThread):
         # 🚀 [원본 복구 3] 1분 브리핑 출력 (전체 자산 현황 계산)
         if not hasattr(self, 'last_brief_min'): self.last_brief_min = -1
         
+        # 🌟 [여기서부터 1분 타이머 바깥입니다!] 0.1초마다 실시간 자산을 계산해서 DB에 넘깁니다.
+        total_unrealized_profit = total_current_val - total_invested
+        total_asset = my_cash + total_current_val
+        
+        try:
+            # db_temp는 위에서 이미 선언되어 있으므로 그대로 사용합니다.
+            db_temp.set_shared_setting("ACCOUNT", "TOTAL_ASSET", str(int(total_asset)))
+            db_temp.set_shared_setting("ACCOUNT", "UNREALIZED_PROFIT", str(int(total_unrealized_profit)))
+            db_temp.set_shared_setting("ACCOUNT", "CASH", str(int(my_cash)))
+        except: 
+            pass
+
+        # ---------------------------------------------------------
+        # 📊 [1분 브리핑 출력 로직] (여기서부터는 1분에 1번만 실행됨)
+        # ---------------------------------------------------------
         if now.minute != self.last_brief_min:
-            total_unrealized_profit = total_current_val - total_invested
-            total_asset = my_cash + total_current_val
-            
             # 🔥 [버그 완벽 해결] 에러 나던 코드를 지우고, 위에서 계산 완료된 UI 표 데이터를 그대로 가져와서 씁니다!
             brief_details = ""
             for row in unified_account_rows:
@@ -596,7 +608,10 @@ class SellGuardianWorker(QThread):
             try: d2_cash = self.mw.api_manager.get_d2_deposit()
             except: d2_cash = 0
             
-            msg = f"📊 [주삐 1분 브리핑] {now.strftime('%H:%M')}\n    💎 자산: {int(total_asset):,}원 (D+2 예수금: {d2_cash:,}원)\n    📈 누적손익: {int(self.mw.cumulative_realized_profit):+,}원 | 보유손익: {int(total_unrealized_profit):+,}원"
+            # 🔥 누적손익은 메인 메모리에서 최신 값을 즉시 가져옵니다.
+            realized_profit = getattr(self.mw, 'cumulative_realized_profit', getattr(self, 'cumulative_realized_profit', 0))
+            
+            msg = f"📊 [주삐 1분 브리핑] {now.strftime('%H:%M')}\n    💎 자산: {int(total_asset):,}원 (D+2 예수금: {d2_cash:,}원)\n    📈 누적손익: {int(realized_profit):+,}원 | 보유손익: {int(total_unrealized_profit):+,}원"
             
             if brief_details:
                 msg += f"\n\n{brief_details.rstrip()}"
@@ -2672,7 +2687,7 @@ class FormMain(QtWidgets.QMainWindow):
 
             # 💸 [리스크 및 컷오프(손/익절) 설정] (이 부분을 찾아서 아래처럼 덮어쓰거나 추가하세요)
             ("TRADE", "PROFIT_RATE", "2.0", "기본 기계적 익절 라인 (%) - 초단타용"),
-            ("TRADE", "STOP_RATE", "1.0", "기본 기계적 손절 라인 (%) - 밀림 방지용 짧은 손절"),
+            ("TRADE", "STOP_RATE", "1.5", "기본 기계적 손절 라인 (%) - 밀림 방지용 짧은 손절"),
             ("TRADE", "TRAILING_STOP_GAP", "0.5", "최고점 대비 하락 허용 폭 (%) - 0.5%만 꺾여도 즉시 익절"),
             ("TRADE", "STRAT_PROFIT_PRESERVE", "1.0", "전략 매도 시 최소 수익 보존 라인 (%)"),
         ]
@@ -3062,34 +3077,25 @@ class FormMain(QtWidgets.QMainWindow):
                         break # 기타 알 수 없는 에러도 포기
 
                 if res_odno: # 매도 주문 성공 (주문번호를 받음)
-                    # 🚀 [추가] 실현 손익 계산 ( (현재가 - 매수가) * 수량 )
-                    realized_profit = (curr_price - buy_price) * qty
+                    # 💡 [버그 완벽 해결] 성급하게 수익금을 더하거나 종목을 지우지 않고, 웹소켓(Ticker)에게 체결 확인을 맡깁니다!
                     profit_rate = ((curr_price - buy_price) / buy_price) * 100
 
-                    # 🚀 [완벽 복구] 옛날 trade_worker 대신 현재 메인 시스템의 누적 수익에 직접 더합니다!
-                    self.cumulative_realized_profit += realized_profit
-                    self.daily_total_pnl_pct += profit_rate 
-                    self.db.set_shared_setting("ACCOUNT", "CUMULATIVE_REALIZED_PROFIT", str(self.cumulative_realized_profit))
-
-                    # 5. 내부 관리 목록에서 삭제 및 UI 갱신
-                    del self.my_holdings[code]
-                    self.tbAccount.removeRow(row)
-                    
-                    # 6. Ticker 창 및 로그에 '수동 판매 완료' 기록
+                    # 1. Ticker 창 및 로그에 '수동 매도 접수' 기록
                     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    msg = f"🚨 [수동 매도 완료] {stock_name} | {curr_price:,.2f}원 | 손익: {int(realized_profit):+,}원 ({profit_rate:.2f}%)"
-                    self.add_log(msg, "sell")
+                    msg = f"📝 [수동 매도 접수] {stock_name} | 매도 주문이 거래소에 전달되었습니다. (체결 대기 중)"
+                    self.add_log(msg, "info")
                     
                     try:
-                        self.db.insert_trade_history(res_odno, code, "SELL", curr_price, qty, profit_rate, status="체결완료", filled_qty=qty)
+                        # 2. DB에 '미체결' 상태로 기록
+                        self.db.insert_trade_history(res_odno, code, "SELL", curr_price, qty, profit_rate, status="미체결", filled_qty=0)
                         conn = self.db._get_connection(self.db.shared_db_path)
                         conn.execute("UPDATE TradeHistory SET symbol_name = ? WHERE order_no = ?", (stock_name, res_odno))
                         conn.commit()
                         conn.close()
                     except Exception as e:
-                        print(f"수동 매도 DB 기록 에러: {e}")
+                        pass
 
-                    # 🚀 [완벽 복구] 주문 내역 표(tbOrder)에 즉시 띄우기
+                    # 3. 주문 내역 표(tbOrder)에 '미체결'로 띄우기
                     self.append_order_table_slot({
                         '주문번호': res_odno,
                         '종목코드': code, 
@@ -3097,9 +3103,9 @@ class FormMain(QtWidgets.QMainWindow):
                         '주문종류': '수동매도', 
                         '주문가격': f"{curr_price:,.0f}", 
                         '주문수량': qty, 
-                        '체결수량': qty,            
+                        '체결수량': 0,            
                         '주문시간': now_str, 
-                        '상태': '체결완료',          
+                        '상태': '미체결',          
                         '수익률': f"{profit_rate:.2f}%" 
                     })
                 else:
@@ -3193,7 +3199,9 @@ class FormMain(QtWidgets.QMainWindow):
         elif event.type() == QtCore.QEvent.Leave: source.setStyleSheet("background-color: rgb(5,5,10); color: Silver;")
         return super().eventFilter(source, event)
         
-    def btnCloseClickEvent(self): QtWidgets.QApplication.quit()         
+    def btnCloseClickEvent(self): 
+        QtWidgets.QApplication.quit() 
+        os._exit(0)        
     def btnDataCreatClickEvent(self): pass
     def generate_and_send_mock_data(self): pass
     

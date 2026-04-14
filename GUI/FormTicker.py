@@ -306,7 +306,7 @@ class FormTicker(QtWidgets.QWidget):
             print(f"Ticker DB 저장 실패: {e}")
 
     def update_main_ui_order(self, exec_data):
-        """ [최종 완성본] 무한 렉 및 DB 충돌 완벽 해결 버전 """
+        """ [최종 완성본] 무한 렉, DB 충돌 및 프로그램 강제종료 완벽 해결 버전 """
         if not self.main_ui: return
         
         target_ono = str(exec_data.get('주문번호')) 
@@ -348,42 +348,41 @@ class FormTicker(QtWidgets.QWidget):
         finally:
             if 'conn' in locals() and conn: conn.close()
 
-        # 🌟 3. UI(표) 업데이트 로직
-        table = self.main_ui.tbOrder
-        headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+        # =========================================================================
+        # 🌟 3. [GUI 튕김 방지 완벽 적용] 화면을 직접 보지 않고 DB에서 정보 꺼내오기
+        # =========================================================================
+        # ❌ 일꾼이 UI(table)를 직접 만지면 프로그램이 튕깁니다! 화면 조작 코드 전부 삭제됨.
+        # ✅ 대신, 방금 전 DB에 저장된 종목명과 주문 종류를 안전하게 읽어옵니다.
+        order_type = "알수없음"
+        stock_name = target_symbol
+
         try:
-            ono_col = headers.index('주문번호'); stat_col = headers.index('상태')
-            qty_col = headers.index('체결수량'); price_col = headers.index('주문가격')
-        except: return
+            conn = self.db._get_connection(self.db.shared_db_path)
+            cursor = conn.execute("SELECT type, symbol_name FROM TradeHistory WHERE order_no = ?", (target_ono,))
+            row = cursor.fetchone()
+            if row:
+                order_type = row[0] # 예: "SELL" 또는 "BUY"
+                stock_name = row[1] # 예: "삼성전자"
+        except: pass
+        finally:
+            if 'conn' in locals() and conn: conn.close()
 
-        for row in range(table.rowCount() - 1, -1, -1):
-            ono_item = table.item(row, ono_col)
-            if ono_item and ono_item.text() == target_ono:
-                status_item = table.item(row, stat_col)
-                if status_item and status_item.text() == db_status: break 
-
-                if status_item and status_item.text() in ["미체결", "부분체결"]:
-                    # 🚀 [완벽 수정 2] 일꾼이 UI를 직접 만지면 프로그램이 팅깁니다! 강제 조작 코드 삭제!
-                    # DB에 값은 이미 써뒀으니, 메인 UI한테 "안전하게 표 다시 그려!"라고 지시만 내리고 빠집니다.
-                    if self.main_ui:
-                        QtCore.QMetaObject.invokeMethod(self.main_ui, "refresh_order_table", QtCore.Qt.QueuedConnection)
-                    
-                    order_type = table.item(row, headers.index('주문종류')).text()
-                    stock_name = table.item(row, headers.index('종목명')).text()
-                    
-                    # (아래 로그 출력과 구독 코드는 기존과 완벽히 동일하게 유지)
-                    if is_cancel:
-                        self.add_ticker_log(f"🗑️ [취소완료] {stock_name} | 30초 경과 주문 정리됨", "warning")
-                    else:
-                        prefix = "🕵️‍♂️ [누락복구]" if is_detective else "💰 [체결알림]"
-                        log_icon = "🔵" if "매수" in order_type or "불타기" in order_type else "🔴"
-                        self.add_ticker_log(f"{prefix} {log_icon} {stock_name} | {db_status} | {real_price:,.0f}원 | {filled_qty}주", "success")
-                    
-                    if db_status == "체결완료" and not is_cancel:
-                        if target_symbol not in self.ws_worker.tracked_symbols:
-                            self.ws_worker.subscribe_stock_realtime(target_symbol)
-                            self.ws_worker.tracked_symbols.add(target_symbol)
-                    break
+        # 🚀 [완벽 수정] 사장님(Main UI)에게 "안전하게 표 새로고침 해주세요!" 라고 메모만 던지고 도망갑니다.
+        if self.main_ui:
+            QtCore.QMetaObject.invokeMethod(self.main_ui, "refresh_order_table", QtCore.Qt.QueuedConnection)
+        
+        # 🌟 4. 안전하게 가져온 정보로 로그 출력 및 웹소켓 구독 시작
+        if is_cancel:
+            self.add_ticker_log(f"🗑️ [취소완료] {stock_name} | 30초 경과 주문 정리됨", "warning")
+        else:
+            prefix = "🕵️‍♂️ [누락복구]" if is_detective else "💰 [체결알림]"
+            log_icon = "🔵" if "BUY" in order_type or "매수" in order_type or "불타기" in order_type else "🔴"
+            self.add_ticker_log(f"{prefix} {log_icon} {stock_name} | {db_status} | {real_price:,.0f}원 | {filled_qty}주", "success")
+        
+        if db_status == "체결완료" and not is_cancel:
+            if target_symbol not in self.ws_worker.tracked_symbols:
+                self.ws_worker.subscribe_stock_realtime(target_symbol)
+                self.ws_worker.tracked_symbols.add(target_symbol)
                 
     def snap_to_main(self):
         if not self.main_ui: return
