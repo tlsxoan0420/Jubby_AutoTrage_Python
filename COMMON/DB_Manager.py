@@ -239,29 +239,38 @@ class JubbyDB_Manager:
 
     def update_strategy_table(self, data_list):
         if not data_list: return
-        conn = self._get_connection(self.shared_db_path)
-        try:
-            conn.execute("BEGIN TRANSACTION;")
-            # 🔥 [핵심 수정] REPLACE INTO는 기존 줄을 삭제해버리므로 메시지가 날아갑니다.
-            # INSERT ... ON CONFLICT를 사용하여 'status_msg'는 절대로 덮어쓰지 않게 보호합니다!
-            conn.executemany('''
-                INSERT INTO StrategyStatus (symbol, symbol_name, ai_prob, ma_5, ma_20, RSI, macd, signal, status_msg) 
-                VALUES (:symbol, :symbol_name, :ai_prob, :ma_5, :ma_20, :RSI, :macd, :signal, :status_msg)
-                ON CONFLICT(symbol) DO UPDATE SET
-                ai_prob=excluded.ai_prob, ma_5=excluded.ma_5, ma_20=excluded.ma_20, 
-                RSI=excluded.RSI, macd=excluded.macd, signal=excluded.signal
-            ''', data_list)
-            conn.execute("COMMIT;")
-        except Exception:
-            conn.execute("ROLLBACK;")
-        finally:
-            conn.close()
-    def update_realtime(self, symbol, current_price, ai_score, holding_str, status_msg):
-        conn = self._get_connection(self.shared_db_path)
-        try:
-            conn.execute("UPDATE StrategyStatus SET ai_prob = ?, status_msg = ? WHERE symbol = ?", (ai_score, status_msg, symbol))
-        except Exception: pass
-        finally: conn.close()
+        
+        # 🛡️ [수정] 다중 스레드 환경에서 락(Lock)이 걸렸을 때 데이터 유실을 막기 위해 
+        # 최대 5번까지 0.1초 간격으로 재시도하는 강력한 방어막을 추가했습니다.
+        max_retries = 5
+        
+        for attempt in range(max_retries):
+            conn = self._get_connection(self.shared_db_path)
+            try:
+                conn.execute("BEGIN TRANSACTION;")
+                # 🔥 REPLACE INTO 대신 INSERT ON CONFLICT를 사용하여, 기존의 status_msg(상태 메시지)가 
+                # 덮어씌워져 날아가는 현상을 완벽하게 방지합니다!
+                conn.executemany('''
+                    INSERT INTO StrategyStatus (symbol, symbol_name, ai_prob, ma_5, ma_20, RSI, macd, signal, status_msg) 
+                    VALUES (:symbol, :symbol_name, :ai_prob, :ma_5, :ma_20, :RSI, :macd, :signal, :status_msg)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                    ai_prob=excluded.ai_prob, ma_5=excluded.ma_5, ma_20=excluded.ma_20, 
+                    RSI=excluded.RSI, macd=excluded.macd, signal=excluded.signal
+                ''', data_list)
+                conn.execute("COMMIT;")
+                return # 성공적으로 저장했으면 즉시 함수 탈출
+                
+            except sqlite3.OperationalError as e:
+                conn.execute("ROLLBACK;") # 에러가 나면 찌꺼기가 남지 않게 무조건 롤백
+                # 에러 원인이 'locked'(잠김) 이라면 숨 고르고 다시 시도
+                if "locked" in str(e).lower() and attempt < max_retries - 1:
+                    time.sleep(0.1) # 0.1초 대기 후 다시 문 두드리기
+                    continue
+                # 락 에러가 아니거나 최대 횟수를 초과하면 로그 출력 후 포기
+                print(f"🚨 [DB 에러] 전략 상태 테이블 업데이트 실패: {e}")
+                break
+            finally:
+                conn.close() # 통로는 무조건 닫아줌 (메모리 누수 방지)
 
     def insert_price_history(self, symbol, price):
         conn = self._get_connection(self.shared_db_path)

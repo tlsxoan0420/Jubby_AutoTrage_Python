@@ -364,34 +364,38 @@ class KIS_API:
                 
         return False
     
-    # --- KIS_Manager.py 맨 아래 덮어쓰기 ---
+    # =====================================================================
+    # [수정] KIS_API 클래스 내부 (통신 전담)
+    # =====================================================================
     def get_d2_deposit(self):
         try:
             # 1차 시도: 주문가능금액조회(8908 API)
             headers = {
                 "content-type": "application/json; charset=utf-8",
-                "authorization": f"Bearer {self.api.access_token}",
-                "appkey": self.api.app_key, "appsecret": self.api.app_secret,
-                "tr_id": "VTTC8908R" if self.api.is_mock else "TTTC8908R", "custtype": "P"
+                # 🔥 self.access_token 과 self.app_key 를 사용하는 것이 맞습니다!
+                "authorization": f"Bearer {self.access_token}",
+                "appkey": self.app_key, "appsecret": self.app_secret,
+                "tr_id": "VTTC8908R" if self.is_mock else "TTTC8908R", "custtype": "P"
             }
             params = {
-                "CANO": self.api.account_no[:8],
-                "ACNT_PRDT_CD": self.api.account_no[8:] if len(self.api.account_no) > 8 else "01",
+                "CANO": self.account_no[:8],
+                "ACNT_PRDT_CD": self.account_no[8:] if len(self.account_no) > 8 else "01",
                 "PDNO": "005930", "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N"
             }
-            res = requests.get(f"{self.api.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order", headers=headers, params=params, timeout=5)
+            res = requests.get(f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order", headers=headers, params=params, timeout=5)
             data = res.json()
             d2_val = int(float(data.get("output", {}).get("n2_dn_expect_cash_amt", "0")))
 
             # 💡 만약 0원이라면? 2차 예비 수단(8434 API) 가동
             if d2_val <= 0:
-                headers["tr_id"] = "VTTC8434R" if self.api.is_mock else "TTTC8434R"
-                res2 = requests.get(f"{self.api.base_url}/uapi/domestic-stock/v1/trading/inquire-balance", headers=headers, params=params, timeout=5)
+                headers["tr_id"] = "VTTC8434R" if self.is_mock else "TTTC8434R"
+                res2 = requests.get(f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance", headers=headers, params=params, timeout=5)
                 d2_val = int(float(res2.json().get("output2", [{}])[0].get("prcs_arrc_excc_amt", "0")))
 
             return d2_val
         except:
             return 0
+        
 # =====================================================================
 # 👔 [2] KIS_Manager 클래스 (사용자 편의용 래퍼 클래스)
 # =====================================================================
@@ -482,33 +486,7 @@ class KIS_Manager:
                     }
         return holdings_dict
 
-    def get_d2_deposit(self):
-        try:
-            # 1차 시도: 주문가능금액조회(8908 API)
-            headers = {
-                "content-type": "application/json; charset=utf-8",
-                "authorization": f"Bearer {self.api.access_token}",
-                "appkey": self.api.app_key, "appsecret": self.api.app_secret,
-                "tr_id": "VTTC8908R" if self.api.is_mock else "TTTC8908R", "custtype": "P"
-            }
-            params = {
-                "CANO": self.api.account_no[:8],
-                "ACNT_PRDT_CD": self.api.account_no[8:] if len(self.api.account_no) > 8 else "01",
-                "PDNO": "005930", "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N"
-            }
-            res = requests.get(f"{self.api.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order", headers=headers, params=params, timeout=5)
-            data = res.json()
-            d2_val = int(float(data.get("output", {}).get("n2_dn_expect_cash_amt", "0")))
-
-            # 💡 만약 0원이라면? 2차 예비 수단(8434 API) 가동
-            if d2_val <= 0:
-                headers["tr_id"] = "VTTC8434R" if self.api.is_mock else "TTTC8434R"
-                res2 = requests.get(f"{self.api.base_url}/uapi/domestic-stock/v1/trading/inquire-balance", headers=headers, params=params, timeout=5)
-                d2_val = int(float(res2.json().get("output2", [{}])[0].get("prcs_arrc_excc_amt", "0")))
-
-            return d2_val
-        except:
-            return 0
-
     def fetch_minute_data(self, code): return self.api.fetch_minute_data(code)
     def cancel_order(self, order_no): return self.api.cancel_order(order_no)
+    # 🚀 [완벽 수정] 길고 복잡했던 코드를 싹 지우고, 단순히 api의 함수를 불러오기만 합니다!
+    def get_d2_deposit(self): return self.api.get_d2_deposit()

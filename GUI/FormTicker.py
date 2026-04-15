@@ -172,16 +172,18 @@ class RealWebSocketWorker(QThread):
             # 🚨 [수정 전] 무조건 바구니에 밀어넣음 (바구니가 꽉 차면 여기서 프로그램이 영원히 멈춤/데드락)
             # self.msg_queue.put(message)
 
-            # 💡 [수정 후] 바구니가 꽉 찼으면, 가장 오래된 쓸모없는 데이터를 1개 버리고 방금 온 최신 데이터를 넣습니다!
             try:
                 # put_nowait은 대기하지 않고 즉시 넣습니다.
                 self.msg_queue.put_nowait(message)
             except queue.Full:
                 # 바구니가 꽉 찼다면? (큐 처리 속도보다 데이터 들어오는 속도가 빠를 때)
                 try:
+                    # 🛡️ [수정] 여러 스레드가 동시에 버리려고 할 때 발생하는 Empty 에러까지 안전하게 무시합니다.
                     self.msg_queue.get_nowait()          # 1. 젤 오래된 데이터 1개를 버림
                     self.msg_queue.put_nowait(message)   # 2. 방금 들어온 따끈따끈한 새 데이터를 넣음
-                except:
+                except queue.Empty:
+                    pass
+                except queue.Full:
                     pass
 
         def on_open(ws):
