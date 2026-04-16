@@ -3,6 +3,7 @@ import os
 import datetime
 import pandas as pd  
 import time
+import random  # 🚀 [추가] 스레드 충돌 분산을 위한 랜덤 모듈
 
 # 방금 만든 공통 경로를 불러옵니다.
 from COMMON.Flag import SystemConfig 
@@ -282,9 +283,18 @@ class JubbyDB_Manager:
     def insert_log(self, log_level, message):
         conn = self._get_connection(self.shared_db_path)
         try:
-            conn.execute("INSERT INTO SharedLogs (log_level, message) VALUES (?, ?)", (log_level, message))
-        except Exception as e: print(f"로그 기록 중 에러: {e}")
-        finally: conn.close()
+            # 🚀 [추가] 파이썬에서 한국 시간(KST)을 정확히 계산합니다!
+            kst_now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)
+            time_str = kst_now.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 🚀 [핵심 수정] DB가 멋대로 시간을 찍게 두지 않고, 우리가 만든 'time_str'을 명시적으로 집어넣습니다.
+            conn.execute("INSERT INTO SharedLogs (log_level, message, created_at) VALUES (?, ?, ?)", 
+                         (log_level, message, time_str))
+            conn.commit()
+        except Exception as e: 
+            print(f"로그 기록 중 에러: {e}")
+        finally: 
+            conn.close()
 
     def insert_trade_history(self, order_no, symbol, trade_type, price, qty, yield_rate=0.0, status="미체결", filled_qty=0):
         """ 주문 내역을 DB에 동적으로 상태를 지정하여 기록 """
@@ -406,17 +416,18 @@ class JubbyDB_Manager:
     def execute_with_retry(self, db_path, query, params=(), fetch=None):
         """
         [상세 설명]
-        모든 DB 읽기/쓰기를 이 함수를 거치게 하여, 동시 다발적 접근으로 인한 
-        잠김(Lock) 발생 시 튕기지 않고 자동으로 0.05초 대기 후 재시도합니다.
-        
-        - fetch='one' : 결과 1개만 가져올 때 (fetchone)
-        - fetch='all' : 결과 전부를 가져올 때 (fetchall)
-        - fetch=None  : 읽어올 결과가 없을 때 (INSERT, UPDATE, DELETE 용)
+        동시 다발적 접근으로 인한 잠김(Lock) 발생 시 튕기지 않고 자동으로 대기 후 재시도합니다.
         """
-        max_retries = 5 # 최대 5번(총 0.25초)까지 문을 두드림
+        # 🚀 [수정 1] 스레드가 몰릴 때를 대비해 최대 30번(약 3~4초)까지 문을 두드리도록 대폭 증가!
+        max_retries = 30 
         
         for attempt in range(max_retries):
-            conn = self._get_connection(db_path)
+            # 🚀 [수정 2] timeout=15.0 옵션을 주어 SQLite 자체적으로도 15초간 락 해제를 기다리게 합니다.
+            conn = sqlite3.connect(db_path, timeout=15.0) 
+            
+            # WAL 모드 강제 적용 (기존 코드와 동일)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            
             try:
                 cursor = conn.execute(query, params)
                 
@@ -426,6 +437,7 @@ class JubbyDB_Manager:
                 elif fetch == 'all':
                     result = cursor.fetchall()
                 else:
+                    conn.commit() # 쓰기 작업 후에는 확실히 커밋 도장 꽝!
                     result = cursor.rowcount # 반영된 줄 수 리턴
                     
                 return result # 성공하면 즉시 결과 돌려주고 함수 종료!
@@ -434,10 +446,14 @@ class JubbyDB_Manager:
                 # 2. 에러가 났는데 만약 "Locked" (잠김) 이라면?
                 if "locked" in str(e).lower():
                     if attempt < max_retries - 1:
-                        time.sleep(0.05) # 0.05초만 숨 고르고 다시 시도(continue)
+                        # 🚀 [핵심 수정 3] 모든 스레드가 똑같은 시간에 깨어나서 다시 충돌하는 것을 막기 위해
+                        # 0.05초 ~ 0.15초 사이의 '랜덤(Random)'한 시간만큼 대기하도록 분산시킵니다!
+                        time.sleep(random.uniform(0.05, 0.15))
                         continue
-                # 3. 잠김 에러가 아니거나, 3번 다 실패하면 에러를 무시하고 None 반환
-                print(f"🚨 [DB 에러] {e} (Query: {query})")
+                
+                # 락 에러가 아니거나, 30번 다 실패하면 로그 출력 (실제로는 여기까지 안 옵니다)
+                print(f"🚨 [DB 락 에러] 쿼리 실행 실패: {e}")
                 return None
             finally:
-                conn.close() # 성공하든 실패하든 무조건 닫아줌
+                if conn:
+                    conn.close() # 작업이 끝난 통로는 무조건 닫아서 다른 스레드에게 양보

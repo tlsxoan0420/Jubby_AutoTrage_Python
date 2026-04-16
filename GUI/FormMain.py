@@ -166,7 +166,7 @@ class AITrainerWorker(QThread):
     def emit_log(self, msg, level="info"): self.sig_log.emit(msg, level)
 
 # =====================================================================
-# 🕵️‍♂️ [전담반] 주삐 탐정 스레드 (5초마다 미체결 강제 동기화)
+# 🕵️‍♂️ [전담반] 주삐 탐정 스레드 (부분체결 완벽 계산 및 동기화)
 # =====================================================================
 class DetectiveWorker(QThread):
     sig_log = pyqtSignal(str, str)
@@ -177,142 +177,149 @@ class DetectiveWorker(QThread):
         self.is_running = True
 
     def run(self):
-        self.sig_log.emit("🕵️‍♂️ [주삐 탐정] 24시간 미체결 감시 전담반 가동 시작!", "info")
+        self.sig_log.emit("🕵️‍♂️ [주삐 탐정] 24시간 부분체결 및 미체결 동기화 전담반 가동!", "info")
         while self.is_running:
-            time.sleep(5.0) # 5초마다 끈질기게 감시
-            try: self.cross_check_logic()
+            time.sleep(5.0) 
+            try: self.smart_cross_check_logic()
             except Exception: pass
 
-    def cross_check_logic(self):
-        unfilled_orders = []
-        # 🌟 [병목 해결] SELECT 작업 후 0.1초 만에 즉시 연결 끊기 (락 원천 차단)
+    def smart_cross_check_logic(self):
+        """ [탐정 전담반] 취소/체결 꼬임 방지를 위한 초정밀 검수 로직 """
+        unfilled_orders_db = []
         try:
             conn = self.mw.db._get_connection(self.mw.db.shared_db_path)
+            # 1. DB에서 '미체결' 상태인 주문만 싹 가져옵니다.
             cursor = conn.execute("SELECT order_no, symbol, type, quantity, price, time FROM TradeHistory WHERE Status = '미체결'")
-            unfilled_orders = cursor.fetchall()
-        except Exception as e: 
-            # 🔥 [수정] DB 조회 실패 시 원인을 파악할 수 있도록 반드시 로그를 남깁니다.
-            self.sig_log.emit(f"⚠️ [탐정단] 미체결 조회 중 DB 접근 실패 (사유: {e})", "warning")
-            return
-        finally:
-            if 'conn' in locals() and conn: conn.close()
+            unfilled_orders_db = cursor.fetchall()
+            conn.close()
+        except: return
 
-        if not unfilled_orders: return
-        
+        if not unfilled_orders_db: return
+
+        # 🔍 KIS 서버에서 실제 보유 잔고(체결 결과)를 실시간으로 긁어옵니다. (교차 검증용)
         try: real_holdings = self.mw.api_manager.get_real_holdings()
-        except: real_holdings = {}
+        except: return 
 
-        for order_no, symbol, o_type, qty, price, order_time_str in unfilled_orders:
+        now_time = datetime.now()
+
+        for db_order_no, symbol, o_type, qty, price, order_time_str in unfilled_orders_db:
             stock_name = self.mw.DYNAMIC_STOCK_DICT.get(symbol, symbol)
+            try: order_time = datetime.strptime(order_time_str, '%Y-%m-%d %H:%M:%S')
+            except: continue
             
-            # ⏰ 30초 취소 로직
-            try:
-                order_time = datetime.strptime(order_time_str, '%Y-%m-%d %H:%M:%S')
-                elapsed_seconds = (datetime.now() - order_time).total_seconds()
+            elapsed_seconds = (now_time - order_time).total_seconds()
+
+            # 🚀 [상황 1] 30초가 지난 미체결 주문은 '강제 취소' 대상
+            if elapsed_seconds > 30:
+                # 📝 [로그 강화] 취소 프로세스 진입 알림
+                self.sig_log.emit(f"⏳ [{stock_name}] 30초 경과 미체결 감지! 거래소에 주문 취소를 요청합니다...", "warning")
                 
-                if elapsed_seconds > 30:
-                    # 🚀 [추가] 너무 잦은 취소 시도 방지 (5초 쿨타임)
-                    if getattr(self, 'last_cancel_try', {}).get(order_no, 0) > time.time() - 5:
-                        continue
+                res = self.mw.api_manager.cancel_order(db_order_no) 
+                
+                if res == "DONE":
+                    # 1. DB 업데이트
+                    self._update_status_safely(db_order_no, "주문취소", 0, float(price))
                     
-                    self.sig_log.emit(f"⏳ [주문 취소] {stock_name} 주문 후 30초 경과. 취소 요청...", "warning")
-                    
-                    cancel_ok = False
-                    if hasattr(self.mw.api_manager, 'cancel_order'):
-                        try: 
-                            cancel_ok = self.mw.api_manager.cancel_order(order_no)
-                        except Exception as e: 
-                            self.sig_log.emit(f"🚨 취소 API 호출 에러: {e}", "error")
-                            cancel_ok = False
-                    
-                    if not getattr(self, 'last_cancel_try', None): self.last_cancel_try = {}
-                    self.last_cancel_try[order_no] = time.time()
-                    
-                    # 🚀 [핵심 방어막] 취소 실패 시, 한투 서버에 크로스 체크 (유령 주문 색출!)
-                    if not cancel_ok:
-                        try:
-                            # 1. 서버의 '진짜 미체결 리스트' 가져오기
-                            if hasattr(self.mw.api_manager, 'api') and hasattr(self.mw.api_manager.api, 'get_unfilled_orders'):
-                                real_unfilled = self.mw.api_manager.api.get_unfilled_orders()
+                    # 🔥 [치명적 버그 완벽 수정] 취소된 수량만큼 내 주머니(my_holdings)에서 반드시 빼주어야 합니다! (롤백)
+                    with self.mw.holdings_lock:
+                        if o_type == "BUY" and symbol in self.mw.my_holdings:
+                            current_qty = self.mw.my_holdings[symbol].get('qty', 0)
+                            new_qty = current_qty - int(qty)
+                            if new_qty <= 0:
+                                del self.mw.my_holdings[symbol] # 다 취소됐으면 주머니에서 아예 삭제
                             else:
-                                real_unfilled = self.mw.api_manager.get_unfilled_orders()
-                                
-                            # 2. 현재 취소하려는 주문번호가 서버에 남아있는지 검사
-                            is_exist = any(str(o.get('주문번호', '')) == str(order_no) for o in real_unfilled)
-                            
-                            if not is_exist:
-                                self.sig_log.emit(f"👻 [{stock_name}] 한투 서버에 미체결 내역 없음! 유령 주문을 삭제합니다.", "success")
-                                cancel_ok = True # 억지로 True로 바꿔서 아래의 DB 삭제 로직을 타게 함
-                            else:
-                                self.sig_log.emit(f"⚠️ [{stock_name}] 주문취소 거절 (서버 오류). 다음 턴에 재시도합니다.", "warning")
-                                continue
-                        except Exception as e:
-                            self.sig_log.emit(f"⚠️ 서버 크로스 체크 중 에러. 다음 턴에 재시도합니다.", "warning")
-                            continue
-                    else:
-                        self.sig_log.emit(f"✅ [{stock_name}] 악성 미체결 주문 취소 완료!", "success")
+                                self.mw.my_holdings[symbol]['qty'] = new_qty # 일부만 취소됐으면 수량만 감소
                     
-                    # 🌟 2. 취소 상태 DB 안전하게 덮어쓰기 & 주머니 정리
-                    if cancel_ok:
-                        up_conn = None
-                        try:
-                            up_conn = self.mw.db._get_connection(self.mw.db.shared_db_path)
-                            up_conn.execute("UPDATE TradeHistory SET Status = '주문취소' WHERE order_no = ?", (order_no,))
-                            up_conn.commit()
-                        except: pass
-                        finally:
-                            if up_conn: up_conn.close()
-# -------------------------------------------------------------
-                        # 🔥 [수정 1] 유령 업데이트 방지 및 스레드 자물쇠(Lock) 적용!
-                        # -------------------------------------------------------------
-                        with self.mw.holdings_lock:
-                            if symbol in self.mw.my_holdings:
-                                # 🚨 [치명적 버그 수정] 매도(SELL) 주문이 취소된 거라면 주식은 여전히 내 주머니에 있어야 합니다!
-                                # 무조건 삭제하지 말고, 신규 매수(BUY)가 취소되었을 때만 주머니에서 지웁니다.
-                                if o_type == "BUY":
-                                    del self.mw.my_holdings[symbol] # 주머니에서 안전하게 삭제
-                                else:
-                                    self.sig_log.emit(f"🛡️ [{stock_name}] 매도 취소 확인! 주식을 보유 상태로 유지하며 다시 감시합니다.", "info")
-                                
-                        if o_type == "BUY" and hasattr(self.mw, 'accumulated_account') and symbol in self.mw.accumulated_account:
-                            self.mw.accumulated_account[symbol]['보유수량'] = "0 (주문취소)"
-                            self.mw.accumulated_account[symbol]['평가손익금'] = "0"
-                            self.mw.accumulated_account[symbol]['수익률'] = "0.00%"
-                        
-                        # 🔥 [팅김 방지 1] 스레드 내부에서 직접 UI 표를 읽으면 충돌이 발생하므로, 메인 UI로 삭제 명령만 보냅니다!
-                        QtCore.QMetaObject.invokeMethod(self.mw, "remove_order_by_no", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, str(order_no)))
-                        # -------------------------------------------------------------
-                        
-                        exec_data = {"주문번호": str(order_no), "종목코드": symbol, "체결수량": 0, "체결가": 0, "is_cancel": True}
-                        if hasattr(self.mw, 'ticker_window'):
-                            self.mw.ticker_window.msg_processor.sig_real_execution.emit(exec_data)
+                    # 📝 [로그 강화] 성공적인 취소 및 롤백 결과를 상세히 출력
+                    self.sig_log.emit(f"🗑️ [{stock_name}] 매수 취소 완료 및 잔고 롤백(-{qty}주) 처리되었습니다.", "success")
                     
-            except Exception: pass
+                elif res == "ALREADY_FILLED":
+                    # 💰 사졌는데 취소하려 한 경우 -> 체결완료로 상태 정정!
+                    self.sig_log.emit(f"💰 [{stock_name}] 취소 전 체결 확인! 상태를 [체결완료]로 복구합니다.", "success")
+                    self._update_status_safely(db_order_no, "체결완료", int(qty), float(price))
+                else:
+                    self.sig_log.emit(f"⚠️ [{stock_name}] 주문 취소 실패 (서버 응답 지연). 다음 사이클에 재시도합니다.", "error")
 
-            # 🕵️‍♂️ (기존) 탐정 동기화 로직
-            is_filled = False
-            if o_type == "BUY" and symbol in real_holdings: 
-                is_filled = True
-            elif "매도" in o_type or o_type == "SELL":
-                if symbol not in real_holdings or real_holdings.get(symbol, {}).get('qty', 0) == 0: 
-                    is_filled = True
+            # 🚀 [상황 2] 5~30초 사이인데, 잔고에 주식이 이미 들어왔다면? (웹소켓이 튀었을 때 대비)
+            elif 5 < elapsed_seconds <= 30:
+                if o_type == "BUY" and symbol in real_holdings:
+                    self.sig_log.emit(f"🔎 [{stock_name}] 웹소켓 누락 체결 발견! 강제 동기화를 실행합니다.", "success")
+                    self._update_status_safely(db_order_no, "체결완료", int(qty), float(price))
 
-            if is_filled:
-                self.sig_log.emit(f"🕵️‍♂️ [주삐 탐정] 한투 알림 누락 감지! [{stock_name}] 강제 체결 동기화 진행", "success")
-                
-                up_conn2 = None
-                try:
-                    up_conn2 = self.mw.db._get_connection(self.mw.db.shared_db_path)
-                    up_conn2.execute("UPDATE TradeHistory SET Status = '체결완료' WHERE order_no = ?", (order_no,))
-                    up_conn2.commit() 
-                except: pass
-                finally:
-                    if up_conn2: up_conn2.close() 
-                
-                exec_data = {"주문번호": str(order_no), "종목코드": symbol, "체결수량": int(qty), "체결가": float(price), "is_detective": True}
-                if hasattr(self.mw, 'ticker_window'):
-                    self.mw.ticker_window.msg_processor.sig_real_execution.emit(exec_data)
+    def _update_status_safely(self, order_no, new_status, filled_qty, real_price):
+        """ 
+        [DB 방어 업데이트] 
+        이미 웹소켓이 '체결완료'로 만든 데이터를 '주문취소'로 덮어쓰는 사고를 100% 차단합니다.
+        """
+        try:
+            conn = self.mw.db._get_connection(self.mw.db.shared_db_path)
+            
+            # 💡 [핵심 SQL] WHERE 절에 Status = '미체결'을 추가했습니다.
+            # 이렇게 하면, 이미 체결된 데이터는 이 쿼리가 작동하지 않아 안전하게 보존됩니다.
+            query = """
+                UPDATE TradeHistory 
+                SET Status = ?, filled_quantity = ?, price = ? 
+                WHERE order_no = ? AND Status = '미체결'
+            """
+            cursor = conn.execute(query, (new_status, filled_qty, real_price, order_no))
+            
+            # 실제로 수정이 일어난 경우에만 커밋하고 UI를 갱신합니다.
+            if cursor.rowcount > 0:
+                conn.commit()
+                QtCore.QMetaObject.invokeMethod(self.mw, "refresh_order_table", QtCore.Qt.QueuedConnection)
+            
+            conn.close()
+        except Exception as e:
+            print(f"탐정 DB 업데이트 에러: {e}")   
 
+    def _update_status_and_ui(self, order_no, symbol, o_type, db_status, ordered_qty=0, filled_qty=0, real_price=0.0):
+        """ [부분 체결 수학 계산의 마법사] 잔고와 DB를 완벽하게 동기화합니다. """
+        up_conn = None
+        exec_data = {} 
+        
+        # 🚀 [핵심 계산] 샀어야 했는데 허공으로 날아간 취소 수량 (예: 800 - 789 = 11주)
+        canceled_qty = ordered_qty - filled_qty 
+        if canceled_qty < 0: canceled_qty = 0
+        
+        try:
+            up_conn = self.mw.db._get_connection(self.mw.db.shared_db_path)
+            # DB에 0이 아니라 "진짜 체결된 789주"를 기록하여 팩트를 보존합니다.
+            up_conn.execute("UPDATE TradeHistory SET Status = ?, filled_quantity = ?, price = ? WHERE order_no = ?", 
+                           (db_status, filled_qty, real_price, order_no))
+            up_conn.commit()
+        except: pass
+        finally:
+            if up_conn: up_conn.close()
+
+        if db_status == "주문취소":
+            with self.mw.holdings_lock:
+                if symbol in self.mw.my_holdings:
+                    if o_type == "BUY":
+                        # 🚀 [치명적 버그 수정] 선반영했던 800주에서 "못 산 11주"만 정확하게 빼줍니다!
+                        current_qty = self.mw.my_holdings[symbol].get('qty', 0)
+                        new_qty = current_qty - canceled_qty
+                        
+                        if new_qty <= 0: # 다 취소돼서 남은 게 없으면 방 뺌
+                            del self.mw.my_holdings[symbol] 
+                        else:
+                            self.mw.my_holdings[symbol]['qty'] = new_qty # 789주로 정확히 업데이트!
+
+            if o_type == "BUY" and hasattr(self.mw, 'accumulated_account') and symbol in self.mw.accumulated_account:
+                if symbol not in self.mw.my_holdings: # 보유량이 0이 되어 삭제된 경우만 표기
+                    self.mw.accumulated_account[symbol]['보유수량'] = "0 (주문취소)"
+                    self.mw.accumulated_account[symbol]['평가손익금'] = "0"
+            
+            # 🔥 표기를 억지로 지우지 않고 DB를 다시 읽어서 표에 '주문취소 (789/800)' 느낌으로 남깁니다.
+            QtCore.QMetaObject.invokeMethod(self.mw, "refresh_order_table", QtCore.Qt.QueuedConnection)
+            exec_data = {"주문번호": str(order_no), "종목코드": symbol, "체결수량": filled_qty, "체결가": real_price, "is_cancel": True}
+        
+        elif db_status == "체결완료":
+            QtCore.QMetaObject.invokeMethod(self.mw, "refresh_order_table", QtCore.Qt.QueuedConnection)
+            exec_data = {"주문번호": str(order_no), "종목코드": symbol, "체결수량": int(filled_qty), "체결가": float(real_price), "is_detective": True}
+            
+        if hasattr(self.mw, 'ticker_window') and exec_data:
+            self.mw.ticker_window.msg_processor.sig_real_execution.emit(exec_data)
+            
 # =====================================================================
 # 🛡️ [일꾼 3호] 매도 수호자 (SellGuardianWorker) - 전체 코드
 # 역할: 실시간 수익률 감시, 본전 방어, 트레일링 스탑, 매수 메모리 청소, 1분 브리핑
@@ -430,8 +437,14 @@ class SellGuardianWorker(QThread):
                 if curr_price <= 0: curr_price = float(df.iloc[-1]['close'])
                 df.at[df.index[-1], 'close'] = curr_price 
                 
-                profit_rate = ((curr_price - buy_price) / buy_price) * 100
-                profit_amt = (curr_price - buy_price) * buy_qty
+                # 🚀 [HTS 완벽 동기화] 세금(0.2%) 및 매매수수료(약 0.03%)를 반영한 '진짜 순손익' 계산!
+                fee_rate = 0.0023 if SystemConfig.MARKET_MODE == "DOMESTIC" else 0.001
+                invest_amt = buy_price * buy_qty
+                eval_amt = curr_price * buy_qty
+                estimated_fee = eval_amt * fee_rate # HTS의 '추정비용'
+                
+                profit_amt = eval_amt - invest_amt - estimated_fee
+                profit_rate = (profit_amt / invest_amt) * 100 if invest_amt > 0 else 0.0
 
                 # 🔥 [추가] 브리핑에 보여줄 보유 종목 상세 텍스트 누적
                 stock_details_str += f"  🔸 {stock_name}: 매입 {buy_price:,.0f}원 -> 현재 {curr_price:,.0f}원 ({profit_rate:+.2f}%)\n"
@@ -465,36 +478,76 @@ class SellGuardianWorker(QThread):
                 curr_macd = float(df.iloc[-1].get('MACD', 0.0)); curr_signal = float(df.iloc[-1].get('Signal_Line', 0.0))
                 now_time_str = datetime.now().strftime('%H:%M:%S')
 
-                # 1. 가장 먼저 변수들을 초기화합니다.
+                # 0. 가장 먼저 변수들을 초기화합니다.
                 is_sell_all = False; is_sell_half = False; status_msg = ""; sell_qty = buy_qty
                 
-                # 🔥 [버그 수정] 매도 감시 일꾼이 불렀다는 표시(is_sell_mode=True)를 남겨 매수 로그 도배를 막습니다!
-                strat_signal = self.mw.strategy_engine.check_trade_signal(df, code, is_sell_mode=True)
+                # 🚀 [1] 쿨타임 및 전략 신호 확인
+                last_sell_attempt = info.get('last_sell_attempt', 0)
+                is_cooldown = (time.time() - last_sell_attempt < 3.0) # 3초 쿨타임
+                
+                if is_cooldown:
+                    strat_signal = "WAIT" # 쿨타임 중에는 신호 무시 (로그 도배 방지)
+                else:
+                    # 전략 엔진으로부터 신호 수신 (EXIT, SELL, BUY, WAIT 등)
+                    strat_signal = self.mw.strategy_engine.check_trade_signal(df, code, is_sell_mode=True)
 
-                # 2. 설정값 로드
-                try: safe_profit_rate = float(db_temp.get_shared_setting("TRADE", "SAFE_PROFIT_RATE", "0.3")); strat_profit_preserve = float(db_temp.get_shared_setting("TRADE", "STRAT_PROFIT_PRESERVE", "0.5")); deadcross_escape_rate = float(db_temp.get_shared_setting("TRADE", "DEADCROSS_ESCAPE_RATE", "1.5"))
-                except: safe_profit_rate = 0.3; strat_profit_preserve = 0.5; deadcross_escape_rate = 1.5
+                # 설정값 로드
+                try: 
+                    safe_profit_rate = float(db_temp.get_shared_setting("TRADE", "SAFE_PROFIT_RATE", "0.3"))
+                    strat_profit_preserve = float(db_temp.get_shared_setting("TRADE", "STRAT_PROFIT_PRESERVE", "0.5"))
+                    deadcross_escape_rate = float(db_temp.get_shared_setting("TRADE", "DEADCROSS_ESCAPE_RATE", "1.5"))
+                except: 
+                    safe_profit_rate = 0.3; strat_profit_preserve = 0.5; deadcross_escape_rate = 1.5
 
-                # 3. 매도 조건 검사 (본전 방어선을 여기에 합칩니다!)
-                if getattr(self.mw, 'panic_mode', False): is_sell_all = True; status_msg = "🚨 긴급 전체 청산"
-                elif is_imminent_close: is_sell_all = True; status_msg = "마감 임박 시장가 청산"
+                # 🚀 [2] 매도 조건 결정 (우선순위 재정렬)
+                is_sell_all = False
+                is_sell_half = False
+                status_msg = ""
+
+                # 상황 A: 무조건 팔아야 하는 경우 (최우선순위)
+                if getattr(self.mw, 'panic_mode', False): 
+                    is_sell_all = True; status_msg = "🚨 긴급 전체 청산"
+                elif is_imminent_close: 
+                    is_sell_all = True; status_msg = "마감 임박 시장가 청산"
+                
+                # 상황 B: 긴급 탈출 (VWAP 붕괴 등) - 수익률 무시하고 즉시 매도
+                elif strat_signal == "EXIT":
+                    is_sell_all = True; status_msg = "🚨 긴급 탈출 (VWAP 붕괴)"
+
+                # 상황 C: 방어 마감 모드 (장 후반 수익 보존)
                 elif is_safe_profit_close:
                     if profit_rate >= safe_profit_rate: is_sell_all = True; status_msg = "방어 마감 익절" 
                     elif profit_rate > 0.0 and curr_macd < curr_signal: is_sell_all = True; status_msg = "추세꺾임 탈출"
                     elif profit_rate <= stop_rate: is_sell_all = True; status_msg = "기계적 손절"
+                
+                # 상황 D: 일반 매매 로직
                 else:
-                    # 🚀 [버그 수정 완료] 본전 방어선 로직을 이곳으로 편입시켜 덮어씌워지지 않게 함
+                    # 본전 방어선
                     if max_profit_rate >= 1.5 and curr_price <= buy_price * 1.003:
                         is_sell_all = True; status_msg = "🛡️ 본전 방어선 작동"
-                    elif use_trailing and profit_rate >= ts_start and trail_drop_rate >= ts_gap: is_sell_all = True; status_msg = f"트레일링 스탑 ({ts_gap}% 하락)"
-                    elif elapsed_mins >= max_hold_min: is_sell_all = True; status_msg = f"시간 제한 ({max_hold_min}분)"
-                    elif strat_signal == "SELL" and profit_rate > strat_profit_preserve: is_sell_all = True; status_msg = "매도 신호 (수익 보존)" 
-                    elif strat_signal == "SELL" and profit_rate <= stop_rate: is_sell_all = True; status_msg = "매도 신호 (손절)"
-                    elif profit_rate >= target_rate and not half_sold: is_sell_half = True; sell_qty = max(1, int(buy_qty // 2)); status_msg = f"목표가({target_rate:.1f}%) 1차 익절"
-                    elif profit_rate <= stop_rate: is_sell_all = True; status_msg = f"손절라인({stop_rate:.1f}%) 이탈"
-                    elif profit_rate >= deadcross_escape_rate and curr_macd < curr_signal: is_sell_all = True; status_msg = "데드크로스 탈출" 
+                    # 트레일링 스탑
+                    elif use_trailing and profit_rate >= ts_start and trail_drop_rate >= ts_gap:
+                        is_sell_all = True; status_msg = f"트레일링 스탑 ({ts_gap}% 하락)"
+                    # 시간 제한
+                    elif elapsed_mins >= max_hold_min:
+                        is_sell_all = True; status_msg = f"시간 제한 ({max_hold_min}분)"
+                    # 전략 매도 신호 (수익 보존 구역)
+                    elif strat_signal == "SELL" and profit_rate > strat_profit_preserve:
+                        is_sell_all = True; status_msg = "매도 신호 (수익 보존)" 
+                    # 전략 매도 신호 (이미 손실 중일 때)
+                    elif strat_signal == "SELL" and profit_rate <= stop_rate:
+                        is_sell_all = True; status_msg = "매도 신호 (손절)"
+                    # 목표가 1차 익절 (절반 매도)
+                    elif profit_rate >= target_rate and not half_sold:
+                        is_sell_half = True; sell_qty = max(1, int(buy_qty // 2)); status_msg = f"목표가({target_rate:.1f}%) 1차 익절"
+                    # 기계적 손절라인 이탈
+                    elif profit_rate <= stop_rate:
+                        is_sell_all = True; status_msg = f"손절라인({stop_rate:.1f}%) 이탈"
+                    # 데드크로스 탈출
+                    elif profit_rate >= deadcross_escape_rate and curr_macd < curr_signal:
+                        is_sell_all = True; status_msg = "데드크로스 탈출" 
 
-                # 4. 표 데이터 기록 (기존과 동일)
+                # 🚀 [3] 표 데이터 기록 (매도 실행 여부와 상관없이 무조건 실행 -> 표 사라짐 방지)
                 unified_account_rows.append({
                     '시간': now_time_str, '종목코드': code, '종목명': stock_name, '보유수량': str(buy_qty),
                     '평균매입가': f"{buy_price:,.0f}", '현재가': f"{curr_price:,.0f}", '평가손익금': f"{profit_amt:,.0f}",
@@ -502,25 +555,41 @@ class SellGuardianWorker(QThread):
                 })
                 is_first_row = False
                 
-                if is_sell_half or is_sell_all:
+                # 🚀 [4] 실제 매도 주문 전송
+                if (is_sell_half or is_sell_all) and not is_cooldown:
+                    with self.mw.holdings_lock:
+                        self.mw.my_holdings[code]['last_sell_attempt'] = time.time()
+                        
                     res_odno = self.execute_guaranteed_sell(code, sell_qty, curr_price)
+                    
                     if res_odno: 
                         if res_odno == "ALREADY_SOLD": res_odno = "00000000" 
                         
                         realized_profit = (curr_price - buy_price) * sell_qty
                         sold_codes.append((code, is_sell_all, sell_qty, realized_profit, curr_price))
                         
-                        # 🛑 [도배방지 초기화] 전량 매도 시 매수 일꾼의 수첩에서 이 종목을 삭제합니다.
-                        # 그래야 나중에 이 종목이 다시 포착되었을 때 로그가 새로 뜰 수 있습니다.
                         if is_sell_all and hasattr(self.mw, 'buy_worker'):
                             if code in self.mw.buy_worker.log_step_memory:
                                 del self.mw.buy_worker.log_step_memory[code]
 
+                        # 🔥 [로그 강화] 매도 사유(status_msg)를 가장 눈에 띄게 앞으로 배치하고, 주문번호까지 꼼꼼하게 기록합니다.
                         log_icon, log_color = ("🟢", "success") if profit_rate > 0 else ("🔴", "sell")
-                        self.sig_log.emit(f"{log_icon} [{status_msg}] {stock_name} | 매도: {sell_qty}주 | 손익: {int(realized_profit):,}원 ({profit_rate:.2f}%)", log_color) 
-                        self.sig_order_append.emit({'주문번호': res_odno, '종목코드': code, '종목명': stock_name, '주문종류': '익절' if profit_rate > 0 else '손절', '주문가격': f"{curr_price:,.0f}", '주문수량': sell_qty, '체결수량': 0, '주문시간': now.strftime("%Y-%m-%d %H:%M:%S"), '상태': '미체결', '수익률': f"{profit_rate:.2f}%"})
+                        sell_type_str = "1차 익절(절반)" if is_sell_half else "전량 청산"
+                        
+                        sell_msg = f"{log_icon} [{sell_type_str}] {stock_name} | 사유: {status_msg} | 체결가: {curr_price:,.0f}원 | 매도: {sell_qty}주 | 손익: {int(realized_profit):+,}원 ({profit_rate:+.2f}%) | 주문번호: {res_odno}"
+                        self.sig_log.emit(sell_msg, log_color) 
+                        
+                        # 카카오톡 알림도 사유를 명확하게!
+                        self.mw.send_kakao_msg(f"🔔 [주삐 매도]\n종목: {stock_name}\n사유: {status_msg}\n수익률: {profit_rate:+.2f}%\n손익금: {int(realized_profit):+,}원") 
+                        
+                        self.sig_order_append.emit({
+                            '주문번호': res_odno, '종목코드': code, '종목명': stock_name, 
+                            '주문종류': '익절' if profit_rate > 0 else '손절', '주문가격': f"{curr_price:,.0f}", 
+                            '주문수량': sell_qty, '체결수량': 0, '주문시간': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                            '상태': '미체결', '수익률': f"{profit_rate:.2f}%"
+                        })
                     else:
-                        self.sig_log.emit(f"🚨 [{stock_name}] {status_msg} 주문 실패 (서버 무응답). 0.5초 뒤 재시도합니다!", "error")
+                        self.sig_log.emit(f"🚨 [{stock_name}] {status_msg} 매도 주문 실패 (서버 무응답 또는 오류). 즉시 재시도 대기!", "error")
                         
         # 🔒 안전하게 공유 변수 및 주머니 업데이트
         if sold_codes:
@@ -696,14 +765,14 @@ class BuyHunterWorker(QThread):
             # 어차피 사기로 결정된 종목이므로, 무거운 AI 재검사 없이 예수금만 재확인하고 API 전송만 시도합니다.
             error_msg = getattr(self.mw.api_manager.api, 'last_error_msg', '')
 
-            # 잔고(예수금)가 정말 없는 거라면 재시도를 즉시 포기합니다.
-            if "잔고" in error_msg or "예수금" in error_msg:
-                self.sig_log.emit(f"🚨 [{stock_name}] 예수금 부족으로 매수를 최종 포기합니다.", "error")
+            # 🚀 [추가] 잔고 부족이거나 아예 살 수 없는 종목(매매불가/증거금100%)이라면 즉시 포기!
+            if "잔고" in error_msg or "예수금" in error_msg or "매매불가" in error_msg or "증거금" in error_msg:
+                self.sig_log.emit(f"🚨 [{stock_name}] {error_msg} 사유로 매수를 즉시 포기합니다.", "error")
                 return None
 
-            # 초당 거래건수 제한에 걸렸다면 트래픽 진정을 위해 더 길게(1.5초) 쉰 다음 쏩니다.
+            # 초당 거래건수 제한에 걸렸다면 트래픽 진정을 위해 더 길게(1.0초) 쉰 다음 쏩니다.
             if "초과" in error_msg or "초당" in error_msg:
-                time.sleep(1.5)
+                time.sleep(1.0)
             else:
                 time.sleep(retry_delay)
 
@@ -927,13 +996,13 @@ class BuyHunterWorker(QThread):
             # ✅ 1단계: AI 확률 커트라인 통과
             if prob >= ai_limit:
                 if log_step < 1:
-                    self.sig_log.emit(f"🤖 [AI 1차 승인] {stock_name} 포착! (확률: {prob*100:.1f}%)", "info")
+                    # self.sig_log.emit(f"🤖 [AI 1차 승인] {stock_name} 포착! (확률: {prob*100:.1f}%)", "info")
                     self.log_step_memory[code] = 1 # 1단계 성공
                 
                 # ✅ 2단계: 전략 엔진 패턴 분석 통과
                 if strat_signal == "BUY":
                     if self.log_step_memory.get(code, 0) < 2:
-                        self.sig_log.emit(f"✅ [2차 승인] {stock_name} 시계열 패턴 우수", "success")
+                        # self.sig_log.emit(f"✅ [2차 승인] {stock_name} 시계열 패턴 우수", "success")
                         self.log_step_memory[code] = 2 # 2단계 성공
                     
                     # 🚀 [원본 복구] ATR 변동성 비중 조절
@@ -1015,13 +1084,27 @@ class BuyHunterWorker(QThread):
                                     self.sig_log.emit(f"🛡️ [안전 장치] 최대 매수 한도({max_buys_per_cycle}회) 도달. 탐색 마감.", "warning")
                                     break
                                 if needed_count <= 0: break
-                            # 💡 [핵심 추가] 매수가 최종 실패했다면 10분 쿨타임을 걸어서 무한 도배를 원천 차단합니다!
+                                
+                            # 💡 [추가] 매수가 최종 실패했다면 10분 쿨타임을 걸어서 무한 도배를 원천 차단합니다!
                             else:
                                 if not hasattr(self.mw, 'cooldown_dict'): self.mw.cooldown_dict = {}
                                 self.mw.cooldown_dict[code] = datetime.now()
                                 self.sig_log.emit(f"🛑 [{stock_name}] 매수 불가 상태. 10분간 탐색을 보류합니다.", "error")
                                 if code in self.log_step_memory:
                                     del self.log_step_memory[code]
+                        
+                        # 🚀 [버그 완벽 수정 1] 살 돈(예수금)이 0원이라서 못 샀을 때 로그 출력!
+                        else:
+                            if self.log_step_memory.get(code, 0) < 3:
+                                self.sig_log.emit(f"💸 [{stock_name}] 3차 승인 통과! BUT 예수금 부족으로 스킵 (예수금: {my_cash:,.0f}원)", "warning")
+                                self.log_step_memory[code] = 3
+
+                    # 🚀 [버그 완벽 수정 2] 예수금은 있지만, 내가 설정한 '최대 투자 비중'이 꽉 차서 스킵될 때!
+                    else:
+                        if self.log_step_memory.get(code, 0) < 3:
+                            self.sig_log.emit(f"🔒 [{stock_name}] 3차 승인 통과! BUT 최대 투자 한도({use_funds_percent}%) 꽉 차서 스킵.", "warning")
+                            self.log_step_memory[code] = 3
+
             else:
                 # 확률이 떨어지면 다음 턴에 다시 알림을 받기 위해 장부 리셋
                 if code in self.log_step_memory:
@@ -1872,43 +1955,26 @@ class AutoTradeWorker(QThread):
                                 total_invested += (curr_price * buy_qty)
 
                                 self.sig_order_append.emit({
-                                    '주문번호': res_odno, 
-                                    '종목코드': code, 
-                                    '종목명': stock_name, 
-                                    '주문종류': '매수' if not is_pyramiding else '불타기', 
-                                    '주문가격': f"{curr_price:,.2f}", 
-                                    '주문수량': buy_qty, 
-                                    '체결수량': 0, 
-                                    '주문시간': now_str, 
-                                    '상태': '미체결', 
-                                    '수익률': '0.00%' 
+                                    '주문번호': res_odno, '종목코드': code, '종목명': stock_name, 
+                                    '주문종류': '매수' if not is_pyramiding else '불타기', '주문가격': f"{curr_price:,.2f}", 
+                                    '주문수량': buy_qty, '체결수량': 0, '주문시간': now_str, '상태': '미체결', '수익률': '0.00%' 
                                 })
                                 
-                                # account_rows.append({'시간': now_time_str, '종목코드': code, '종목명': stock_name, '보유수량': new_total_qty 
-                                #                      if is_pyramiding else buy_qty, '평균매입가': f"{new_avg_price if is_pyramiding else curr_price:,.0f}",
-                                #                        '현재가': f"{curr_price:,.0f}", '평가손익금': "0", '수익률': "0.00%", '상태': '보유중'})
-                                
-                                # acc_cols = ['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','상태']
-                                # temp_df = pd.DataFrame(account_rows)
-                                # for c in acc_cols:
-                                #     if c not in temp_df.columns: temp_df[c] = ""
-                                # self.sig_account_df.emit(temp_df[acc_cols].copy()); self.sig_sync_cs.emit()
-                                
                                 needed_count -= 1
-
-                                # 🚀 [매수 카운트 1 증가]
                                 current_cycle_buys += 1 
-                                
-                                # 🔥 뇌동 폭풍 매수 방지! 한 번 샀으면 흥분을 가라앉히고 0.2초간 무조건 멈춥니다.
                                 time.sleep(0.2)
                                 
-                                # 🌟 [핵심 방어막] 사이클 내 최대 매수 허용치에 도달하면 즉시 신규 매수 탐색을 중단!
                                 if current_cycle_buys >= max_buys_per_cycle:
                                     self.sig_log.emit(f"🛡️ [안전 장치] 1사이클 최대 매수 한도({max_buys_per_cycle}회) 도달. 이번 턴 신규 진입을 마감합니다.", "warning")
-                                    break # 반복문을 빠져나가므로 더 이상 매수하지 않음!
+                                    break 
                                 
                                 if needed_count <= 0:
                                     break
+                        # 🚀 [추가] 돈이 없어서 못 살 때 무한 도배되는 것을 막고 정확한 사유를 로깅합니다!
+                        else:
+                            if self.log_step_memory.get(code, 0) < 3:
+                                self.sig_log.emit(f"💸 [{stock_name}] AI 승인 완료! BUT 예수금 부족으로 스킵 (예수금: {my_cash:,.0f}원)", "warning")
+                                self.log_step_memory[code] = 3 # 무한 알림 도배 방지
 
                 try: db_temp.update_realtime(code, curr_price, prob*100, "NO", "탐색 중...")
                 except: pass
@@ -2248,16 +2314,10 @@ class FormMain(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(dict)
     def append_order_table_slot(self, order_info):
+        """ [완벽 수정] UI를 직접 만지지 않고, 오직 DB만 갱신한 뒤 깔끔하게 새로고침합니다! """
         if not order_info: return 
         
         order_no = order_info.get('주문번호', '00000000')
-        
-        # 🚀 [중복 방지 1] 이미 화면 표(tbOrder)에 똑같은 주문번호가 있으면 무시하고 돌아갑니다!
-        # (과거 복구 데이터가 아니더라도, 어떤 이유로든 표에 두 번 그려지는 것을 원천 차단)
-        for row in range(self.tbOrder.rowCount()):
-            item = self.tbOrder.item(row, 0)
-            if item and item.text() == order_no:
-                return
 
         if not order_info.get('is_restore', False):
             try:
@@ -2268,48 +2328,34 @@ class FormMain(QtWidgets.QMainWindow):
                 
                 price = float(str(order_info.get('주문가격', '0')).replace(',', ''))
                 qty = int(order_info.get('주문수량', 0))
-                # 🚀 [% 기호 제거 후 안전한 float 변환]
                 raw_y_rate = str(order_info.get('수익률', '0')).replace('%', '').replace(',', '').strip()
                 y_rate = float(raw_y_rate) if raw_y_rate else 0.0
                 
-                self.db.insert_trade_history(order_no, code, o_type, price, qty, y_rate)
-                
                 conn = self.db._get_connection(self.db.shared_db_path)
-                conn.execute("UPDATE TradeHistory SET symbol_name = ? WHERE order_no = ?", (s_name, order_no))
+                
+                # 🚀 [방어막] 웹소켓이 '초고속 체결'로 껍데기를 먼저 만들어 둔 게 있는지 검사합니다.
+                cursor = conn.execute("SELECT COUNT(*) FROM TradeHistory WHERE order_no = ?", (order_no,))
+                
+                if cursor.fetchone()[0] == 0:
+                    # 1. 일반적인 상황: DB에 아무것도 없으니 평범하게 '미체결'로 Insert
+                    self.db.insert_trade_history(order_no, code, o_type, price, qty, y_rate)
+                    conn.execute("UPDATE TradeHistory SET symbol_name = ? WHERE order_no = ?", (s_name, order_no))
+                else:
+                    # 2. 꼬인 상황: 웹소켓이 '체결완료'로 먼저 만들어 둠! 
+                    # ➔ 절대 Status(체결완료)는 건드리지 말고, 누락되었던 종목명, 종류 등 알맹이만 덮어씌웁니다!
+                    conn.execute("""
+                        UPDATE TradeHistory 
+                        SET symbol_name = ?, type = ?, quantity = ?, order_price = ?, order_yield = ? 
+                        WHERE order_no = ?
+                    """, (s_name, o_type, qty, price, f"{y_rate}%", order_no))
+                    
                 conn.commit()
                 conn.close()
             except Exception: pass
 
-        ord_cols = ['주문번호', '시간', '종목코드', '종목명', '주문종류', '주문가격', '주문수량', '체결수량', '상태', '수익률']
-
-        # 🚀 [UI 중복 렌더링 방어막 2] 새로고침(refresh)이 호출될 예정이라면 굳이 여기서 행을 안 만들어도 됩니다.
-        # 하지만 혹시 모르니 빈 줄을 먼저 만들고 덮어씁니다.
-        row_idx = self.tbOrder.rowCount()
-        self.tbOrder.insertRow(row_idx)
-        
-        for col_idx, col_name in enumerate(ord_cols):
-            if col_name == '시간':
-                val = str(order_info.get('주문시간', datetime.now().strftime("%H:%M:%S")))
-            elif col_name == '수익률':
-                # 🚀 [수익률 소수점 완벽 커팅] 어떤 값이 들어오든 무조건 소수점 2자리까지만 반올림해서 %를 붙입니다!
-                raw_val = str(order_info.get(col_name, '0')).replace('%', '').replace(',', '').strip()
-                try:
-                    num_val = float(raw_val)
-                    val = f"{num_val:.2f}%"
-                except:
-                    val = "0.00%"
-            else:
-                val = str(order_info.get(col_name, ''))
-            
-            if col_name == '상태' and not order_info.get('상태'): val = "미체결"
-            if col_name == '수익률' and not val: val = "0.00%"
-
-            item = QtWidgets.QTableWidgetItem(val)
-            item.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.tbOrder.setItem(row_idx, col_idx, item)
-            
-        self.tbOrder.setColumnHidden(0, True) 
-        if self.tbOrder.rowCount() > 500: self.tbOrder.removeRow(0)
+        # 🚀 [UI 두 줄 버그 원천 차단] 
+        # 억지로 화면에 줄을 끼워 넣지 않고, 무조건 DB에서 깔끔하게 다시 읽어와 화면을 덮어씌웁니다.
+        self.refresh_order_table()
 
     @QtCore.pyqtSlot() 
     def btnDataSendClickEvent(self):
@@ -2438,16 +2484,27 @@ class FormMain(QtWidgets.QMainWindow):
             if code not in self.my_holdings: continue
 
             if df is not None and not df.empty:
-                curr_price = df.iloc[-1]['close']
-                profit_rate = ((curr_price - buy_price) / buy_price) * 100
-                pnl_str = f"{profit_rate:.2f}%"
+                curr_price = float(df.iloc[-1]['close'])
+                
+                # 🚀 [HTS 완벽 동기화] 세금 및 수수료(약 0.23%) 차감
+                fee_rate = 0.0023 if SystemConfig.MARKET_MODE == "DOMESTIC" else 0.001
+                invest_amt = buy_price * buy_qty
+                eval_amt = curr_price * buy_qty
+                estimated_fee = eval_amt * fee_rate # HTS의 '추정비용'
+                
+                real_profit_amt = eval_amt - invest_amt - estimated_fee
+                real_profit_rate = (real_profit_amt / invest_amt) * 100 if invest_amt > 0 else 0.0
+                
+                pnl_str = f"{real_profit_rate:.2f}%"
                 
                 # 데이터 갱신
                 self.my_holdings[code]['high_watermark'] = max(self.my_holdings[code].get('high_watermark', buy_price), curr_price)
                 self.my_holdings[code]['buy_time'] = datetime.now()
                 
-                stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.0f} -> {curr_price:,.0f} ({profit_rate:+.2f}%)\n"
+                stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.0f} -> {curr_price:,.0f} ({real_profit_rate:+.2f}%)\n"
             else: 
+                real_profit_amt = 0
+                pnl_str = "0.00%"
                 stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.0f} -> 통신지연\n"
                 
             total_invested += (buy_price * buy_qty)
@@ -2462,7 +2519,7 @@ class FormMain(QtWidgets.QMainWindow):
                 '보유수량': str(buy_qty), 
                 '평균매입가': f"{buy_price:,.0f}", 
                 '현재가': f"{curr_price:,.0f}", 
-                '평가손익금': f"{(curr_price - buy_price) * buy_qty:,.0f}", 
+                '평가손익금': f"{real_profit_amt:,.0f}", 
                 '수익률': pnl_str, 
                 '상태': "보유중",
                 '주문가능금액': f"{my_cash_float:,.0f}" if is_first else ""
@@ -2556,13 +2613,18 @@ class FormMain(QtWidgets.QMainWindow):
             # 0.5초 뒤 안전하게 표 갱신
             QtCore.QTimer.singleShot(500, lambda: self.update_table(self.tbAccount, TradeData.account.df))
 
-        # 7. 예약 주문(미체결) 동기화 (이미 작성하신 코드 유지)
+        # 7. 예약 주문(미체결) 동기화
         try:
             if hasattr(self.api_manager, 'api') and hasattr(self.api_manager.api, 'get_unfilled_orders'):
                 unfilled_orders = self.api_manager.api.get_unfilled_orders()
             else:
                 unfilled_orders = self.api_manager.get_unfilled_orders()
             
+            # 🚀 [핵심 쉴드 복구!] 서버가 뻗어서 None이 반환되면 
+            # 에러를 내지 말고 즉시 조용히 함수를 끝내버립니다!
+            if unfilled_orders is None:
+                return
+
             existing_ord_nos = []
             for row in range(self.tbOrder.rowCount()):
                 item = self.tbOrder.item(row, 0)
@@ -2911,8 +2973,7 @@ class FormMain(QtWidgets.QMainWindow):
                         
                 except Exception: pass
 
-                # 🔥 [수정 2] 일꾼(스레드)이 멈췄다가 다시 켜질 때 뻗는 에러를 방지하기 위해 
-                # 새 일꾼을 배정하고 메인 화면(UI)과 알림선을 다시 연결해줍니다!
+                # 🔥 [수정 2] 일꾼(스레드) 배정 및 알림선 연결
                 self.buy_worker = BuyHunterWorker(self)
                 self.sell_worker = SellGuardianWorker(self)
                 
@@ -2926,6 +2987,10 @@ class FormMain(QtWidgets.QMainWindow):
                 self.sell_worker.sig_sync_cs.connect(self.btnDataSendClickEvent)
                 self.buy_worker.sig_sync_cs.connect(self.btnDataSendClickEvent)
                 self.sell_worker.sig_panic_done.connect(self.panic_sell_done_slot)
+                
+                # 🚀 [핵심 수정 1] 매도 일꾼뿐만 아니라 매수 일꾼의 퇴근도 보고받도록 둘 다 연결합니다!
+                self.finished_worker_count = 0 # 퇴근한 일꾼 수 초기화
+                self.buy_worker.finished.connect(self.check_worker_stopped)
                 self.sell_worker.finished.connect(self.check_worker_stopped)
 
                 self.panic_mode = False 
@@ -2942,8 +3007,8 @@ class FormMain(QtWidgets.QMainWindow):
                 # 퇴근 스위치만 내려줍니다.
                 if self.buy_worker: self.buy_worker.is_running = False
                 if self.sell_worker: self.sell_worker.is_running = False 
-                if hasattr(self, 'detective_worker') and self.detective_worker: 
-                    self.detective_worker.is_running = False
+                # if hasattr(self, 'detective_worker') and self.detective_worker: 
+                #     self.detective_worker.is_running = False
                     
                 # 🚨 [삭제] self.buy_worker.wait(500) 부분 삭제 완료! (데드락 방지)
                 
@@ -2952,13 +3017,19 @@ class FormMain(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def check_worker_stopped(self):
-        if self.btnAutoDataTest.text() == "감시망 종료 대기중...":
-            self.is_stopping = False
-            self.btnAutoDataTest.setText("자동 매매 가동 (GO)")
-            self.btnAutoDataTest.setStyleSheet("background-color: rgb(5,5,15); color: Silver;")
-            self.add_log("✅ [주삐 엔진] 감시망이 안전하게 종료되었습니다.", "info")
-            try: self.db.update_system_status('TRADER', '감시망 중단 🔴', 0)
-            except: pass
+        # 🚀 [핵심 수정 2] 일꾼 두 명이 모두 안전하게 퇴근했는지 카운트합니다!
+        if not hasattr(self, 'finished_worker_count'): self.finished_worker_count = 0
+        self.finished_worker_count += 1
+
+        # 2명 모두 무사히 퇴근 완료했을 때만 화면을 갱신! (팅김 원천 차단)
+        if self.finished_worker_count >= 2:
+            if self.btnAutoDataTest.text() == "감시망 종료 대기중...":
+                self.is_stopping = False
+                self.btnAutoDataTest.setText("자동 매매 가동 (GO)")
+                self.btnAutoDataTest.setStyleSheet("background-color: rgb(5,5,15); color: Silver;")
+                self.add_log("✅ [주삐 엔진] 2-Track 감시망이 완벽하고 안전하게 종료되었습니다.", "info")
+                try: self.db.update_system_status('TRADER', '감시망 중단 🔴', 0)
+                except: pass
 
     def save_manual_log(self):
         try:
@@ -3115,8 +3186,8 @@ class FormMain(QtWidgets.QMainWindow):
                         '수익률': f"{profit_rate:.2f}%" 
                     })
                 else:
-                    error_msg = getattr(self.api_manager.api, 'last_error_msg', '알 수 없는 오류')
-                    self.add_log(f"❌ [{stock_name}] 수동 매도 주문이 최종 거절되었습니다. 사유: {error_msg}", "error")
+                    error_msg = getattr(self.api_manager.api, 'last_error_msg', '서버 응답 없음')
+                    self.add_log(f"❌ [{stock_name}] 수동 매도 거절! 사유: {error_msg}", "error")
 
         except Exception as e:
             self.add_log(f"🚨 수동 매도 처리 중 에러: {e}", "error")
@@ -3264,21 +3335,10 @@ class FormMain(QtWidgets.QMainWindow):
         except: pass
 
     def load_unfilled_orders_to_ui(self):
-        """ [신규] 재시작 시 DB에서 미체결 내역을 읽어와 표에 표시 (탐정이 취소할 수 있게 함) """
-        try:
-            conn = self.db._get_connection(self.db.shared_db_path)
-            cursor = conn.execute("SELECT order_no, symbol, symbol_name, type, price, quantity, filled_quantity, strftime('%H:%M:%S', time) FROM TradeHistory WHERE Status = '미체결'")
-            rows = cursor.fetchall()
-            conn.close()
-            for row in rows:
-                self.append_order_table_slot({
-                    '주문번호': str(row[0]), '종목코드': row[1], '종목명': row[2], 
-                    '주문종류': row[3], '주문가격': f"{row[4]:,.0f}", '주문수량': row[5], 
-                    '체결수량': row[6], '주문시간': row[7], '상태': '미체결', 
-                    '수익률': '0.00%', 'is_restore': True
-                })
-        except: pass
-
+        """ [완벽 수정] 재시작 시 DB 내역을 바탕으로 표를 동기화합니다. """
+        # 이제 억지로 줄을 추가할 필요가 없습니다. 
+        # DB에 저장된 내역을 그대로 읽어오도록 새로고침만 실행합니다.
+        self.refresh_order_table()
     def btnDataClearClickEvent(self): 
         self.tbAccount.setRowCount(0); self.tbStrategy.setRowCount(0); self.tbOrder.setRowCount(0); self.tbMarket.setRowCount(0)
 

@@ -1,3 +1,4 @@
+from datetime import datetime
 import json
 import time
 import websocket # 🚨 CMD에서 pip install websocket-client 필수
@@ -354,13 +355,30 @@ class FormTicker(QtWidgets.QWidget):
                 if 'conn' in locals() and conn: conn.close()
 
         # 🌟 2. [가장 중요] DB에 상태를 쓰고 반드시 'commit(도장)'을 찍습니다.
-        # 이 도장을 찍어야 '탐정'이 DB를 보고 "아, 처리됐구나" 하고 멈춥니다!
         try:
-            conn = self.db._get_connection(self.db.shared_db_path)
-            conn.execute("UPDATE TradeHistory SET Status = ?, filled_quantity = ?, price = ? WHERE order_no = ?", 
-                         (db_status, filled_qty, real_price, target_ono))
-            conn.commit() # 🔥 필수! 이게 없으면 탐정이 5초마다 계속 신호를 보내서 렉이 걸립니다.
-        except: pass
+            # 🔥 [DB 락 완벽 방어] FormTicker에서도 무조건 execute_with_retry를 써서 락(Lock)을 방지합니다.
+            query = "UPDATE TradeHistory SET Status = ?, filled_quantity = ?, price = ? WHERE order_no = ?"
+            rowcount = self.db.execute_with_retry(self.db.shared_db_path, query, (db_status, filled_qty, real_price, target_ono))
+            
+            # 🚀 [핵심 방어막] API 응답(미체결 저장)보다 웹소켓(체결 알림)이 0.1초 먼저 도착한 초희귀 케이스!
+            if rowcount == 0 and not is_cancel and not is_detective:
+                time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                short_time_str = datetime.now().strftime("%H:%M:%S")
+                
+                insert_query = '''INSERT INTO TradeHistory 
+                    (time, symbol, symbol_name, type, price, quantity, order_no, Status, filled_quantity, order_price, order_time, order_yield) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'''
+                
+                self.db.execute_with_retry(
+                    self.db.shared_db_path, 
+                    insert_query, 
+                    (time_str, target_symbol, "-", "알수없음", real_price, filled_qty, target_ono, db_status, filled_qty, real_price, short_time_str, "0.00%")
+                )
+                
+                self.add_ticker_log(f"⚡ [초고속 체결] API 응답보다 웹소켓 체결이 빨라 선기록을 진행했습니다.", "warning")
+
+        except Exception as e: 
+            self.add_ticker_log(f"🚨 Ticker DB 업데이트 오류: {e}", "error")
         finally:
             if 'conn' in locals() and conn: conn.close()
 

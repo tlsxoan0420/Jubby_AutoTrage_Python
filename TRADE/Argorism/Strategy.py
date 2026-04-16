@@ -129,18 +129,11 @@ class JubbyStrategy:
         else:
             print(msg)
 
-    # [Strategy.py 수정 부분]
-    
     # =====================================================================
     # ⚖️ [궁극의 2차 방어막] 실시간 호가창 매도/매수 잔량 비율 검사
     # =====================================================================
     def check_orderbook_imbalance(self, code):
-        """ 
-        [1차 방어: LSTM 패턴]을 통과한 종목에 대해 
-        [2차 방어: 실시간 수급]을 확인하여 '가짜 돌파(휩쏘)'를 완벽히 걸러냅니다.
-        """
         try:
-            # 💡 [핵심 수정] DB_Manager의 만능 래퍼를 사용하여 Lock 충돌을 100% 방어합니다!
             row = self.db.execute_with_retry(
                 self.db.shared_db_path, 
                 "SELECT ask_size, bid_size FROM MarketStatus WHERE symbol = ?", 
@@ -152,64 +145,86 @@ class JubbyStrategy:
                 ask_size = float(row[0])
                 bid_size = float(row[1])
 
+                # 🚀 [업그레이드 2] 텅텅 빈 호가창(사막화) 필터링! 
+                # 비율이 아무리 좋아도, 호가창 잔량이 너무 적으면 시장가 매수 시 크게 손해 봅니다.
+                if ask_size + bid_size < 2000: # 양쪽 합쳐서 잔량이 너무 적을 경우
+                    self.send_log(f"🛡️ [2차 방어막 작동] {self.get_pretty_name(code)} 호가창이 너무 얇습니다(거래 가뭄). 휩쏘/슬리피지 위험 차단!", "warning")
+                    return False
+
                 if ask_size > 0 and bid_size > 0:
                     imbalance_ratio = ask_size / bid_size
                     
-                    # 목표 매도벽 비율 (기본 2.0배 - 매도 잔량이 매수 잔량보다 2배 많아야 진짜 상승)
                     try: target_ratio = float(self.db.get_shared_setting("TRADE", "ORDERBOOK_RATIO", "2.0"))
                     except: target_ratio = 2.0
 
                     if imbalance_ratio >= target_ratio:
-                        # 🚀 [매도벽 두꺼움] 개미들이 팔고 나가는 물량을 세력이 다 받아먹으면서 올릴 준비! (찐상승)
                         self.send_log(f"🔥 [최종 승인] {self.get_pretty_name(code)} 실시간 호가 수급 완벽! (매도벽 {imbalance_ratio:.1f}배). 🚀발사!", "success")
                         return True 
                     else:
-                        # 🛑 [매수벽 두꺼움] 누군가 아래에 매수 물량을 엄청 깔아두고 개미 꼬시는 중! (가짜 상승)
                         self.send_log(f"🛡️ [2차 방어막 작동] {self.get_pretty_name(code)} 호가 수급 불량 (매도벽 {imbalance_ratio:.1f}배 < {target_ratio}배). 개미 꼬시기 차단!", "warning")
                         return False 
         except Exception as e:
             pass 
         
-        # 데이터 오류 시 안전을 위해 우선 통과 (1차 LSTM 방어막이 있으므로)
         return True
     
-    # =====================================================================
-    # 🌪️ [궁극의 3차 방어막] 진짜 돈이 들어오는지 (체결강도) 검사
-    # =====================================================================
     def check_volume_power_and_money(self, code):
-        """
-        아무리 호가창 매도잔량이 많아 보여도, 실제로 시장가로 긁어가는 '매수세(체결강도)'가 없으면 가짜입니다.
-        체결강도가 100 이상이면 파는 사람보다 사는 사람이 더 많다는 뜻입니다.
-        """
         try:
-            row = self.db.execute_with_retry(
-                self.db.shared_db_path, 
-                "SELECT vol_energy FROM MarketStatus WHERE symbol = ?", 
-                (code,), 
-                fetch='one'
-            )
+            # 주식 이름 가져오기
+            pretty_name = code
+            if hasattr(self, 'get_pretty_name'):
+                pretty_name = self.get_pretty_name(code)
+            elif hasattr(self.db, 'DYNAMIC_STOCK_DICT'):
+                pretty_name = self.db.DYNAMIC_STOCK_DICT.get(code, code)
 
-            if row:
-                vol_power = float(row[0])
-                
-                try: min_vol_power = float(self.db.get_shared_setting("TRADE", "MIN_VOL_POWER", "105.0"))
-                except: min_vol_power = 105.0
-
-                # 체결강도가 기준치(기본 105) 이상일 때만 승인
-                if vol_power >= min_vol_power:
-                    # 🔥 [수정된 부분] 방어막을 무사히 통과했을 때 성공 로그를 남깁니다!
-                    self.send_log(f"✅ [3차 방어막 통과] {self.get_pretty_name(code)} 체결강도 우수 ({vol_power:.1f} >= {min_vol_power}). 진짜 돈이 들어옵니다!", "success")
-                    return True
-                else:
-                    # 방어막에 걸려서 탈락했을 때의 로그
-                    self.send_log(f"🛡️ [3차 방어막 작동] {self.get_pretty_name(code)} 체결강도 부족 ({vol_power:.1f} < {min_vol_power}). 가짜 반등 의심!", "warning")
-                    return False
-        except Exception as e:
-            # 🔥 [추가된 부분] 통신 지연 등으로 DB에서 값을 못 가져왔을 때 조용히 넘어가지 않고 로그를 남깁니다.
-            self.send_log(f"⚠️ [3차 방어막 예외] {self.get_pretty_name(code)} 체결강도 조회 실패. 1, 2차 방어막을 믿고 강제 통과합니다.", "warning")
-            pass
+            real_vol_power = 0.0
             
-        return True # 데이터 오류 시 1,2차 방어막을 믿고 통과
+            # 🚀 1. SQL(MarketStatus)에서 Ticker가 수집해둔 '진짜 체결강도'를 안전하게 가져옵니다.
+            # 🔥 [DB 락 완벽 방어] 직접 conn을 열지 않고, 무조건 execute_with_retry를 사용합니다!
+            try:
+                # 먼저 vol_energy 컬럼으로 조회를 시도합니다.
+                row = self.db.execute_with_retry(
+                    self.db.shared_db_path,
+                    "SELECT vol_energy FROM MarketStatus WHERE symbol = ?",
+                    (code,),
+                    fetch='one'
+                )
+            except:
+                row = None
+                
+            # 만약 vol_energy 컬럼이 없어서 에러가 났거나 결과가 없다면 vol_power 컬럼으로 재시도합니다. (스마트 로직 대체)
+            if not row:
+                try:
+                    row = self.db.execute_with_retry(
+                        self.db.shared_db_path,
+                        "SELECT vol_power FROM MarketStatus WHERE symbol = ?",
+                        (code,),
+                        fetch='one'
+                    )
+                except:
+                    row = None
+
+            # SQL에서 값을 성공적으로 가져왔고, AI 가짜값(1~5)이 아닌 진짜 데이터(10.0 이상)라면 반영!
+            if row and row[0] and float(row[0]) > 10.0:
+                real_vol_power = float(row[0])
+
+            # 🚀 2. 기준치 검사 (105.0 이상)
+            threshold = 105.0
+            
+            # 만약 체결강도를 못 가져왔다면 팅기지 않고 융통성 있게 임시 통과
+            if real_vol_power == 0.0:
+                self.send_log(f"⚠️ [{pretty_name}] 실시간 체결강도 SQL 확인 지연. (임시 통과)", "warning")
+                return True
+
+            if real_vol_power >= threshold:
+                return True
+            else:
+                self.send_log(f"🛡️ [3차 방어막 작동] {pretty_name} 체결강도 부족 ({real_vol_power:.1f} / 기준치: {threshold}). 가짜 반등 의심!", "warning")
+                return False
+
+        except Exception as e:
+            self.send_log(f"🚨 체결강도 검사 에러: {e}", "error")
+            return True
 
     # =====================================================================
     # 📊 1. [초단타 퀀트 지표] VWAP, 거래량 돌파 에너지 등 실시간 계산
@@ -281,8 +296,23 @@ class JubbyStrategy:
     def get_ai_features(self, df):
         if df is None or len(df) < 26: return None
         
+        # 🚀 [업그레이드 1] 1분봉이 닫히기 전이라도, 실시간 '현재가(curr_price)' 변동에 맞춰 
+        # 핵심 지표들을 0.1초만에 재계산하여 AI에게 먹여줍니다. (틱 단위 반응속도 획득!)
+        curr_price = float(df.iloc[-1]['close'])
+        prev_close = float(df.iloc[-2]['close']) if len(df) > 1 else curr_price
+        
+        if prev_close > 0: df.at[df.index[-1], 'return'] = ((curr_price - prev_close) / prev_close) * 100.0
+        
+        ma5 = float(df.iloc[-1].get('MA5', curr_price))
+        ma20 = float(df.iloc[-1].get('MA20', curr_price))
+        vwap = float(df.iloc[-1].get('VWAP', curr_price))
+        
+        if ma5 > 0: df.at[df.index[-1], 'Disparity_5'] = (curr_price / ma5) * 100.0
+        if ma20 > 0: df.at[df.index[-1], 'Disparity_20'] = (curr_price / ma20) * 100.0
+        if vwap > 0: df.at[df.index[-1], 'VWAP_Disparity'] = (curr_price / vwap) * 100.0
+
         features = [
-            'return', 'vol_change', 'RSI', 'MACD', 'BB_PctB', 'BB_Width', # 👈 BB_Lower를 BB_PctB로 이름 변경!
+            'return', 'vol_change', 'RSI', 'MACD', 'BB_PctB', 'BB_Width', 
             'Disparity_5', 'Disparity_20', 'Vol_Energy', 'OBV_Trend', 
             'ATR', 'High_Tail', 'Low_Tail', 'Buying_Pressure', 'Market_Return_1m',
             'Disparity_60', 'Disparity_120', 'Macro_Trend', 'VWAP_Disparity' 
@@ -374,7 +404,6 @@ class JubbyStrategy:
     # =====================================================================
     # 🚀 [최종 통합본] 실전 매수/매도 타점 판독 (AI 3중 필터 + 매도 비상 탈출)
     # =====================================================================
-    # 🔥 [핵심 1] is_sell_mode=False 라는 스위치를 추가합니다.
     def check_trade_signal(self, df, code, is_sell_mode=False):
         if len(df) < 26: return "WAIT"
         
@@ -386,30 +415,27 @@ class JubbyStrategy:
 
         # =================================================================
         # 🚨 [최우선 판단] 초단타 비상 탈출구 (매수 조건보다 무조건 먼저 검사!)
-        # 만약 차트가 박살나고 있다면, AI가 당장 사라고 해도 무조건 팔아야 합니다.
         # =================================================================
         # 1. 추세 붕괴 신호 (데드크로스 + 이평선 이탈)
         if current['MACD'] < current['Signal_Line'] and curr_price < current.get('MA5', curr_price):
-            # 로그 없이 즉각 SELL 반환 (속도가 생명)
             return "SELL"
             
+        # 🚀 [업그레이드 3] 세력 평단가(VWAP) 강력 이탈 시 비상 탈출!
+        curr_vwap = float(current.get('VWAP', curr_price))
+        if is_sell_mode and curr_price < curr_vwap * 0.995: # VWAP(세력평단가) 대비 -0.5% 이탈 시
+            # self.send_log(f"🚨 [긴급 탈출] {pretty_name} 세력 평단가(VWAP) 붕괴! 더 큰 하락 전 즉시 손절합니다.", "error")
+            return "SELL"
+
         # 2. 고점 과열 및 매도 폭탄(긴 윗꼬리) 감지
         try: sell_rsi = float(self.db.get_shared_setting("TRADE", "SELL_RSI", "75.0"))
         except: sell_rsi = 75.0
 
         body_size = abs(current['open'] - current['close'])
-        # 윗꼬리가 몸통보다 길면 누군가 위에서 강하게 찍어누르고 있다는 뜻!
         is_heavy_selling_pressure = current['High_Tail'] > body_size and current['High_Tail'] > 0
         
         if current['RSI'] >= sell_rsi and is_heavy_selling_pressure:
-            # 🔥 [도배 방지] 여기서 무한으로 로그를 찍지 않고 조용히 결과만 넘깁니다!
             return "SELL"
 
-        # =================================================================
-        # 🔥 [핵심 2 버그 완벽 해결] 
-        # 매도 감시 일꾼이 호출한 경우, 여기까지만 (팔지 말지만) 검사하고 빠져나갑니다!
-        # 이렇게 하면 무거운 AI 연산을 생략하여 컴퓨터 렉을 방지하고, 매수 로그 무한 도배를 차단합니다.
-        # =================================================================
         if is_sell_mode:
             return "WAIT"
 
@@ -494,8 +520,9 @@ class JubbyStrategy:
                 if self.check_orderbook_imbalance(code):
                     # 🚀 2. 체결강도(진짜 돈이 들어오는지) 검사 통과 시 최종 진입!
                     if self.check_volume_power_and_money(code):
-                        self.send_log(f"🚀 [최종 승인] {pretty_name} 모든 조건 충족! 강력 매수 진입!", "success")
-                        try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "🔥 강력 매수 신호!")
+                        # 🚀 [수정] 혼동 방지를 위해 '3차 승인'으로 변경합니다. (진짜 최종 승인은 예산 확인 후 뜹니다)
+                        self.send_log(f"🔥 [3차 승인] {pretty_name} 수급 및 체결강도 완벽! (최종 매수 예산 확인 중...)", "success")
+                        try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "🔥 매수 예산 확인 중...")
                         except: pass
                         return "BUY" 
                     else:
