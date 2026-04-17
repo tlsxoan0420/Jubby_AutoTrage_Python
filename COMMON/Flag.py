@@ -123,10 +123,11 @@ class TradeData:
                 "symbol_name": str(row.get('종목명', '')),
                 "quantity": str(row.get('보유수량', '0')),
                 "avg_price": str(row.get('평균매입가', '0')),
-                "current_price": str(row.get('현재가', '0')), # 현재가 추가
-                "pnl": str(row.get('평가손익', '0%')),
-                "available_cash": str(row.get('주문가능금액', '0')),
-                "update_count": self.account.update_count
+                "current_price": str(row.get('현재가', '0')),
+                "pnl_amt": str(row.get('평가손익금', '0')),
+                "pnl_rate": str(row.get('수익률', '0.00%')),
+                "status": str(row.get('상태', '')),
+                "available_cash": str(row.get('주문가능금액', '0'))
             })
         return result_list
 

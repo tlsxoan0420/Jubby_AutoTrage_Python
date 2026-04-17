@@ -192,17 +192,17 @@ class JubbyStrategy:
             except:
                 row = None
                 
-            # 만약 vol_energy 컬럼이 없어서 에러가 났거나 결과가 없다면 vol_power 컬럼으로 재시도합니다. (스마트 로직 대체)
-            if not row:
-                try:
-                    row = self.db.execute_with_retry(
-                        self.db.shared_db_path,
-                        "SELECT vol_power FROM MarketStatus WHERE symbol = ?",
-                        (code,),
-                        fetch='one'
-                    )
-                except:
-                    row = None
+            # 🚀 [핵심 수정] 엉뚱한 vol_energy를 읽어와서 매수가 씹히는 현상을 막기 위해,
+            # 오직 vol_power(Ticker가 저장한 순수 체결강도)만 검색하도록 코드를 단일화합니다.
+            try:
+                row = self.db.execute_with_retry(
+                    self.db.shared_db_path,
+                    "SELECT vol_power FROM MarketStatus WHERE symbol = ?",
+                    (code,),
+                    fetch='one'
+                )
+            except:
+                row = None
 
             # SQL에서 값을 성공적으로 가져왔고, AI 가짜값(1~5)이 아닌 진짜 데이터(10.0 이상)라면 반영!
             if row and row[0] and float(row[0]) > 10.0:

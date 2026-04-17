@@ -96,7 +96,9 @@ class KIS_API:
             self._log_msg(f"🚨 승인키 발급 오류: {e}")
         return None
 
-    # 🚨 [버그 수정] 취소 로직 정밀화 (이미 체결된 경우 ALREADY_FILLED 반환)
+    # ---------------------------------------------------------
+    # [1] cancel_order 함수 수정 (주문 취소 규격 완벽 대응)
+    # ---------------------------------------------------------
     def cancel_order(self, order_no):
         self._wait_for_api_rate_limit()
         if SystemConfig.MARKET_MODE != "DOMESTIC": return "FAIL"
@@ -104,7 +106,20 @@ class KIS_API:
         tr_id = "VTTC0803U" if self.is_mock else "TTTC0803U"
         cano = self.account_no[:8]
         acnt_prdt_cd = self.account_no[8:] if len(self.account_no) > 8 else "01"
-        payload = {"CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd, "ORGN_ODNO": str(order_no).zfill(10), "ORD_DVSN": "01", "RVSE_CNCL_DVSN_CD": "02", "ORD_QTY": "0", "ORD_UNPR": "0", "QTY_ALL_ORD_YN": "Y"}
+        
+        # 🚀 [버그 완벽 수정 2] 한투 API 규정상 주문 취소 시 ORD_DVSN은 반드시 "00"(지정가)이어야 합니다!
+        # 기존 "01"(시장가)로 보내면 서버가 형식이 틀렸다며 응답을 주지 않거나 실패 처리합니다.
+        payload = {
+            "CANO": cano, 
+            "ACNT_PRDT_CD": acnt_prdt_cd, 
+            "ORGN_ODNO": str(order_no).zfill(10), 
+            "ORD_DVSN": "00",  # 👈 핵심 수정 부분
+            "RVSE_CNCL_DVSN_CD": "02", 
+            "ORD_QTY": "0", 
+            "ORD_UNPR": "0", 
+            "QTY_ALL_ORD_YN": "Y"
+        }
+        
         headers = {"Content-Type": "application/json", "authorization": f"Bearer {self.access_token}", "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"}
         try:
             res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=5.0)
@@ -112,10 +127,11 @@ class KIS_API:
             msg = data.get('msg1', '')
             if data.get('rt_cd') == '0':
                 if "이미 체결" in msg or "수량이 없습니다" in msg or "완료" in msg:
-                    return "ALREADY_FILLED" # 취소 요청했으나 사실 사졌음
-                return "DONE" # 진짜 취소 성공
+                    return "ALREADY_FILLED" 
+                return "DONE" 
             else:
-                if "이미 체결" in msg: return "ALREADY_FILLED"
+                self.last_error_msg = msg # 🚀 실패 사유를 메인 UI에 넘겨주기 위해 보관합니다.
+                if "이미 체결" in msg or "취소가능수량" in msg: return "ALREADY_FILLED"
                 return "FAIL"
         except: return "ERROR"
 
@@ -140,8 +156,11 @@ class KIS_API:
             self.last_error_msg = str(e)
             return None
 
+    # ---------------------------------------------------------
+    # [2] fetch_minute_data 함수 수정 (시간순 정렬)
+    # ---------------------------------------------------------
     def fetch_minute_data(self, stock_code):
-        """ 최근 분봉 데이터 조회 및 컬럼명 변경 (KeyError 해결) """
+        """ 최근 분봉 데이터 조회 및 컬럼명 변경 """
         self._wait_for_api_rate_limit()
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
         headers = {
@@ -161,32 +180,29 @@ class KIS_API:
             if data.get('rt_cd') == '0':
                 df = pd.DataFrame(data.get('output2', []))
                 if not df.empty:
-                    # 🚀 [핵심 수정] 한투의 'stck_prpr' 컬럼을 'close'로 이름을 바꿉니다!
-                    df = df.rename(columns={'stck_prpr': 'close'})
-                    # 숫자 데이터로 변환
-                    df['close'] = pd.to_numeric(df['close'])
+                    df = df.rename(columns={
+                        'stck_prpr': 'close',
+                        'stck_oprc': 'open',
+                        'stck_hgpr': 'high',
+                        'stck_lwpr': 'low',
+                        'cntg_vol': 'volume'
+                    })
+                    
+                    # 🚀 [버그 완벽 수정 3] 한투 API는 최신 데이터가 인덱스 0에 옵니다.
+                    # 이를 과거->최신 순으로 뒤집어야 iloc[-1]을 호출했을 때 찐 '현재가'를 가져옵니다!
+                    df = df.iloc[::-1].reset_index(drop=True)
+                    
+                    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric, errors='coerce').fillna(0)
                     return df
             return None
         except: 
             return None
 
-    def get_account_balance(self):
-        PATH = "uapi/domestic-stock/v1/trading/inquire-psbl-order"
-        headers = {"content-type": "application/json", "authorization": f"Bearer {self.access_token}", "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": "VTTC8908R" if self.is_mock else "TTTC8908R", "custtype": "P"}
-        params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "PDNO": "", "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N"}
-        for _ in range(3):
-            self._wait_for_api_rate_limit()
-            try:
-                res = requests.get(f"{self.base_url}/{PATH}", headers=headers, params=params)
-                data = res.json()
-                if data.get("rt_cd") == "0": return int(data["output"]["ord_psbl_cash"])
-            except: pass
-        return 0
-
     def get_account_holdings(self):
         PATH = "uapi/domestic-stock/v1/trading/inquire-balance"
         headers = {"content-type": "application/json", "authorization": f"Bearer {self.access_token}", "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": "VTTC8434R" if self.is_mock else "TTTC8434R", "custtype": "P"}
-        params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+        acnt_prdt_cd = self.account_no[8:] if len(self.account_no) > 8 else "01"
+        params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": acnt_prdt_cd, "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
         for _ in range(3):
             self._wait_for_api_rate_limit()
             try:
@@ -194,54 +210,114 @@ class KIS_API:
                 data = res.json()
                 if data.get("rt_cd") == "0": return data.get("output1", [])
             except: pass
-        return []
+        return None
+    
+    def get_account_holdings(self):
+        PATH = "uapi/domestic-stock/v1/trading/inquire-balance"
+        headers = {"content-type": "application/json", "authorization": f"Bearer {self.access_token}", "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": "VTTC8434R" if self.is_mock else "TTTC8434R", "custtype": "P"}
+        # 🚀 [핵심] PRCS_DVSN을 "00"으로 변경하여 '당일 매수한 종목'도 실시간 잔고에 즉각 포함되도록 수정!
+        params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+        for _ in range(3):
+            self._wait_for_api_rate_limit()
+            try:
+                res = requests.get(f"{self.base_url}/{PATH}", headers=headers, params=params)
+                data = res.json()
+                if data.get("rt_cd") == "0": return data.get("output1", [])
+            except: pass
+        return None # 🚀 [] 대신 None을 반환하여 윗표 증발을 막음!
+    
+    def get_real_holdings(self): 
+        # 🚀 [핵심 수정] self.api.get_account_holdings() 에서 '.api'를 지웠습니다!
+        raw_list = self.get_account_holdings()
+        
+        if raw_list is None: return None # 통신 실패 시 방어막
+        
+        holdings_dict = {}
+        if isinstance(raw_list, list):
+            for item in raw_list:
+                code = item.get('pdno', '')
+                hldg_qty = int(item.get('hldg_qty', '0'))
+                if code and hldg_qty > 0:
+                    holdings_dict[code] = {
+                        'price': float(item.get('pchs_avg_pric', '0')), 
+                        'qty': hldg_qty
+                    }
+        return holdings_dict
     
     def get_unfilled_orders(self):
-        """ 🔍 [신규] 한투 서버에서 실제 '미체결 내역'을 직접 긁어옵니다. """
-        self._wait_for_api_rate_limit() # 초당 호출 제한 방지
+        self._wait_for_api_rate_limit() 
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
-        headers = {
-            "content-type": "application/json", 
-            "authorization": f"Bearer {self.access_token}", 
-            "appkey": self.app_key, "appsecret": self.app_secret, 
-            "tr_id": "VTTC8001R" if self.is_mock else "TTTC8001R", "custtype": "P"
-        }
-        # 오늘 날짜의 미체결(CCLD_DVSN: 02) 데이터 요청
-        params = {
-            "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01",
-            "INQR_STRT_DT": datetime.now().strftime("%Y%m%d"), "INQR_END_DT": datetime.now().strftime("%Y%m%d"),
-            "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00", "PDNO": "", "CCLD_DVSN": "02",
-            "ORD_GNO_BRNO": "", "ODNO": "", "INQR_DVSN_3": "00", "INQR_DVSN_1": "",
-            "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""
-        }
+        headers = {"content-type": "application/json", "authorization": f"Bearer {self.access_token}", "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": "VTTC8001R" if self.is_mock else "TTTC8001R", "custtype": "P"}
+        acnt_prdt_cd = self.account_no[8:] if len(self.account_no) > 8 else "01"
+        params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": acnt_prdt_cd, "INQR_STRT_DT": datetime.now().strftime("%Y%m%d"), "INQR_END_DT": datetime.now().strftime("%Y%m%d"), "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00", "PDNO": "", "CCLD_DVSN": "02", "ORD_GNO_BRNO": "", "ODNO": "", "INQR_DVSN_3": "00", "INQR_DVSN_1": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
         try:
             res = requests.get(url, headers=headers, params=params, timeout=5)
             data = res.json()
-            # 서버에서 받은 미체결 리스트 반환 (없으면 빈 리스트)
             return data.get('output1', [])
         except: return []
 
     def get_d2_deposit(self):
-        """ 💰 [신규] D+2일 뒤에 실제로 들어올 '예수금'을 조회합니다. """
         self._wait_for_api_rate_limit()
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
-        headers = {
-            "content-type": "application/json", 
-            "authorization": f"Bearer {self.access_token}", 
-            "appkey": self.app_key, "appsecret": self.app_secret, 
-            "tr_id": "VTTC8908R" if self.is_mock else "TTTC8908R", "custtype": "P"
-        }
-        params = {
-            "CANO": self.account_no[:8], "ACNT_PRDT_CD": "01", 
-            "PDNO": "005930", "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N"
-        }
+        headers = {"content-type": "application/json", "authorization": f"Bearer {self.access_token}", "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": "VTTC8908R" if self.is_mock else "TTTC8908R", "custtype": "P"}
+        acnt_prdt_cd = self.account_no[8:] if len(self.account_no) > 8 else "01"
+        params = {"CANO": self.account_no[:8], "ACNT_PRDT_CD": acnt_prdt_cd, "PDNO": "005930", "ORD_UNPR": "", "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "Y", "OVRS_ICLD_YN": "N"}
         try:
             res = requests.get(url, headers=headers, params=params, timeout=5)
             data = res.json()
-            # n2_dn_expect_cash_amt가 D+2 예수금 항목입니다.
             return int(float(data.get("output", {}).get("n2_dn_expect_cash_amt", "0")))
         except: return 0
 
+    def get_execution_details(self):
+        """ 거래소 서버에 물어봐서 주문번호별 '실제 총 체결 수량'을 딕셔너리로 가져옵니다. """
+        self._wait_for_api_rate_limit()
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        tr_id = "VTTC8001R" if self.is_mock else "TTTC8001R"
+        cano = self.account_no[:8]
+        acnt_prdt_cd = self.account_no[8:] if len(self.account_no) > 8 else "01"
+        
+        # 🚀 [핵심 원인 수정] 한투 서버가 깐깐하게 요구하는 14개 필수 검색 조건을 모두 채웠습니다!
+        # 이거 하나라도 빠지면 서버가 대답을 안 해서 탐정이 체결 확인을 못 합니다.
+        params = {
+            "CANO": cano, 
+            "ACNT_PRDT_CD": acnt_prdt_cd,
+            "INQR_STRT_DT": datetime.now().strftime('%Y%m%d'),
+            "INQR_END_DT": datetime.now().strftime('%Y%m%d'),
+            "SLL_BUY_DVSN_CD": "00",  # 00: 전체 (매도/매수 구분)
+            "INQR_DVSN": "00",        # 00: 역순
+            "PDNO": "",               # 종목코드 (공백 시 전체)
+            "CCLD_DVSN": "00",        # 00: 전체 (체결/미체결 모두 조회)
+            "ORD_GNO_BRNO": "",       # 주문채번지점번호
+            "ODNO": "",               # 주문번호 (공백 시 전체)
+            "INQR_DVSN_3": "00",      # 00: 전체
+            "INQR_DVSN_1": "",        # 조회구분1
+            "CTX_AREA_FK100": "",     # 연속조회 조건
+            "CTX_AREA_NK100": ""      # 연속조회 키
+        }
+        
+        headers = {
+            "Content-Type": "application/json", 
+            "authorization": f"Bearer {self.access_token}", 
+            "appKey": self.app_key, 
+            "appSecret": self.app_secret, 
+            "tr_id": tr_id, 
+            "custtype": "P"
+        }
+        
+        try:
+            res = requests.get(url, headers=headers, params=params, timeout=5)
+            data = res.json()
+            exec_dict = {}
+            if data.get('rt_cd') == '0':
+                for item in data.get('output1', []):
+                    odno = str(item.get('odno', '')).strip()
+                    # tot_ccld_qty = 이 주문번호로 지금까지 실제로 사거나 판 찐 개수
+                    qty = int(item.get('tot_ccld_qty', '0'))
+                    if odno: exec_dict[odno] = qty
+            return exec_dict
+        except Exception as e: 
+            print(f"체결 수량 확인 통신 에러: {e}")
+            return None
 
 # 👔 [사용자 편의 래퍼] KIS_Manager
 class KIS_Manager:
@@ -266,19 +342,7 @@ class KIS_Manager:
     def sell(self, code, qty): return self.api.order_stock(code, qty, is_buy=False)
     def get_balance(self): return self.api.get_account_balance()
     def cancel_order(self, order_no): return self.api.cancel_order(order_no)
-    def get_real_holdings(self): 
-        raw_list = self.api.get_account_holdings()
-        holdings_dict = {}
-        if isinstance(raw_list, list):
-            for item in raw_list:
-                code = item.get('pdno', '')
-                hldg_qty = int(item.get('hldg_qty', '0'))
-                if code and hldg_qty > 0:
-                    holdings_dict[code] = {
-                        'price': float(item.get('pchs_avg_pric', '0')), # 🚀 'price' 추가!
-                        'qty': hldg_qty
-                    }
-        return holdings_dict
+    def get_real_holdings(self): return self.api.get_real_holdings()
 
     def fetch_minute_data(self, code): # 🚀 UI에서 부를 수 있게 연결통로 추가!
         return self.api.fetch_minute_data(code)
@@ -291,3 +355,30 @@ class KIS_Manager:
     def fetch_minute_data(self, code): 
         """ UI의 차트 데이터 요청을 API 클래스로 전달 """
         return self.api.fetch_minute_data(code)
+    
+    def fetch_execution_details(self):
+        """ 주문번호별 실제 체결 수량을 딕셔너리로 반환합니다. """
+        return self.api.get_execution_details()
+    
+    # ---------------------------------------------------------
+    # 🔍 [핵심 추가] 거래소 실제 미체결 내역 조회 (유령 주문 판별용)
+    # ---------------------------------------------------------
+    def fetch_real_unfilled_orders_set(self):
+        """ 
+        현재 거래소(한투) 서버에 실제로 살아있는 미체결 주문번호들을 set 형태로 가져옵니다. 
+        이 명단에 없는 주문은 우리 DB에서 지워버려야 할 '유령 주문'입니다.
+        """
+        # 기존에 만들어둔 get_unfilled_orders 함수를 활용합니다.
+        raw_list = self.api.get_unfilled_orders() 
+        
+        real_unfilled_nos = set()
+        if isinstance(raw_list, list):
+            for item in raw_list:
+                # 주문번호(odno)를 추출하여 공백 제거 후 저장
+                odno = item.get('odno')
+                if odno:
+                    real_unfilled_nos.add(str(odno).strip())
+        
+        # 🚀 [주석] 만약 서버 에러로 리스트를 못 가져왔다면 None을 반환하여 
+        # 탐정이 함부로 DB를 지우지 못하게 방어막을 칩니다.
+        return real_unfilled_nos if raw_list is not None else None

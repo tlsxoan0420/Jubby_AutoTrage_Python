@@ -56,12 +56,24 @@ class MessageProcessorWorker(QThread):
                 # 1. 내 계좌 체결 통보 파싱 (H0STCNI0 / H0STCNI9)
                 if tr_id_recv in ["H0STCNI0", "H0STCNI9"]:
                     content = parts[3].split('^')
-                    if len(content) < 12: return
+                    # 🚀 [치명적 버그 수정] 한투 규격에 맞게 인덱스 번호를 완전히 맞췄습니다!
+                    if len(content) < 15: return
                     try:
+                        ccld_yn = content[13].strip() 
+                        if ccld_yn != '1': return # '1'(체결)일 때만 반응합니다.
+                        
+                        # 🚀 [버그 완벽 수정 1: 체결 지연 해결]
+                        # KIS 서버가 부여한 주문번호(예: 0000029486)에서 앞의 0을 지워버리면,
+                        # DB에 저장된 원본(0000029486)과 매칭되지 않아 즉각적인 '체결완료' 업데이트가 누락됩니다.
+                        # 따라서 .lstrip('0')을 삭제하고 원본 그대로 사용합니다!
+                        order_no = content[2].strip()
+                        
                         exec_data = {
-                            "주문번호": content[1], "종목코드": content[3], 
-                            "체결수량": int(content[5]), "체결가": float(content[6]), 
-                            "체결시간": f"{content[7][:2]}:{content[7][2:4]}:{content[7][4:6]}"
+                            "주문번호": order_no, 
+                            "종목코드": content[8].strip(), # 🚀 3 -> 8 로 수정
+                            "체결수량": int(content[9]),    # 🚀 5 -> 9 로 수정
+                            "체결가": float(content[10]),   # 🚀 6 -> 10 으로 수정
+                            "체결시간": f"{content[11][:2]}:{content[11][2:4]}:{content[11][4:6]}" if len(content[11]) >= 6 else content[11]
                         }
                         self.sig_real_execution.emit(exec_data)
                     except: pass
@@ -69,23 +81,36 @@ class MessageProcessorWorker(QThread):
                 # 2. 실시간 현재가 및 체결강도 DB 저장 (H0STCNT0)
                 elif tr_id_recv == "H0STCNT0":
                     content = parts[3].split('^')
-                    # 💡 [체결강도 획득] KIS API의 22번 방이 '체결강도'입니다. (100 이상이면 매수세 우위)
                     if len(content) >= 23:
                         try:
                             symbol = content[0]
                             curr_price = float(content[2])
-                            vol_power = float(content[22]) # 🚀 체결강도 추출!
+                            vol_power = float(content[22]) 
                             
-                            # MarketStatus의 vol_energy 컬럼에 체결강도를 덮어씁니다.
-                            self.ws_conn.execute("UPDATE MarketStatus SET last_price = ?, vol_energy = ? WHERE symbol = ?", 
-                                                 (curr_price, vol_power, symbol))
-                        except: pass 
+                            # 🚀 [버그 완벽 수정 1] UPDATE만 하면 DB에 종목이 없을 때 시세 갱신이 누락됩니다.
+                            # INSERT ON CONFLICT를 사용하여 방이 없으면 만들고, 있으면 갱신하도록 수정합니다!
+                            query = """
+                                INSERT INTO MarketStatus (symbol, last_price, vol_power)
+                                VALUES (?, ?, ?)
+                                ON CONFLICT(symbol) DO UPDATE SET
+                                last_price = excluded.last_price,
+                                vol_power = excluded.vol_power
+                            """
+                            self.ws_conn.execute(query, (symbol, curr_price, vol_power))
+                        except: pass
                     elif len(content) >= 3:
                         try:
                             symbol = content[0]; curr_price = float(content[2])
-                            self.ws_conn.execute("UPDATE MarketStatus SET last_price = ? WHERE symbol = ?", (curr_price, symbol))
+                            # 🚀 여기도 동일하게 방어막을 적용합니다.
+                            query = """
+                                INSERT INTO MarketStatus (symbol, last_price)
+                                VALUES (?, ?)
+                                ON CONFLICT(symbol) DO UPDATE SET
+                                last_price = excluded.last_price
+                            """
+                            self.ws_conn.execute(query, (symbol, curr_price))
                         except: pass
-
+                        
                 # 3. 실시간 호가 잔량 DB 저장 (H0STASP0)
                 elif tr_id_recv == "H0STASP0":
                     content = parts[3].split('^')
@@ -417,6 +442,10 @@ class FormTicker(QtWidgets.QWidget):
             if target_symbol not in self.ws_worker.tracked_symbols:
                 self.ws_worker.subscribe_stock_realtime(target_symbol)
                 self.ws_worker.tracked_symbols.add(target_symbol)
+            
+            # 🔥 [잔고 완벽 동기화] 체결 완료 시, 탐정을 기다리지 않고 즉시 HTS 실제 잔고를 새로고침합니다!
+            if self.main_ui:
+                QtCore.QMetaObject.invokeMethod(self.main_ui, "load_real_holdings", QtCore.Qt.QueuedConnection)
                 
     def snap_to_main(self):
         if not self.main_ui: return

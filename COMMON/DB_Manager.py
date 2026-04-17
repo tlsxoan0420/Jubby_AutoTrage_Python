@@ -152,6 +152,7 @@ class JubbyDB_Manager:
                 if "last_price" not in m_cols: conn.execute("ALTER TABLE MarketStatus ADD COLUMN last_price REAL")
                 if "ask_size" not in m_cols: conn.execute("ALTER TABLE MarketStatus ADD COLUMN ask_size REAL")
                 if "bid_size" not in m_cols: conn.execute("ALTER TABLE MarketStatus ADD COLUMN bid_size REAL")
+                if "vol_power" not in m_cols: conn.execute("ALTER TABLE MarketStatus ADD COLUMN vol_power REAL") # 🔥 [핵심 추가] 이 방이 없어서 현재가 업데이트가 튕겼습니다!
             except Exception: pass
 
             # 🟢 [기본 설정값 세팅]
@@ -222,18 +223,30 @@ class JubbyDB_Manager:
 
     def update_market_table(self, data_list):
         if not data_list: return
+        # 🚀 [치명적 버그 수정] REPLACE INTO 대신 ON CONFLICT DO UPDATE를 사용하여
+        # 기존 행을 삭제하지 않고 필요한 값만 살짝 덮어씌웁니다. (Ticker 데이터 증발 완벽 방지!)
         self.execute_many_with_retry(
             self.shared_db_path,
-            "DELETE FROM MarketStatus",
-            "REPLACE INTO MarketStatus (symbol, symbol_name, last_price, open_price, high_price, low_price, return_1m, trade_amount, vol_energy, disparity, volume) VALUES (:symbol, :symbol_name, :last_price, :open_price, :high_price, :low_price, :return_1m, :trade_amount, :vol_energy, :disparity, :volume)",
+            None, # DELETE 쿼리 제거 (기존 데이터를 보존해야 함)
+            '''
+            INSERT INTO MarketStatus (symbol, symbol_name, last_price, open_price, high_price, low_price, return_1m, trade_amount, vol_energy, disparity, volume) 
+            VALUES (:symbol, :symbol_name, :last_price, :open_price, :high_price, :low_price, :return_1m, :trade_amount, :vol_energy, :disparity, :volume)
+            ON CONFLICT(symbol) DO UPDATE SET
+                last_price=excluded.last_price, open_price=excluded.open_price, 
+                high_price=excluded.high_price, low_price=excluded.low_price, 
+                return_1m=excluded.return_1m, trade_amount=excluded.trade_amount, 
+                vol_energy=excluded.vol_energy, disparity=excluded.disparity, volume=excluded.volume
+                -- 💡 주의: 여기서 vol_power, ask_size, bid_size는 업데이트하지 않아야 FormTicker가 저장한 실시간 데이터가 보존됩니다!
+            ''',
             data_list
         )
 
     def update_account_table(self, data_list):
         if not data_list: return
+        # 🚀 [치명적 버그 수정] AccountStatus 테이블도 증발을 막기 위해 동일하게 변경합니다.
         self.execute_many_with_retry(
             self.shared_db_path,
-            "DELETE FROM AccountStatus",
+            "DELETE FROM AccountStatus", # 잔고는 전량 매도 시 0주가 되어 표에서 사라져야 하므로 DELETE 후 INSERT 하는 것이 맞습니다. (유지)
             "REPLACE INTO AccountStatus (symbol, symbol_name, quantity, avg_price, current_price, pnl_amt, pnl_rate, available_cash) VALUES (:symbol, :symbol_name, :quantity, :avg_price, :current_price, :pnl_amt, :pnl_rate, :available_cash)",
             data_list
         )
@@ -256,7 +269,7 @@ class JubbyDB_Manager:
                     VALUES (:symbol, :symbol_name, :ai_prob, :ma_5, :ma_20, :RSI, :macd, :signal, :status_msg)
                     ON CONFLICT(symbol) DO UPDATE SET
                     ai_prob=excluded.ai_prob, ma_5=excluded.ma_5, ma_20=excluded.ma_20, 
-                    RSI=excluded.RSI, macd=excluded.macd, signal=excluded.signal
+                    RSI=excluded.RSI, macd=excluded.macd, signal=excluded.signal, status_msg=excluded.status_msg
                 ''', data_list)
                 conn.execute("COMMIT;")
                 return # 성공적으로 저장했으면 즉시 함수 탈출

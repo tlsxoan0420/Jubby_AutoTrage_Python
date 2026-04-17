@@ -210,8 +210,9 @@ def calculate_indicators_logic(df, market_dict, future_window=10, profit_target=
     df['future_min'] = df['close'].shift(-future_window).rolling(window=future_window, min_periods=1).min()
     df['Target_Buy'] = np.where((df['future_max'] >= df['close'] * (1 + profit_target/100)) & (df['future_min'] > df['close'] * (1 - stop_loss/100)), 1, 0)
     
-    # 💡 불필요한 계산용 찌꺼기 컬럼 삭제
-    df.drop(['Typical_Price', 'TP_Volume'], axis=1, inplace=True, errors='ignore')
+    # 💡 [핵심 수정] AI 훈련에 들어가지 않는 쓰레기 데이터(Typical_Price, 볼린저 상하단 밴드 등)를 
+    # 완벽하게 삭제하여 SQLite DB 용량 팽창과 AI 훈련 속도 저하를 막습니다.
+    df.drop(['Typical_Price', 'TP_Volume', 'VWAP', 'BB_Upper', 'BB_Lower'], axis=1, inplace=True, errors='ignore')
     
     return df.dropna().reset_index(drop=True)
 
