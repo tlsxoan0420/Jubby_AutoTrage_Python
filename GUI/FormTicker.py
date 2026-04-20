@@ -87,8 +87,6 @@ class MessageProcessorWorker(QThread):
                             curr_price = float(content[2])
                             vol_power = float(content[22]) 
                             
-                            # 🚀 [버그 완벽 수정 1] UPDATE만 하면 DB에 종목이 없을 때 시세 갱신이 누락됩니다.
-                            # INSERT ON CONFLICT를 사용하여 방이 없으면 만들고, 있으면 갱신하도록 수정합니다!
                             query = """
                                 INSERT INTO MarketStatus (symbol, last_price, vol_power)
                                 VALUES (?, ?, ?)
@@ -96,19 +94,25 @@ class MessageProcessorWorker(QThread):
                                 last_price = excluded.last_price,
                                 vol_power = excluded.vol_power
                             """
-                            self.ws_conn.execute(query, (symbol, curr_price, vol_power))
+                            # 🚀 [버그 완벽 수정] 팅김 방지! ws_conn.execute 직접 호출 대신, 
+                            # DB가 잠겨있을 때 자동으로 대기했다가 처리해주는 만능 래퍼 함수 사용!
+                            self.db.execute_with_retry(
+                                self.db.shared_db_path, query, (symbol, curr_price, vol_power)
+                            )
                         except: pass
                     elif len(content) >= 3:
                         try:
                             symbol = content[0]; curr_price = float(content[2])
-                            # 🚀 여기도 동일하게 방어막을 적용합니다.
                             query = """
                                 INSERT INTO MarketStatus (symbol, last_price)
                                 VALUES (?, ?)
                                 ON CONFLICT(symbol) DO UPDATE SET
                                 last_price = excluded.last_price
                             """
-                            self.ws_conn.execute(query, (symbol, curr_price))
+                            # 🚀 [수정] 여기도 동일하게 안전망 적용
+                            self.db.execute_with_retry(
+                                self.db.shared_db_path, query, (symbol, curr_price)
+                            )
                         except: pass
                         
                 # 3. 실시간 호가 잔량 DB 저장 (H0STASP0)
@@ -118,8 +122,12 @@ class MessageProcessorWorker(QThread):
                         try:
                             symbol = content[0]
                             total_ask_size = float(content[43]); total_bid_size = float(content[73])
-                            self.ws_conn.execute("UPDATE MarketStatus SET ask_size = ?, bid_size = ? WHERE symbol = ?", 
-                                        (total_ask_size, total_bid_size, symbol))
+                            
+                            # 🚀 [수정] 무방비 UPDATE 대신 방어막 적용
+                            query = "UPDATE MarketStatus SET ask_size = ?, bid_size = ? WHERE symbol = ?"
+                            self.db.execute_with_retry(
+                                self.db.shared_db_path, query, (total_ask_size, total_bid_size, symbol)
+                            )
                         except: pass
         else:
             # 4. 시스템 메시지 처리
@@ -364,20 +372,39 @@ class FormTicker(QtWidgets.QWidget):
         if filled_qty == 0 and not is_cancel:
             return
 
-        # 🌟 1. 상태 판별 (취소인지, 체결인지, 부분체결인지)
+        # 🌟 1. 상태 판별 (취소인지, 체결인지, 부분체결인지 완벽 판별)
         db_status = "체결완료"
-        if is_cancel:
-            db_status = "주문취소"
-        else:
-            try:
-                conn = self.db._get_connection(self.db.shared_db_path)
-                cursor = conn.execute("SELECT quantity FROM TradeHistory WHERE order_no = ?", (target_ono,))
-                row = cursor.fetchone()
-                if row and 0 < filled_qty < int(row[0]):
-                    db_status = "부분체결"
-            except: pass
-            finally:
-                if 'conn' in locals() and conn: conn.close()
+        try:
+            conn = self.db._get_connection(self.db.shared_db_path)
+            # 기존 DB에 저장되어 있던 진짜 총 주문량과 체결량을 가져옵니다.
+            cursor = conn.execute("SELECT quantity, filled_quantity FROM TradeHistory WHERE order_no = ?", (target_ono,))
+            row = cursor.fetchone()
+            
+            if row:
+                total_qty = int(row[0])
+                prev_filled = int(row[1] if row[1] else 0)
+                
+                if is_cancel:
+                    # 🚀 [버그 완벽 수정 1] 취소 알림이 온 경우!
+                    # 기존에 체결된 게 1개라도 있다면 "부분체결/잔여취소", 아예 0개면 "주문취소"로 명확히 나눕니다.
+                    if prev_filled > 0:
+                        db_status = "부분체결/잔여취소"
+                    else:
+                        db_status = "주문취소"
+                        
+                    # 🚨 덮어쓰기 금지! 취소 알림의 수량(보통 남은 수량)을 무시하고, 기존 체결량을 그대로 유지합니다.
+                    filled_qty = prev_filled 
+                else:
+                    # 🚀 [기존 수정 유지] 체결 알림이 온 경우 누적 합산!
+                    new_filled_qty = prev_filled + filled_qty 
+                    if new_filled_qty < total_qty:
+                        db_status = "부분체결"
+                    else:
+                        db_status = "체결완료"
+                    filled_qty = new_filled_qty 
+        except: pass
+        finally:
+            if 'conn' in locals() and conn: conn.close()
 
         # 🌟 2. [가장 중요] DB에 상태를 쓰고 반드시 'commit(도장)'을 찍습니다.
         try:
@@ -426,9 +453,18 @@ class FormTicker(QtWidgets.QWidget):
         finally:
             if 'conn' in locals() and conn: conn.close()
 
-        # 🚀 [완벽 수정] 사장님(Main UI)에게 "안전하게 표 새로고침 해주세요!" 라고 메모만 던지고 도망갑니다.
+        # 🚀 [완벽 복구 & 렉 방지] 사장님(Main UI)에게 표 새로고침을 요청합니다.
+        # 단, 렉을 방지하기 위해 1초에 한 번만 호출되도록 방어막(Throttle)을 칩니다.
         if self.main_ui:
-            QtCore.QMetaObject.invokeMethod(self.main_ui, "refresh_order_table", QtCore.Qt.QueuedConnection)
+            now = time.time()
+            # 마지막으로 새로고침을 요청한 지 1초가 지났을 때만 실행 (렉 방지)
+            if not hasattr(self, 'last_refresh_time') or (now - self.last_refresh_time) > 1.0:
+                self.last_refresh_time = now
+                QtCore.QMetaObject.invokeMethod(self.main_ui, "refresh_order_table", QtCore.Qt.QueuedConnection)
+                
+                # 체결이 완료되었다면 메인 스레드에게 "데이터 C#으로 쏴라!" 라고 버튼 클릭 신호도 보냅니다.
+                if db_status == "체결완료" or is_cancel:
+                    QtCore.QMetaObject.invokeMethod(self.main_ui, "btnDataSendClickEvent", QtCore.Qt.QueuedConnection)
         
         # 🌟 4. 안전하게 가져온 정보로 로그 출력 및 웹소켓 구독 시작
         if is_cancel:

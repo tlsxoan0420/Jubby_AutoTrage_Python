@@ -185,82 +185,77 @@ class DetectiveWorker(QThread):
             except Exception: pass
 
     def smart_cross_check_logic(self):
-        """ [탐정 전담반 V5 - 최종 완전판] 주문번호 오류 무시 & 찐 계좌 대조 로직 """
+        """ [탐정 전담반 V6 - 최종 완전판] 직무유기 버그 소거 및 강제 마감 처리 """
         try:
             conn = self.mw.db._get_connection(self.mw.db.shared_db_path)
-            cursor = conn.execute("SELECT order_no, symbol, type, quantity, price, time FROM TradeHistory WHERE Status LIKE '%미체결%'")
+            cursor = conn.execute("SELECT order_no, symbol, type, quantity, price, time FROM TradeHistory WHERE Status IN ('미체결', '부분체결')")
             pending_orders = cursor.fetchall()
             conn.close()
         except: return
 
         if not pending_orders: return
 
-        # 🚀 1. 거래소 체결 명단 긁어오기
         exec_details = self.mw.api_manager.fetch_execution_details() or {}
-        
-        # 🚀 2. HTS 찐 계좌 잔고 긁어오기 (최강의 안전장치)
         real_holdings = self.mw.api_manager.get_real_holdings() or {}
-
         now_time = datetime.now()
 
         for order in pending_orders:
             db_order_no, symbol, o_type, ordered_qty, price, o_time = order
             ordered_qty = int(ordered_qty)
             stock_name = self.mw.DYNAMIC_STOCK_DICT.get(symbol, symbol)
-            
-            # 🚨 [치명적 버그 수정] 한투 서버의 "000015587"과 우리 DB의 "15587"을 맞추기 위해 앞의 0을 다 뗍니다!
             target_no = str(db_order_no).strip().lstrip('0') 
 
             actual_filled_qty = 0
             for k, v in exec_details.items():
                 if str(k).strip().lstrip('0') == target_no:
-                    actual_filled_qty = v
+                    actual_filled_qty = int(v)
                     break
             
-            # 🚨 [안전장치 2] 주문번호 매칭이 안 되더라도, 찐 계좌 잔고에 이 주식이 들어와 있다면? 체결된 것임!
-            is_in_balance = symbol in real_holdings
+            # 매수(BUY)인데 이미 잔고에 들어와있다면 체결로 간주
+            if actual_filled_qty == 0 and o_type == "BUY" and symbol in real_holdings:
+                actual_filled_qty = int(real_holdings[symbol]['qty'])
+                if actual_filled_qty < ordered_qty: actual_filled_qty = ordered_qty
 
             # ---------------------------------------------------------
-            # 🚀 [상황 1] 사자마자 바로 체결 확인됨! (주문번호 매칭 성공 OR 잔고 입고 확인)
+            # 🚀 [상황 1] 체결 완료! (전량 체결 판별)
             # ---------------------------------------------------------
-            if actual_filled_qty >= ordered_qty or (o_type == "BUY" and is_in_balance):
-                final_qty = actual_filled_qty if actual_filled_qty > 0 else ordered_qty
-                
-                self.sig_log.emit(f"✅ [{stock_name}] 실제 체결 및 HTS 입고 확인 완료! 위 표에 반영합니다.", "success")
-                self._update_status_safely(db_order_no, "체결완료", final_qty, float(price))
-                
-                # 🚀 탐정이 직접 계산하지 않고, 확실하게 HTS 찐 잔고를 긁어와서 윗 표를 100% 동기화합니다!
+            if actual_filled_qty >= ordered_qty and ordered_qty > 0:
+                self.sig_log.emit(f"✅ [{stock_name}] 거래소 체결(전량) 확인 완료! 표에 반영합니다.", "success")
+                self._update_status_safely(db_order_no, "체결완료", ordered_qty, float(price))
                 QtCore.QMetaObject.invokeMethod(self.mw, "load_real_holdings", QtCore.Qt.QueuedConnection)
                 continue
 
             # ---------------------------------------------------------
-            # 🚀 [상황 2] 30초가 지나도 체결이 안 될 때 (강제 취소)
+            # 🚀 [상황 2] 30초가 지나도 체결이 안 될 때 (강제 취소 및 마감)
             # ---------------------------------------------------------
             try: order_time = datetime.strptime(o_time, '%Y-%m-%d %H:%M:%S')
             except: continue
             elapsed_seconds = (now_time - order_time).total_seconds()
 
             if elapsed_seconds > 30:
-                if not hasattr(self.mw, 'buy_worker') or self.mw.buy_worker is None or not self.mw.buy_worker.is_running:
-                    continue
-
                 res = self.mw.api_manager.cancel_order(db_order_no) 
                 
-                if res == "ALREADY_FILLED":
-                    self._update_status_safely(db_order_no, "체결완료", ordered_qty, float(price))
-                    QtCore.QMetaObject.invokeMethod(self.mw, "load_real_holdings", QtCore.Qt.QueuedConnection)
-                
-                elif res == "DONE":
-                    if actual_filled_qty > 0:
+                # 🚀 [버그 완벽 수정 2] 탐정의 멍청한 오판을 막고, KIS에서 긁어온 '진짜 체결량(actual_filled_qty)'만 믿습니다!
+                error_msg = getattr(self.mw.api_manager.api, 'last_error_msg', '')
+                ghost_keywords = ["이미 취소", "해당 주문", "내역이없습니다", "주문번호가 잘못", "취소가능수량"]
+                is_ghost_or_already_canceled = any(kw in error_msg for kw in ghost_keywords)
+
+                if res in ["DONE", "ALREADY_FILLED"] or is_ghost_or_already_canceled:
+                    # 취소 처리가 끝났거나, 이미 취소된 주문이라면 -> 진짜 체결량을 기준으로 최종 상태를 못 박습니다!
+                    if actual_filled_qty >= ordered_qty:
+                        self.sig_log.emit(f"✅ [{stock_name}] 전량 체결 완료!", "success")
+                        self._update_status_safely(db_order_no, "체결완료", actual_filled_qty, float(price))
+                    elif actual_filled_qty > 0:
+                        self.sig_log.emit(f"✂️ [{stock_name}] {actual_filled_qty}주 체결 후 잔여 미체결분 취소 완료!", "warning")
                         self._update_status_safely(db_order_no, "부분체결/잔여취소", actual_filled_qty, float(price))
-                        QtCore.QMetaObject.invokeMethod(self.mw, "load_real_holdings", QtCore.Qt.QueuedConnection)
                     else:
+                        self.sig_log.emit(f"🗑️ [{stock_name}] 30초 경과 전량 주문취소 완료!", "warning")
                         self._update_status_safely(db_order_no, "주문취소", 0, float(price))
+                    
+                    QtCore.QMetaObject.invokeMethod(self.mw, "load_real_holdings", QtCore.Qt.QueuedConnection)
                 else:
-                    error_msg = getattr(self.mw.api_manager.api, 'last_error_msg', '')
-                    ghost_keywords = ["이미 취소", "해당 주문", "내역이없습니다", "주문번호가 잘못"]
-                    if any(kw in error_msg for kw in ghost_keywords):
-                        self._update_status_safely(db_order_no, "취소완료(유령소거)", 0, float(price))
+                    if "초과" not in error_msg: 
+                        self.sig_log.emit(f"⚠️ [{stock_name}] 취소 지연: {error_msg}", "warning")
 
     def _apply_to_holdings(self, symbol, o_type, qty, price):
         """ 탐정이 확인한 '진짜 체결 수량'만 잔고(my_holdings)에 더하거나 뺍니다. """
@@ -291,23 +286,24 @@ class DetectiveWorker(QThread):
         try:
             conn = self.mw.db._get_connection(self.mw.db.shared_db_path)
             
-            # 💡 [핵심 SQL] WHERE 절에 Status = '미체결'을 추가했습니다.
-            # 이렇게 하면, 이미 체결된 데이터는 이 쿼리가 작동하지 않아 안전하게 보존됩니다.
+            # 💡 [핵심 수정] 부분체결 상태도 업데이트를 허용합니다.
             query = """
                 UPDATE TradeHistory 
                 SET Status = ?, filled_quantity = ?, price = ? 
-                WHERE order_no = ? AND Status = '미체결'
+                WHERE order_no = ? AND Status IN ('미체결', '부분체결')
             """
             cursor = conn.execute(query, (new_status, filled_qty, real_price, order_no))
             
-            # 실제로 수정이 일어난 경우에만 커밋하고 UI를 갱신합니다.
+            # 실제로 수정이 일어난 경우에만 커밋하고 UI를 강제 갱신합니다.
             if cursor.rowcount > 0:
                 conn.commit()
+                # 🚀 [추가] UI 표 새로고침과 C# TCP 전송을 동시에 트리거하여 화면을 즉각 바꿉니다!
                 QtCore.QMetaObject.invokeMethod(self.mw, "refresh_order_table", QtCore.Qt.QueuedConnection)
+                QtCore.QMetaObject.invokeMethod(self.mw, "btnDataSendClickEvent", QtCore.Qt.QueuedConnection)
             
             conn.close()
         except Exception as e:
-            print(f"탐정 DB 업데이트 에러: {e}")   
+            print(f"탐정 DB 업데이트 에러: {e}")
 
     def _update_status_and_ui(self, order_no, symbol, o_type, db_status, ordered_qty=0, filled_qty=0, real_price=0.0):
         """ [부분 체결 수학 계산의 마법사] 잔고와 DB를 완벽하게 동기화합니다. """
@@ -415,21 +411,27 @@ class SellGuardianWorker(QThread):
 
     def run(self):
         self.is_running = True
-        self.sig_log.emit("📺 [모니터 요원] 잔고 감시 및 1분 브리핑 전담 스레드 가동!", "info")
-        db_temp = JubbyDB_Manager()
+        # 🚀 1. 로그를 '모니터 요원'에서 '매도 수호자'로 알맞게 변경
+        self.sig_log.emit("🦅 [매도 수호자] 실시간 매도 전담 스레드 가동!", "info")
         loop_count = 0 
         
         while self.is_running:
             try:
-                self.update_ui_and_log(db_temp)
+                # 🚀 2. [치명적 버그 수정] update_ui_and_log 대신 진짜 매도 함수를 실행합니다!
+                self.process_selling()
                 
-                # 🚀 [버그 완벽 수정 3] 10초마다 찐 계좌 잔고를 긁어와서 동기화시킵니다!
-                # 이렇게 하면 웹소켓 알림이 씹히더라도 화면의 '미체결'이 빛의 속도로 '체결완료'로 바뀝니다.
+                # 10초마다 찐 계좌 잔고를 긁어와서 동기화
                 if loop_count % 10 == 0:
-                    QtCore.QMetaObject.invokeMethod(self.mw, "load_real_holdings", QtCore.Qt.QueuedConnection)
+                    try:
+                        # self.mw 가 아니라 self.main_ui 일 수도 있으므로 둘 다 확인!
+                        target_ui = getattr(self, 'mw', getattr(self, 'main_ui', None))
+                        if target_ui:
+                            QtCore.QMetaObject.invokeMethod(target_ui, "load_real_holdings", QtCore.Qt.QueuedConnection)
+                    except: pass
                     
             except Exception as e:
-                self.sig_log.emit(f"🚨 [모니터 요원 에러] {e}", "error") 
+                # 에러 로그도 매도 수호자로 명확하게 분리
+                self.sig_log.emit(f"🚨 [매도 수호자 에러] {e}", "error") 
             
             time.sleep(1.0) 
             loop_count += 1
@@ -1552,72 +1554,94 @@ class FormMain(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot() 
     def btnDataSendClickEvent(self):
-        def clean_num(val): 
-            v = str(val).replace(",", "").replace("%", "").strip()
-            if v.lower() in ["", "nan", "inf", "-inf", "infinity"]: return "0.0"
-            if v == "-": return "0.0" 
-            try: return str(float(v))
-            except ValueError: return "0.0"
+        """ 🚀 [버벅임 완벽 해결 2] 수백 개의 DB 저장 및 TCP 통신 작업을 백그라운드 스레드로 넘겨 화면 렉 원천 차단! """
+        
+        # 1. 화면(UI 스레드)에서 표 데이터(DataFrame)를 안전하게 복사(Copy)해옵니다.
+        # 이렇게 하면 일꾼이 이 데이터를 DB에 쓰는 동안 원본이 바뀌어서 팅기는 사고를 막을 수 있습니다.
+        market_df = TradeData.market.df.copy() if not TradeData.market.df.empty else pd.DataFrame()
+        account_df = TradeData.account.df.copy() if not TradeData.account.df.empty else pd.DataFrame()
+        strategy_df = TradeData.strategy.df.copy() if not TradeData.strategy.df.empty else pd.DataFrame()
 
-        def get_symbol(row):
-            sym = str(row.get("종목코드", ""))
-            if sym in ["", "0"]: return ""
-            if sym == "-": return sym
-            return sym.zfill(6) if SystemConfig.MARKET_MODE == "DOMESTIC" else sym
+        def sync_task():
+            def clean_num(val): 
+                v = str(val).replace(",", "").replace("%", "").strip()
+                if v.lower() in ["", "nan", "inf", "-inf", "infinity"]: return "0.0"
+                if v == "-": return "0.0" 
+                try: return str(float(v))
+                except ValueError: return "0.0"
 
-        market_list = []
-        if not TradeData.market.df.empty:
-            for _, row in TradeData.market.df.iterrows():
-                sym = get_symbol(row)
-                if not sym: continue
-                market_list.append({"symbol": sym, "symbol_name": str(row.get("종목명", "")), "last_price": float(clean_num(row.get("현재가", "0"))), "open_price": float(clean_num(row.get("시가", "0"))), "high_price": float(clean_num(row.get("고가", "0"))), "low_price": float(clean_num(row.get("저가", "0"))), "return_1m": float(clean_num(row.get("1분등락률", "0"))), "trade_amount": float(clean_num(row.get("거래대금", "0"))), "vol_energy": float(clean_num(row.get("거래량에너지", "1"))), "disparity": float(clean_num(row.get("이격도", "100"))), "volume": float(clean_num(row.get("거래량", "0")))})
-            try: self.db.update_market_table(market_list)
-            except Exception as e: self.add_log(f"🚨 MarketStatus DB 에러: {e}", "error")
+            def get_symbol(row):
+                sym = str(row.get("종목코드", ""))
+                if sym in ["", "0"]: return ""
+                if sym == "-": return sym
+                return sym.zfill(6) if SystemConfig.MARKET_MODE == "DOMESTIC" else sym
 
-        account_list = []
-        if not TradeData.account.df.empty:
-            for _, row in TradeData.account.df.iterrows():
-                sym = get_symbol(row)
-                if not sym: continue
-                curr_price = float(clean_num(row.get("현재가", "0")))
-                account_list.append({"symbol": sym, "symbol_name": str(row.get("종목명", "")), "quantity": int(float(clean_num(row.get("보유수량", "0")))), "avg_price": float(clean_num(row.get("평균매입가", "0"))), "current_price": curr_price, "pnl_amt": float(clean_num(row.get("평가손익금", "0"))), "pnl_rate": float(clean_num(row.get("수익률", "0"))), "available_cash": float(clean_num(row.get("주문가능금액", "0")))})
-                if curr_price > 0:
-                    try: self.db.insert_price_history(sym, curr_price)
-                    except: pass
-            try: self.db.update_account_table(account_list)
-            except Exception as e: self.add_log(f"🚨 AccountStatus DB 에러: {e}", "error")
+            # [Market DB 동기화]
+            market_list = []
+            if not market_df.empty:
+                for _, row in market_df.iterrows():
+                    sym = get_symbol(row)
+                    if not sym: continue
+                    market_list.append({"symbol": sym, "symbol_name": str(row.get("종목명", "")), "last_price": float(clean_num(row.get("현재가", "0"))), "open_price": float(clean_num(row.get("시가", "0"))), "high_price": float(clean_num(row.get("고가", "0"))), "low_price": float(clean_num(row.get("저가", "0"))), "return_1m": float(clean_num(row.get("1분등락률", "0"))), "trade_amount": float(clean_num(row.get("거래대금", "0"))), "vol_energy": float(clean_num(row.get("거래량에너지", "1"))), "disparity": float(clean_num(row.get("이격도", "100"))), "volume": float(clean_num(row.get("거래량", "0")))})
+                try: self.db.update_market_table(market_list)
+                except Exception as e: pass
 
-        strategy_list = []
-        if not TradeData.strategy.df.empty:
-            for _, row in TradeData.strategy.df.iterrows():
-                sym = get_symbol(row)
-                if not sym: continue
-                sig = str(row.get("전략신호", "")); sig = "BUY" if "BUY" in sig else ("SELL" if "SELL" in sig else ("WAIT" if "WAIT" in sig else sig))
+            # [Account DB 동기화]
+            account_list = []
+            if not account_df.empty:
+                for _, row in account_df.iterrows():
+                    sym = get_symbol(row)
+                    if not sym: continue
+                    curr_price = float(clean_num(row.get("현재가", "0")))
+                    account_list.append({"symbol": sym, "symbol_name": str(row.get("종목명", "")), "quantity": int(float(clean_num(row.get("보유수량", "0")))), "avg_price": float(clean_num(row.get("평균매입가", "0"))), "current_price": curr_price, "pnl_amt": float(clean_num(row.get("평가손익금", "0"))), "pnl_rate": float(clean_num(row.get("수익률", "0"))), "available_cash": float(clean_num(row.get("주문가능금액", "0")))})
+                    if curr_price > 0:
+                        try: self.db.insert_price_history(sym, curr_price)
+                        except: pass
+                try: self.db.update_account_table(account_list)
+                except Exception as e: pass
+
+            # [Strategy DB 동기화]
+            strategy_list = []
+            if not strategy_df.empty:
+                for _, row in strategy_df.iterrows():
+                    sym = get_symbol(row)
+                    if not sym: continue
+                    sig = str(row.get("전략신호", "")); sig = "BUY" if "BUY" in sig else ("SELL" if "SELL" in sig else ("WAIT" if "WAIT" in sig else sig))
+                    
+                    ai_prob_str = str(row.get("상승확률", "0")).replace("%", "")
+                    try: ai_prob = float(ai_prob_str)
+                    except ValueError: ai_prob = 0.0
+
+                    strategy_list.append({
+                        "symbol": sym, "symbol_name": str(row.get("종목명", "")), "ai_prob": ai_prob,
+                        "ma_5": float(clean_num(row.get("MA_5", "0"))), "ma_20": float(clean_num(row.get("MA_20", "0"))), 
+                        "RSI": float(clean_num(row.get("RSI", "0"))), "macd": float(clean_num(row.get("MACD", "0"))), 
+                        "signal": sig, "status_msg": str(row.get("상태메시지", "")) 
+                    })
+                try: self.db.update_strategy_table(strategy_list)
+                except Exception as e: pass
+
+            # [C# 차트 서버(TCP) 발사]
+            if hasattr(self, 'tcp_client') and self.tcp_client.is_connected:
+                # 🚀 [버그 완벽 수정] 스레드 안에서 과거 데이터를 보내지 않도록, 
+                # DB 동기화가 모두 끝난 직후의 가장 최신 TradeData 상태를 다시 한번 읽어서 보냅니다!
                 
-                # 🚀 [수정] DataFrame에서 '상승확률'을 읽어와서 float 숫자로 변환
-                ai_prob_str = str(row.get("상승확률", "0")).replace("%", "")
-                try: ai_prob = float(ai_prob_str)
-                except ValueError: ai_prob = 0.0
+                # 1. 잔고(Account) 데이터 전송
+                latest_account_data = TradeData.account_dict()
+                if latest_account_data:
+                    self.tcp_client.send_message("Account", latest_account_data)
+                else:
+                    # 빈 바구니라도 확실하게 보내서 UI를 갱신(초기화) 시킵니다.
+                    self.tcp_client.send_message("Account", [])
+                    
+                # 2. 주문/체결(Order) 데이터도 함께 강제로 전송하여 밑에 있는 표도 새로고침 시킵니다!
+                latest_order_data = TradeData.order_dict()
+                if latest_order_data:
+                    self.tcp_client.send_message("Order", latest_order_data)
 
-                strategy_list.append({
-                    "symbol": sym, 
-                    "symbol_name": str(row.get("종목명", "")), 
-                    "ai_prob": ai_prob,
-                    "ma_5": float(clean_num(row.get("MA_5", "0"))), 
-                    "ma_20": float(clean_num(row.get("MA_20", "0"))), 
-                    "RSI": float(clean_num(row.get("RSI", "0"))), 
-                    "macd": float(clean_num(row.get("MACD", "0"))), 
-                    "signal": sig,
-                    "status_msg": str(row.get("상태메시지", "")) # 🚀 AI 엔진이 뱉은 상세 이유를 온전히 보존합니다!
-                })
-            try: self.db.update_strategy_table(strategy_list)
-            except Exception as e: self.add_log(f"🚨 StrategyStatus DB 에러: {e}", "error")
-
-        # 🚀 오직 Account(계좌) 데이터만 C#으로 발사!
-        if hasattr(self, 'tcp_client') and self.tcp_client.is_connected:
-            account_data_list = TradeData.account_dict()
-            # 🌟 리스트 자체를 묶어서 쏩니다! (잔고가 0원이면 빈 바구니[]를 쏴서 C# 표를 싹 비웁니다)
-            self.tcp_client.send_message("Account", account_data_list)
+        # 🔥 메인 화면은 냅두고, 복사해 둔 데이터를 바탕으로 백그라운드에서 조용히 DB에 씁니다!
+        import threading
+        threading.Thread(target=sync_task, daemon=True).start()
 
     @QtCore.pyqtSlot(object) 
     def update_market_table_slot(self, df):
@@ -1635,84 +1659,68 @@ class FormMain(QtWidgets.QMainWindow):
         TradeData.market.df = df[standard_cols]
         self.update_table(self.tbMarket, TradeData.market.df)
 
+    @QtCore.pyqtSlot()
     def load_real_holdings(self):
-        """ [완벽 수정] HTS 잔고를 가져와 내부 주머니만 동기화합니다. 윗표 그리기는 모니터 요원이 자동 처리합니다! """
-        try:
-            # 1. HTS 실제 잔고 긁어오기 (KIS_Manager를 통해 안전하게)
-            new_holdings = self.api_manager.get_real_holdings()
-            
-            # 서버 에러로 잔고를 못 가져왔다면, 기존 주머니를 지우지 않고 탈출 (윗표 증발 방지!)
-            if new_holdings is None: return
-
-            # 2. 안전하게 내 주머니 업데이트 (자물쇠 채움)
-            with self.holdings_lock:
-                # 새로운 잔고 업데이트
-                for code, info in new_holdings.items():
-                    if code in self.my_holdings:
-                        self.my_holdings[code]['qty'] = info['qty']
-                        self.my_holdings[code]['price'] = info['price']
-                    else:
-                        self.my_holdings[code] = info
-                
-                # HTS에서 팔려서 없어진 종목은 내 주머니에서도 삭제
-                keys_to_delete = [code for code in self.my_holdings.keys() if code not in new_holdings]
-                for code in keys_to_delete:
-                    del self.my_holdings[code]
-                    
-            # 3. 예수금 업데이트
-            api_cash = self.api_manager.get_balance()
-            if api_cash is not None and float(api_cash) > 0:
-                self.last_known_cash = float(api_cash)
-
-            # 4. 실시간 가격 수신을 위해 웹소켓 구독
-            if hasattr(self, 'ticker_window') and hasattr(self.ticker_window, 'ws_worker'):
-                for code in self.my_holdings.keys():
-                    if code not in self.ticker_window.ws_worker.tracked_symbols:
-                        self.ticker_window.ws_worker.subscribe_stock_realtime(code)
-                        self.ticker_window.ws_worker.tracked_symbols.add(code)
-
-            # 🚀 [핵심] 윗표 업데이트를 여기서 억지로 하지 않습니다! 
-            # (모니터 일꾼인 SystemMonitorWorker가 알아서 1초 뒤에 예쁘게 그립니다)
-
-            # ---------------------------------------------------------
-            # 🚀 [원복] 보유 종목 및 계좌 잔고 상세 출력 복구
-            # ---------------------------------------------------------
-            self.add_log(f"💼 [보유 종목 로드] 총 {len(self.my_holdings)}개 동기화 완료!", "success")
-            
+        """ 🚀 [버벅임 완벽 해결 1] 메인 화면이 멈추지 않게 백그라운드 스레드에서 잔고를 조회합니다! """
+        def fetch_task():
             try:
-                # 1. 예수금 잔고 상세 출력
-                d2_deposit = self.api_manager.get_d2_deposit()
-                self.add_log(f"💰 [계좌 잔고] 주문 가능 예수금: {int(d2_deposit):,.0f}원", "info")
-                
-                # 2. 보유 종목 리스트 상세 출력
-                if len(self.my_holdings) > 0:
-                    self.add_log("👇 [현재 보유 주식 상세 내역] 👇", "info")
-                    
-                    # my_holdings가 딕셔너리 형태일 경우 (주삐 기본 구조)
-                    if isinstance(self.my_holdings, dict):
-                        for code, data in self.my_holdings.items():
-                            name = data.get('종목명', code)
-                            qty = data.get('보유수량', 0)
-                            price = data.get('매입단가', 0)
-                            profit = data.get('수익률', 0.0)
-                            self.add_log(f"  🔸 {name} ({code}) | {qty}주 | 매입가: {int(price):,.0f}원 | 수익률: {profit:.2f}%", "info")
-                    
-                    # 혹시 my_holdings가 리스트 형태일 경우를 대비한 안전망
-                    elif isinstance(self.my_holdings, list):
-                        for data in self.my_holdings:
-                            name = data.get('종목명', '알수없음')
-                            code = data.get('종목코드', '000000')
-                            qty = data.get('보유수량', 0)
-                            self.add_log(f"  🔸 {name} ({code}) | {qty}주 보유", "info")
-                else:
-                    self.add_log("  🔸 현재 보유 중인 종목이 없습니다.", "info")
-                    
-            except Exception as e:
-                self.add_log(f"🚨 잔고 상세 출력 중 에러 발생: {e}", "error")
-            # ---------------------------------------------------------
+                # 1. HTS 실제 잔고 긁어오기 (네트워크 통신 - 백그라운드에서 진행되어 렉 없음)
+                new_holdings = self.api_manager.get_real_holdings()
+                if new_holdings is None: return
 
-        except Exception as e:
-            self.add_log(f"🚨 잔고 동기화 에러: {e}", "error")
+                # 2. 안전하게 내 주머니 업데이트 (자물쇠 채움)
+                with self.holdings_lock:
+                    for code, info in new_holdings.items():
+                        if code in self.my_holdings:
+                            self.my_holdings[code]['qty'] = info['qty']
+                            self.my_holdings[code]['price'] = info['price']
+                        else:
+                            self.my_holdings[code] = info
+                    
+                    keys_to_delete = [code for code in self.my_holdings.keys() if code not in new_holdings]
+                    for code in keys_to_delete:
+                        del self.my_holdings[code]
+                        
+                # 3. 예수금 업데이트
+                try:
+                    api_cash = self.api_manager.get_d2_deposit() 
+                    if api_cash is not None and float(api_cash) > 0:
+                        self.last_known_cash = float(api_cash)
+                except Exception: pass
+
+                # 4. 실시간 가격 수신을 위해 웹소켓 구독
+                if hasattr(self, 'ticker_window') and hasattr(self.ticker_window, 'ws_worker'):
+                    for code in self.my_holdings.keys():
+                        if code not in self.ticker_window.ws_worker.tracked_symbols:
+                            self.ticker_window.ws_worker.subscribe_stock_realtime(code)
+                            self.ticker_window.ws_worker.tracked_symbols.add(code)
+
+                # 5. 잔고 동기화 로그 띄우기 (add_log는 스레드 안전하므로 팅기지 않음)
+                self.add_log(f"💼 [보유 종목 로드] 총 {len(self.my_holdings)}개 동기화 완료!", "success")
+                
+                try:
+                    d2_deposit = self.api_manager.get_d2_deposit()
+                #     self.add_log(f"💰 [계좌 잔고] 주문 가능 예수금: {int(d2_deposit):,.0f}원", "info")
+                    
+                #     if len(self.my_holdings) > 0:
+                #         self.add_log("👇 [현재 보유 주식 상세 내역] 👇", "info")
+                #         if isinstance(self.my_holdings, dict):
+                #             for code, data in self.my_holdings.items():
+                #                 name = data.get('종목명', code)
+                #                 qty = data.get('보유수량', 0)
+                #                 price = data.get('매입단가', 0)
+                #                 profit = data.get('수익률', 0.0)
+                #                 self.add_log(f"  🔸 {name} ({code}) | {qty}주 | 매입가: {int(price):,.0f}원 | 수익률: {profit:.2f}%", "info")
+                #     else:
+                #         self.add_log("  🔸 현재 보유 중인 종목이 없습니다.", "info")
+                except Exception as e: pass
+
+            except Exception as e:
+                self.add_log(f"🚨 잔고 동기화 에러: {e}", "error")
+
+        # 🔥 메인 화면을 멈추지 않고, 일회용 알바생(스레드)을 고용해서 통신을 맡기고 쿨하게 넘깁니다!
+        import threading
+        threading.Thread(target=fetch_task, daemon=True).start()
 
     def initUI(self):
         ui_file_path = resource_path("GUI/Main.ui")

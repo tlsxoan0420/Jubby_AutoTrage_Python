@@ -4,6 +4,7 @@ import datetime
 import pandas as pd  
 import time
 import random  # 🚀 [추가] 스레드 충돌 분산을 위한 랜덤 모듈
+import threading  # 상단에 추가!
 
 # 방금 만든 공통 경로를 불러옵니다.
 from COMMON.Flag import SystemConfig 
@@ -21,7 +22,7 @@ class JubbyDB_Manager:
 
         self._initialize_shared_db()
         self._initialize_python_db()
-        
+        _db_write_lock = threading.Lock()
     # =======================================================================
     # 🔌 외부 연결 통로 개방 (C#과의 락(Lock) 충돌 완벽 방지)
     # =======================================================================
@@ -361,9 +362,26 @@ class JubbyDB_Manager:
     def save_training_data(self, df, market_mode):
         if df is None or df.empty: return
         table_name = "TrainData_Domestic" if market_mode == "DOMESTIC" else "TrainData_Overseas" if market_mode == "OVERSEAS" else "TrainData_Futures"
-        conn = self._get_connection(self.python_db_path)
-        try: df.to_sql(table_name, conn, if_exists='append', index=False)
-        finally: conn.close()
+        
+        # 🚀 [버그 완벽 수정] 15개의 수집기 스레드가 동시에 저장하려 할 때 병목(Lock)을 방지!
+        # 자물쇠(Lock)를 채워서 오직 1명의 스레드만 순서대로 DB에 기록하게 만듭니다.
+        with self._db_write_lock:
+            max_retries = 10
+            for attempt in range(max_retries):
+                conn = self._get_connection(self.python_db_path)
+                try:
+                    # 쓰기 작업 실행
+                    df.to_sql(table_name, conn, if_exists='append', index=False)
+                    break # 성공 시 즉시 반복문 탈출
+                except sqlite3.OperationalError as e:
+                    # DB가 잠겨있을 경우 숨을 고르고 재시도
+                    if "locked" in str(e).lower() and attempt < max_retries - 1:
+                        time.sleep(random.uniform(0.1, 0.3))
+                        continue
+                    print(f"🚨 [DB 저장 에러] {table_name} 쓰기 실패: {e}")
+                    break
+                finally:
+                    conn.close() # 작업이 끝난 통로는 무조건 닫기
 
     def get_training_data(self, market_mode):
         table_name = "TrainData_Domestic" if market_mode == "DOMESTIC" else "TrainData_Overseas" if market_mode == "OVERSEAS" else "TrainData_Futures"

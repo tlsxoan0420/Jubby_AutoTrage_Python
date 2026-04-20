@@ -236,9 +236,33 @@ class JubbyStrategy:
         try:
             df['return'] = df['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0) * 100 
             
+            # 전형적 가격 (고가+저가+종가의 평균) 및 이를 활용한 거래대금(TP_Volume) 계산
             df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
             df['TP_Volume'] = df['Typical_Price'] * df['volume']
-            df['VWAP'] = df['TP_Volume'].cumsum() / (df['volume'].cumsum() + 1e-9)
+            
+            # =====================================================================
+            # 🚀 [VWAP 알고리즘 완벽 보정] 당일 전체 누적 수치 기반 진짜 세력 평단가 복원
+            # =====================================================================
+            # KIS_Manager에서 'total_vol'(당일 누적 거래량)과 'total_tr_pbmn'(당일 누적 거래대금)을 넘겨받았는지 확인합니다.
+            if 'total_vol' in df.columns and 'total_tr_pbmn' in df.columns:
+                # 1. API가 제공하는 가장 최신 시점의 '진짜 당일 전체 누적 데이터' (마지막 행 기준)
+                current_total_vol = float(df['total_vol'].iloc[-1])
+                current_total_val = float(df['total_tr_pbmn'].iloc[-1])
+                
+                # 2. 현재 차트로 불러온 120개 분봉 데이터 안에서의 총합
+                recent_vol_sum = df['volume'].sum()
+                recent_val_sum = df['TP_Volume'].sum()
+                
+                # 3. 장 초반(아침 9시 ~ 분봉 시작점)에 짤려서 누락된 과거 데이터 역산
+                #    (혹시 모를 음수 에러를 막기 위해 max(0, x) 사용)
+                past_vol_offset = max(0, current_total_vol - recent_vol_sum)
+                past_val_offset = max(0, current_total_val - recent_val_sum)
+                
+                # 4. [짤려나간 과거 수치 + 현재 분봉 누적합]을 더해서 영웅문 HTS 등과 똑같은 당일 VWAP 생성!
+                df['VWAP'] = (past_val_offset + df['TP_Volume'].cumsum()) / (past_vol_offset + df['volume'].cumsum() + 1e-9)
+            else:
+                # 만약 API 연동 실패나 과거 데이터 테스트 중일 때를 대비한 땜빵용 기존 로직 (안전망)
+                df['VWAP'] = df['TP_Volume'].cumsum() / (df['volume'].cumsum() + 1e-9)
 
             # 💡 [알고리즘 추가 1] VWAP 이격도: 현재 주가가 오늘 하루 평균 매매가보다 얼마나 높은지/낮은지 비율
             # 100보다 크면 세력도 수익중, 100보다 작으면 세력도 물려있음을 의미함
