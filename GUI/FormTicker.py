@@ -246,7 +246,15 @@ class RealWebSocketWorker(QThread):
         while self.is_running:
             self.ws.run_forever()
             if not self.is_running: break
-            time.sleep(3) # 자동 재연결
+            
+            # 🚀 [안정성 개선] 웹소켓이 끊기고 다시 연결을 시도하기 전, 접속키(Approval Key)를 새로 발급받습니다.
+            self.sig_execution_msg.emit("🔄 웹소켓 재연결 시도 중... 접속키 갱신", "warning")
+            time.sleep(3) # 증권사 서버 폭주 방지를 위해 3초 대기
+            
+            # 새로운 키를 발급받아 교체해줍니다. (토큰 만료로 인한 튕김 방지)
+            new_key = self.api.get_approval_key()
+            if new_key:
+                self.approval_key = new_key
 
     def stop(self):
         self.is_running = False

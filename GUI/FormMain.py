@@ -1659,69 +1659,143 @@ class FormMain(QtWidgets.QMainWindow):
         TradeData.market.df = df[standard_cols]
         self.update_table(self.tbMarket, TradeData.market.df)
 
-    @QtCore.pyqtSlot()
-    def load_real_holdings(self):
-        """ 🚀 [버벅임 완벽 해결 1] 메인 화면이 멈추지 않게 백그라운드 스레드에서 잔고를 조회합니다! """
-        def fetch_task():
+    def load_real_holdings(self, *args, **kwargs):
+        """ 
+        🚀 [최종 해결판] 백그라운드 스레드 완전 폐기 & 100% 출력 보장
+        (어떤 인자가 넘어오든 에러가 나지 않도록 *args, **kwargs로 방어막을 쳤습니다)
+        """
+        # 버튼을 눌렀는지, 아니면 인자로 수동 지시가 왔는지 완벽하게 감지
+        is_manual = False
+        if self.sender() is not None or kwargs.get('is_manual') is True:
+            is_manual = True
+
+        # 자물쇠 체크
+        if getattr(self, 'is_fetching_account', False):
+            if is_manual:
+                self.add_log("⏳ 이전 데이터를 가져오는 중입니다. 잠시만 대기해주세요!", "warning")
+            return
+            
+        self.is_fetching_account = True
+
+        # 🚀 [즉각 피드백] 시작하자마자 로그를 띄웁니다.
+        if is_manual:
+            self.add_log("🔄 증권사 서버에 계좌 조회를 요청했습니다... (최대 1~3초 소요)", "info")
             try:
-                # 1. HTS 실제 잔고 긁어오기 (네트워크 통신 - 백그라운드에서 진행되어 렉 없음)
-                new_holdings = self.api_manager.get_real_holdings()
-                if new_holdings is None: return
+                # 데이터를 가져오는 동안 프로그램이 '응답 없음'에 빠지지 않게 화면을 강제로 한 번 새로고침합니다!
+                from PyQt5.QtWidgets import QApplication
+                QApplication.processEvents() 
+            except: pass
 
-                # 2. 안전하게 내 주머니 업데이트 (자물쇠 채움)
-                with self.holdings_lock:
-                    for code, info in new_holdings.items():
-                        if code in self.my_holdings:
-                            self.my_holdings[code]['qty'] = info['qty']
-                            self.my_holdings[code]['price'] = info['price']
-                        else:
-                            self.my_holdings[code] = info
+        # 🚀 [문제 해결] 스레드(threading)를 쓰지 않고 여기서 바로 다이렉트로 실행합니다! (절대 안 팅김)
+        try:
+            # 1. 실제 잔고 긁어오기
+            new_holdings = self.api_manager.get_real_holdings()
+            if new_holdings is None: 
+                if is_manual:
+                    self.add_log("🚨 계좌 정보 조회 실패 (증권사 서버 지연)", "error")
+                return
+
+            with self.holdings_lock:
+                # 삭제된 종목(매도 완료) 제거
+                keys_to_delete = [code for code in self.my_holdings.keys() if code not in new_holdings]
+                for code in keys_to_delete:
+                    del self.my_holdings[code]
                     
-                    keys_to_delete = [code for code in self.my_holdings.keys() if code not in new_holdings]
-                    for code in keys_to_delete:
-                        del self.my_holdings[code]
-                        
-                # 3. 예수금 업데이트
-                try:
-                    api_cash = self.api_manager.get_d2_deposit() 
-                    if api_cash is not None and float(api_cash) > 0:
-                        self.last_known_cash = float(api_cash)
-                except Exception: pass
+                # 최신 종목 정보 덮어쓰기
+                for code, info in new_holdings.items():
+                    if code in self.my_holdings:
+                        self.my_holdings[code]['qty'] = info['qty']
+                        self.my_holdings[code]['price'] = info['price']
+                    else:
+                        self.my_holdings[code] = info
+                    
+            # 2. 예수금 업데이트
+            d2_cash = 0
+            try:
+                api_cash = self.api_manager.get_d2_deposit() 
+                if api_cash is not None and float(api_cash) > 0:
+                    self.last_known_cash = float(api_cash)
+                    d2_cash = int(float(str(api_cash).replace(',', '')))
+            except Exception: pass
 
-                # 4. 실시간 가격 수신을 위해 웹소켓 구독
-                if hasattr(self, 'ticker_window') and hasattr(self.ticker_window, 'ws_worker'):
-                    for code in self.my_holdings.keys():
-                        if code not in self.ticker_window.ws_worker.tracked_symbols:
-                            self.ticker_window.ws_worker.subscribe_stock_realtime(code)
-                            self.ticker_window.ws_worker.tracked_symbols.add(code)
+            # 3. 실시간 가격 수신을 위해 웹소켓 구독
+            if hasattr(self, 'ticker_window') and hasattr(self.ticker_window, 'ws_worker'):
+                for code in self.my_holdings.keys():
+                    if code not in self.ticker_window.ws_worker.tracked_symbols:
+                        self.ticker_window.ws_worker.subscribe_stock_realtime(code)
+                        self.ticker_window.ws_worker.tracked_symbols.add(code)
 
-                # 5. 잔고 동기화 로그 띄우기 (add_log는 스레드 안전하므로 팅기지 않음)
-                self.add_log(f"💼 [보유 종목 로드] 총 {len(self.my_holdings)}개 동기화 완료!", "success")
+            # 4. 🚀 수동 클릭 시에만 상세 브리핑 띄우기 (이제 로그창에 100% 꽂힙니다!)
+            if is_manual:
+                total_invested = 0
+                total_current_val = 0
+                stock_details_str = ""
                 
-                try:
-                    d2_deposit = self.api_manager.get_d2_deposit()
-                #     self.add_log(f"💰 [계좌 잔고] 주문 가능 예수금: {int(d2_deposit):,.0f}원", "info")
+                if len(self.my_holdings) > 0:
+                    with self.holdings_lock:
+                        holdings_copy = list(self.my_holdings.items())
+                        
+                    for code, info in holdings_copy:
+                        buy_price = info['price']
+                        buy_qty = info['qty']
+                        
+                        stock_name = getattr(self, 'DYNAMIC_STOCK_DICT', {}).get(code, code)
+                        
+                        curr_price = buy_price
+                        if hasattr(self, 'db'):
+                            try:
+                                p = self.db.get_realtime_price(code)
+                                if p and p > 0: curr_price = p
+                            except: pass
+                            
+                        if curr_price == buy_price and hasattr(self, 'df_cache'):
+                            try:
+                                cached_df = getattr(self, 'df_cache', {}).get(code)
+                                if cached_df is not None and not cached_df.empty:
+                                    curr_price = float(cached_df.iloc[-1]['close'])
+                            except: pass
+                                
+                        fee_rate = 0.0023 
+                        try:
+                            from COMMON.Flag import SystemConfig
+                            if getattr(SystemConfig, 'MARKET_MODE', 'DOMESTIC') != "DOMESTIC":
+                                fee_rate = 0.001
+                        except: pass
+                            
+                        invest_amt = buy_price * buy_qty
+                        eval_amt = curr_price * buy_qty
+                        estimated_fee = eval_amt * fee_rate 
+                        
+                        real_profit_amt = eval_amt - invest_amt - estimated_fee
+                        real_profit_rate = (real_profit_amt / invest_amt) * 100 if invest_amt > 0 else 0.0
+                        
+                        total_invested += invest_amt
+                        total_current_val += eval_amt
+                        
+                        stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.0f} -> 현재 {curr_price:,.0f} ({real_profit_rate:+.2f}%)\n"
+                        
+                total_unrealized_profit = total_current_val - total_invested
+                total_asset = d2_cash + total_current_val
+                realized_profit = getattr(self, 'cumulative_realized_profit', 0)
+                
+                msg = f"💼 [수동 계좌 조회] 총 {len(self.my_holdings)}개 동기화 완료!\n"
+                msg += f"    💎 자산: {int(total_asset):,}원 (D+2 예수금: {d2_cash:,}원)\n"
+                msg += f"    📈 누적손익: {int(realized_profit):+,}원 | 보유손익: {int(total_unrealized_profit):+,}원\n\n"
+                
+                if stock_details_str:
+                    msg += stock_details_str.rstrip()
+                else:
+                    msg += "    💼 [보유 종목 없음]"
                     
-                #     if len(self.my_holdings) > 0:
-                #         self.add_log("👇 [현재 보유 주식 상세 내역] 👇", "info")
-                #         if isinstance(self.my_holdings, dict):
-                #             for code, data in self.my_holdings.items():
-                #                 name = data.get('종목명', code)
-                #                 qty = data.get('보유수량', 0)
-                #                 price = data.get('매입단가', 0)
-                #                 profit = data.get('수익률', 0.0)
-                #                 self.add_log(f"  🔸 {name} ({code}) | {qty}주 | 매입가: {int(price):,.0f}원 | 수익률: {profit:.2f}%", "info")
-                #     else:
-                #         self.add_log("  🔸 현재 보유 중인 종목이 없습니다.", "info")
-                except Exception as e: pass
+                # 이제 스레드가 아니기 때문에 무조건 화면에 팍! 하고 찍힙니다.
+                self.add_log(msg, "info")
 
-            except Exception as e:
-                self.add_log(f"🚨 잔고 동기화 에러: {e}", "error")
-
-        # 🔥 메인 화면을 멈추지 않고, 일회용 알바생(스레드)을 고용해서 통신을 맡기고 쿨하게 넘깁니다!
-        import threading
-        threading.Thread(target=fetch_task, daemon=True).start()
-
+        except Exception as e:
+            if is_manual: 
+                self.add_log(f"🚨 계좌 조회 에러: {e}", "error")
+        finally:
+            self.is_fetching_account = False
+        
     def initUI(self):
         ui_file_path = resource_path("GUI/Main.ui")
         uic.loadUi(ui_file_path, self)
