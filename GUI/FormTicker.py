@@ -229,9 +229,12 @@ class RealWebSocketWorker(QThread):
                        "body": {"input": {"tr_id": tr_id, "tr_key": self.hts_id}}}
             ws.send(json.dumps(sub_msg))
             
-            # 🚀 [완벽 수정] 전체 명단(2500개)이 아니라, '현재 내 계좌에 있는 종목'만 조용히 구독합니다!
+            # 🚀 [수정됨] 자물쇠(Lock)를 채우고 안전하게 리스트로 복사해서 사용합니다.
             if self.main_ui and hasattr(self.main_ui, 'my_holdings'):
-                for code in list(self.main_ui.my_holdings.keys()):
+                with self.main_ui.holdings_lock:
+                    holding_codes = list(self.main_ui.my_holdings.keys())
+                    
+                for code in holding_codes:
                     if code not in self.tracked_symbols:
                         self.subscribe_stock_realtime(code)
                         self.tracked_symbols.add(code)
@@ -270,28 +273,34 @@ class RealWebSocketWorker(QThread):
         """ [중요] 특정 종목을 실시간 감시 리스트에 추가합니다 (수익률 업데이트용) """
         if not self.ws or not self.ws.sock or not self.ws.sock.connected: return
         
-        # 현재가 구독 (H0STCNT0)
-        self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
-                                 "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}}}))
-        # 호가잔량 구독 (H0STASP0)
-        self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
-                                 "body": {"input": {"tr_id": "H0STASP0", "tr_key": code}}}))
-        
-        self.sig_execution_msg.emit(f"📡 [{code}] 실시간 시세 추적 가동!", "info")
+        try:
+            # 현재가 구독 (H0STCNT0)
+            self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                                     "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}}}))
+            # 호가잔량 구독 (H0STASP0)
+            self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                                     "body": {"input": {"tr_id": "H0STASP0", "tr_key": code}}}))
+            
+            self.sig_execution_msg.emit(f"📡 [{code}] 실시간 시세 추적 가동!", "info")
+        except Exception as e:
+            self.sig_execution_msg.emit(f"🚨 웹소켓 구독 전송 에러 [{code}]: {e}", "error")
 
     def unsubscribe_stock_realtime(self, code):
         """ [추가] 매도 완료된 종목의 실시간 추적을 해제하여 40개 한도 꽉 참을 방지합니다. """
         if not self.ws or not self.ws.sock or not self.ws.sock.connected: return
         
-        # 🔥 tr_type "2"가 바로 '구독 해제(Unsubscribe)' 명령입니다.
-        self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "2", "content-type": "utf-8"},
-                                 "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}}}))
-        self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "2", "content-type": "utf-8"},
-                                 "body": {"input": {"tr_id": "H0STASP0", "tr_key": code}}}))
-        
-        if code in self.tracked_symbols:
-            self.tracked_symbols.remove(code)
-        self.sig_execution_msg.emit(f"🔌 [{code}] 매도 완료! 실시간 시세 추적 해제 (웹소켓 트래픽 확보)", "warning")
+        try:
+            # 🔥 tr_type "2"가 바로 '구독 해제(Unsubscribe)' 명령입니다.
+            self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "2", "content-type": "utf-8"},
+                                     "body": {"input": {"tr_id": "H0STCNT0", "tr_key": code}}}))
+            self.ws.send(json.dumps({"header": {"approval_key": self.approval_key, "custtype": "P", "tr_type": "2", "content-type": "utf-8"},
+                                     "body": {"input": {"tr_id": "H0STASP0", "tr_key": code}}}))
+            
+            if code in self.tracked_symbols:
+                self.tracked_symbols.remove(code)
+            self.sig_execution_msg.emit(f"🔌 [{code}] 매도 완료! 실시간 시세 추적 해제 (웹소켓 트래픽 확보)", "warning")
+        except Exception as e:
+            self.sig_execution_msg.emit(f"🚨 웹소켓 구독 해제 전송 에러 [{code}]: {e}", "error")
 
 # =====================================================================
 # 🖥️ Ticker UI 메인 윈도우

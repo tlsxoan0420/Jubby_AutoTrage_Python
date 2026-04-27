@@ -17,7 +17,7 @@ from datetime import datetime
 from PyQt5 import QtWidgets, uic, QtCore, QtGui  
 from PyQt5.QtCore import Qt, QThread, pyqtSignal 
 
-from COMMON.Flag import TradeData            
+from COMMON.Flag import trade_data            
 from COMMON.KIS_Manager import KIS_Manager   
 from COMMON.TcpJsonClient import TcpJsonClient
 
@@ -232,13 +232,20 @@ class DetectiveWorker(QThread):
             except: continue
             elapsed_seconds = (now_time - order_time).total_seconds()
 
+            # 🚀 [완벽 수정] 탐정 무한루프 탈출구 추가
             if elapsed_seconds > 30:
                 res = self.mw.api_manager.cancel_order(db_order_no) 
                 
-                # 🚀 [버그 완벽 수정 2] 탐정의 멍청한 오판을 막고, KIS에서 긁어온 '진짜 체결량(actual_filled_qty)'만 믿습니다!
                 error_msg = getattr(self.mw.api_manager.api, 'last_error_msg', '')
-                ghost_keywords = ["이미 취소", "해당 주문", "내역이없습니다", "주문번호가 잘못", "취소가능수량"]
+                # 🔥 '서버 응답 없음', 'timeout' 등 통신 불량 키워드 추가
+                ghost_keywords = ["이미 취소", "해당 주문", "내역이없습니다", "주문번호가 잘못", "취소가능수량", "서버 응답 없음", "timeout"]
                 is_ghost_or_already_canceled = any(kw in error_msg for kw in ghost_keywords)
+
+                # 🔥 [최종 탈출구] 통신 불량으로 취소가 계속 실패한 채 60초가 넘어가면 유령 주문으로 간주하고 강제 삭제!
+                if elapsed_seconds > 60 and res != "DONE" and res != "ALREADY_FILLED":
+                    self.sig_log.emit(f"🗑️ [{stock_name}] 유령 주문 60초 경과로 강제 삭제 처리 (무한 루프 방지)", "warning")
+                    self._update_status_safely(db_order_no, "취소(유령주문)", actual_filled_qty, float(price))
+                    continue
 
                 if res in ["DONE", "ALREADY_FILLED"] or is_ghost_or_already_canceled:
                     # 취소 처리가 끝났거나, 이미 취소된 주문이라면 -> 진짜 체결량을 기준으로 최종 상태를 못 박습니다!
@@ -483,6 +490,12 @@ class SellGuardianWorker(QThread):
 
         total_invested = 0; total_current_val = 0; sold_codes = []
         
+        # 1. 루프에 들어가기 전, 보유한 모든 종목 코드를 리스트로 만듭니다.
+        holding_codes = [code for code, info in current_holdings]
+        
+        # 2. DB에서 이 종목들의 현재가를 한 번에 싹 가져옵니다.
+        realtime_prices = db_temp.get_multiple_realtime_prices(holding_codes)
+
         for code, info in current_holdings: 
             if not self.is_running: return 
             
@@ -504,10 +517,12 @@ class SellGuardianWorker(QThread):
             if cached_df is None or len(cached_df) < 26: continue
             df = cached_df.copy() 
             
-            curr_price = db_temp.get_realtime_price(code)
-            if curr_price <= 0: curr_price = float(df.iloc[-1]['close'])
-            df.at[df.index[-1], 'close'] = curr_price 
+            curr_price = realtime_prices.get(code, 0.0) 
+            if curr_price <= 0: 
+                curr_price = float(df.iloc[-1]['close'])
             
+            df.at[df.index[-1], 'close'] = curr_price
+
             # 수익률 계산
             fee_rate = 0.0023 if SystemConfig.MARKET_MODE == "DOMESTIC" else 0.001
             invest_amt = buy_price * buy_qty
@@ -539,7 +554,7 @@ class SellGuardianWorker(QThread):
 
             is_sell_all = False; is_sell_half = False; status_msg = ""; sell_qty = buy_qty
             last_sell_attempt = info.get('last_sell_attempt', 0)
-            is_cooldown = (time.time() - last_sell_attempt < 3.0) 
+            is_cooldown = (time.time() - last_sell_attempt < 10.0)
             
             if is_cooldown: strat_signal = "WAIT" 
             else: strat_signal = self.mw.strategy_engine.check_trade_signal(df, code, is_sell_mode=True)
@@ -686,20 +701,26 @@ class SystemMonitorWorker(QThread):
         is_first_row = True
         stock_details_str = ""
 
+        # 루프 시작 전 가격 일괄 로드
+        holding_codes = [code for code, info in current_holdings]
+        realtime_prices = db_temp.get_multiple_realtime_prices(holding_codes)
+
         # 2. 보유 종목 리스트 생성 및 수익금 계산
         for code, info in current_holdings:
             buy_price = info['price']
             buy_qty = info['qty']
             stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code)
             
-            # 🚀 [버그 완벽 수정] 웹소켓이 끊기거나 응답이 없으면, 매수 엔진이 1분마다 갱신하는 최신 캐시(df_cache)에서 가격을 빼옵니다!
-            curr_price = db_temp.get_realtime_price(code)
+            # DB 호출 대신 미리 가져온 딕셔너리 사용
+            curr_price = realtime_prices.get(code, 0.0)
+            
             if curr_price <= 0: 
+                # 가격이 없을 때만 기존 캐시 로직 작동 (안전장치)
                 cached_df = self.mw.df_cache.get(code)
                 if cached_df is not None and not cached_df.empty:
                     curr_price = float(cached_df.iloc[-1]['close'])
                 else:
-                    curr_price = buy_price # 최후의 수단
+                    curr_price = buy_price
             
             # 🚀 [HTS 완벽 동기화] 매도 감시 일꾼과 동일하게 세금/수수료를 계산하여 찐 수익률을 표기합니다.
             fee_rate = 0.0023 if SystemConfig.MARKET_MODE == "DOMESTIC" else 0.001
@@ -1002,6 +1023,9 @@ class BuyHunterWorker(QThread):
         # 4. 종목 스캔 시작
         base_targets = self.get_realtime_hot_stocks()
         scan_targets = list(set(list(self.mw.my_holdings.keys()) + base_targets))
+
+        # 🚀 스캔 대상이 100개면 DB 문을 100번 열던 것을 1번으로 단축!
+        all_prices = db_temp.get_multiple_realtime_prices(scan_targets)
         
         market_rows = []; strategy_rows = []; scanned_log_list = []; current_cycle_buys = 0
 
@@ -1017,8 +1041,11 @@ class BuyHunterWorker(QThread):
             except: scan_delay = 0.3
             time.sleep(scan_delay)
 
-            try: prob, curr_price, df_feat = self.mw.get_ai_probability(code)
+            # 🚀 [수정된 부분] 한방에 가져온 가격(all_prices)을 꺼내서 get_ai_probability에 같이 넘겨줍니다!
+            target_price = all_prices.get(code, 0.0)
+            try: prob, curr_price, df_feat = self.mw.get_ai_probability(code, target_price)
             except: continue
+            
             if prob == -1.0 or curr_price <= 0 or np.isnan(curr_price): continue 
 
             # 🚀 [원본 복구] 불타기(Pyramiding) 허용 알고리즘
@@ -1044,7 +1071,7 @@ class BuyHunterWorker(QThread):
                         if prob < ai_limit: continue
                     else:
                         continue # 불타기 조건이 안 맞으면 더 이상 매수 탐색 진행 안함
-
+                    
             stock_name = self.mw.DYNAMIC_STOCK_DICT.get(code, code) 
             if code not in self.mw.my_holdings: scanned_log_list.append({'name': stock_name, 'prob': prob})
             
@@ -1558,9 +1585,9 @@ class FormMain(QtWidgets.QMainWindow):
         
         # 1. 화면(UI 스레드)에서 표 데이터(DataFrame)를 안전하게 복사(Copy)해옵니다.
         # 이렇게 하면 일꾼이 이 데이터를 DB에 쓰는 동안 원본이 바뀌어서 팅기는 사고를 막을 수 있습니다.
-        market_df = TradeData.market.df.copy() if not TradeData.market.df.empty else pd.DataFrame()
-        account_df = TradeData.account.df.copy() if not TradeData.account.df.empty else pd.DataFrame()
-        strategy_df = TradeData.strategy.df.copy() if not TradeData.strategy.df.empty else pd.DataFrame()
+        market_df = trade_data.market.df.copy() if not trade_data.market.df.empty else pd.DataFrame()
+        account_df = trade_data.account.df.copy() if not trade_data.account.df.empty else pd.DataFrame()
+        strategy_df = trade_data.strategy.df.copy() if not trade_data.strategy.df.empty else pd.DataFrame()
 
         def sync_task():
             def clean_num(val): 
@@ -1624,10 +1651,10 @@ class FormMain(QtWidgets.QMainWindow):
             # [C# 차트 서버(TCP) 발사]
             if hasattr(self, 'tcp_client') and self.tcp_client.is_connected:
                 # 🚀 [버그 완벽 수정] 스레드 안에서 과거 데이터를 보내지 않도록, 
-                # DB 동기화가 모두 끝난 직후의 가장 최신 TradeData 상태를 다시 한번 읽어서 보냅니다!
+                # DB 동기화가 모두 끝난 직후의 가장 최신 trade_data 상태를 다시 한번 읽어서 보냅니다!
                 
                 # 1. 잔고(Account) 데이터 전송
-                latest_account_data = TradeData.account_dict()
+                latest_account_data = trade_data.account_dict()
                 if latest_account_data:
                     self.tcp_client.send_message("Account", latest_account_data)
                 else:
@@ -1635,7 +1662,7 @@ class FormMain(QtWidgets.QMainWindow):
                     self.tcp_client.send_message("Account", [])
                     
                 # 2. 주문/체결(Order) 데이터도 함께 강제로 전송하여 밑에 있는 표도 새로고침 시킵니다!
-                latest_order_data = TradeData.order_dict()
+                latest_order_data = trade_data.order_dict()
                 if latest_order_data:
                     self.tcp_client.send_message("Order", latest_order_data)
 
@@ -1648,28 +1675,28 @@ class FormMain(QtWidgets.QMainWindow):
         # 🚀 '시간' 컬럼을 넣어 구조를 100% 맞춰줍니다.
         standard_cols = ['시간','종목코드','종목명','현재가','시가','고가','저가','1분등락률','거래대금','거래량에너지','이격도','거래량']
         if df.empty: 
-            TradeData.market.df = pd.DataFrame(columns=standard_cols)
-            self.update_table(self.tbMarket, TradeData.market.df)
+            trade_data.market.df = pd.DataFrame(columns=standard_cols)
+            self.update_table(self.tbMarket, trade_data.market.df)
             return
             
         if '종목코드' not in df.columns and 'Symbol' in df.columns: df = df.rename(columns={'Symbol': '종목코드', 'Name': '종목명', 'Price': '현재가'})
         for col in standard_cols:
             if col not in df.columns: df[col] = "0"
             
-        TradeData.market.df = df[standard_cols]
-        self.update_table(self.tbMarket, TradeData.market.df)
+        trade_data.market.df = df[standard_cols]
+        self.update_table(self.tbMarket, trade_data.market.df)
 
+    @QtCore.pyqtSlot()
     def load_real_holdings(self, *args, **kwargs):
         """ 
-        🚀 [최종 해결판] 백그라운드 스레드 완전 폐기 & 100% 출력 보장
-        (어떤 인자가 넘어오든 에러가 나지 않도록 *args, **kwargs로 방어막을 쳤습니다)
+        🚀 [최종 해결판] UI 렉/멈춤 현상 완벽 해결!
+        네트워크 통신으로 인한 대기 시간(Sleep)이 화면을 멈추게 하지 않도록 백그라운드로 넘깁니다.
         """
-        # 버튼을 눌렀는지, 아니면 인자로 수동 지시가 왔는지 완벽하게 감지
         is_manual = False
         if self.sender() is not None or kwargs.get('is_manual') is True:
             is_manual = True
 
-        # 자물쇠 체크
+        # 자물쇠 체크 (중복 실행 방지)
         if getattr(self, 'is_fetching_account', False):
             if is_manual:
                 self.add_log("⏳ 이전 데이터를 가져오는 중입니다. 잠시만 대기해주세요!", "warning")
@@ -1677,134 +1704,155 @@ class FormMain(QtWidgets.QMainWindow):
             
         self.is_fetching_account = True
 
-        # 🚀 [즉각 피드백] 시작하자마자 로그를 띄웁니다.
         if is_manual:
             self.add_log("🔄 증권사 서버에 계좌 조회를 요청했습니다... (최대 1~3초 소요)", "info")
+
+        # 🚀 [핵심] API 통신과 대기(Sleep) 작업을 전담할 내부 백그라운드 함수 생성
+        def fetch_task():
             try:
-                # 데이터를 가져오는 동안 프로그램이 '응답 없음'에 빠지지 않게 화면을 강제로 한 번 새로고침합니다!
-                from PyQt5.QtWidgets import QApplication
-                QApplication.processEvents() 
-            except: pass
+                # 1. 실제 잔고 긁어오기 (여기서 1~3초가 걸려도 화면은 멈추지 않음!)
+                new_holdings = self.api_manager.get_real_holdings()
+                if new_holdings is None: 
+                    if is_manual:
+                        self.add_log("🚨 계좌 정보 조회 실패 (증권사 서버 지연)", "error")
+                    return
 
-        # 🚀 [문제 해결] 스레드(threading)를 쓰지 않고 여기서 바로 다이렉트로 실행합니다! (절대 안 팅김)
-        try:
-            # 1. 실제 잔고 긁어오기
-            new_holdings = self.api_manager.get_real_holdings()
-            if new_holdings is None: 
-                if is_manual:
-                    self.add_log("🚨 계좌 정보 조회 실패 (증권사 서버 지연)", "error")
-                return
-
-            with self.holdings_lock:
-                # 삭제된 종목(매도 완료) 제거
-                keys_to_delete = [code for code in self.my_holdings.keys() if code not in new_holdings]
-                for code in keys_to_delete:
-                    del self.my_holdings[code]
-                    
-                # 최신 종목 정보 덮어쓰기
-                for code, info in new_holdings.items():
-                    if code in self.my_holdings:
-                        self.my_holdings[code]['qty'] = info['qty']
-                        self.my_holdings[code]['price'] = info['price']
-                    else:
-                        self.my_holdings[code] = info
-                    
-            # 2. 예수금 업데이트
-            d2_cash = 0
-            try:
-                api_cash = self.api_manager.get_d2_deposit() 
-                if api_cash is not None and float(api_cash) > 0:
-                    self.last_known_cash = float(api_cash)
-                    d2_cash = int(float(str(api_cash).replace(',', '')))
-            except Exception: pass
-
-            # 3. 실시간 가격 수신을 위해 웹소켓 구독
-            if hasattr(self, 'ticker_window') and hasattr(self.ticker_window, 'ws_worker'):
-                for code in self.my_holdings.keys():
-                    if code not in self.ticker_window.ws_worker.tracked_symbols:
-                        self.ticker_window.ws_worker.subscribe_stock_realtime(code)
-                        self.ticker_window.ws_worker.tracked_symbols.add(code)
-
-            # 4. 🚀 수동 클릭 시에만 상세 브리핑 띄우기 (이제 로그창에 100% 꽂힙니다!)
-            if is_manual:
-                total_invested = 0
-                total_current_val = 0
-                stock_details_str = ""
-                
-                if len(self.my_holdings) > 0:
-                    with self.holdings_lock:
-                        holdings_copy = list(self.my_holdings.items())
+                # 🔒 자물쇠를 채우고 안전하게 주머니(Dictionary) 업데이트
+                with self.holdings_lock:
+                    keys_to_delete = [code for code in self.my_holdings.keys() if code not in new_holdings]
+                    for code in keys_to_delete:
+                        del self.my_holdings[code]
                         
-                    for code, info in holdings_copy:
-                        buy_price = info['price']
-                        buy_qty = info['qty']
-                        
-                        stock_name = getattr(self, 'DYNAMIC_STOCK_DICT', {}).get(code, code)
-                        
-                        curr_price = buy_price
-                        if hasattr(self, 'db'):
-                            try:
-                                p = self.db.get_realtime_price(code)
-                                if p and p > 0: curr_price = p
-                            except: pass
+                    # 🚀 [완벽 수정] 잔고를 덮어씌울 때, AI가 기록해둔 매도 쿨타임 기억을 보존합니다! (이중 매도 원천 차단)
+                    for code, info in new_holdings.items():
+                        if code in self.my_holdings:
+                            # 1. 기존 기억 백업
+                            last_sell = self.my_holdings[code].get('last_sell_attempt', 0)
+                            half_sold = self.my_holdings[code].get('half_sold', False)
                             
-                        if curr_price == buy_price and hasattr(self, 'df_cache'):
+                            # 2. 수량/가격 갱신
+                            self.my_holdings[code]['qty'] = info['qty']
+                            self.my_holdings[code]['price'] = info['price']
+                            
+                            # 3. 기억 복구
+                            self.my_holdings[code]['last_sell_attempt'] = last_sell
+                            self.my_holdings[code]['half_sold'] = half_sold
+                        else:
+                            self.my_holdings[code] = info
+                        
+                        # =================================================================
+                        # 🚀 [여기에 아래 10줄을 추가해 주세요!]
+                        # 웹소켓이 고장 나도 10초마다 KIS 서버에서 받아온 찐 현재가로 DB를 강제 갱신합니다!
+                        curr_price = info.get('current_price', 0)
+                        if curr_price > 0:
                             try:
-                                cached_df = getattr(self, 'df_cache', {}).get(code)
-                                if cached_df is not None and not cached_df.empty:
-                                    curr_price = float(cached_df.iloc[-1]['close'])
+                                self.db.execute_with_retry(
+                                    self.db.shared_db_path,
+                                    "INSERT INTO MarketStatus (symbol, last_price) VALUES (?, ?) ON CONFLICT(symbol) DO UPDATE SET last_price=excluded.last_price",
+                                    (code, curr_price)
+                                )
+                            except: pass
+                        # =================================================================
+                        
+                # 2. 예수금 업데이트
+                d2_cash = 0
+                try:
+                    api_cash = self.api_manager.get_d2_deposit() 
+                    if api_cash is not None and float(api_cash) > 0:
+                        self.last_known_cash = float(api_cash)
+                        d2_cash = int(float(str(api_cash).replace(',', '')))
+                except Exception: pass
+
+                # 3. 실시간 가격 수신을 위해 웹소켓 구독
+                if hasattr(self, 'ticker_window') and hasattr(self.ticker_window, 'ws_worker'):
+                    for code in self.my_holdings.keys():
+                        if code not in self.ticker_window.ws_worker.tracked_symbols:
+                            self.ticker_window.ws_worker.subscribe_stock_realtime(code)
+                            self.ticker_window.ws_worker.tracked_symbols.add(code)
+
+                # 4. 수동 클릭 시 브리핑 텍스트 조립 후 안전한 시그널(add_log)로 화면에 전송
+                if is_manual:
+                    total_invested = 0
+                    total_current_val = 0
+                    stock_details_str = ""
+                    
+                    if len(self.my_holdings) > 0:
+                        with self.holdings_lock:
+                            holdings_copy = list(self.my_holdings.items())
+                            
+                        for code, info in holdings_copy:
+                            buy_price = info['price']
+                            buy_qty = info['qty']
+                            stock_name = getattr(self, 'DYNAMIC_STOCK_DICT', {}).get(code, code)
+                            
+                            curr_price = buy_price
+                            if hasattr(self, 'db'):
+                                try:
+                                    p = self.db.get_realtime_price(code)
+                                    if p and p > 0: curr_price = p
+                                except: pass
+                                
+                            if curr_price == buy_price and hasattr(self, 'df_cache'):
+                                try:
+                                    cached_df = getattr(self, 'df_cache', {}).get(code)
+                                    if cached_df is not None and not cached_df.empty:
+                                        curr_price = float(cached_df.iloc[-1]['close'])
+                                except: pass
+                                    
+                            fee_rate = 0.0023 
+                            try:
+                                from COMMON.Flag import SystemConfig
+                                if getattr(SystemConfig, 'MARKET_MODE', 'DOMESTIC') != "DOMESTIC":
+                                    fee_rate = 0.001
                             except: pass
                                 
-                        fee_rate = 0.0023 
-                        try:
-                            from COMMON.Flag import SystemConfig
-                            if getattr(SystemConfig, 'MARKET_MODE', 'DOMESTIC') != "DOMESTIC":
-                                fee_rate = 0.001
-                        except: pass
+                            invest_amt = buy_price * buy_qty
+                            eval_amt = curr_price * buy_qty
+                            estimated_fee = eval_amt * fee_rate 
                             
-                        invest_amt = buy_price * buy_qty
-                        eval_amt = curr_price * buy_qty
-                        estimated_fee = eval_amt * fee_rate 
-                        
-                        real_profit_amt = eval_amt - invest_amt - estimated_fee
-                        real_profit_rate = (real_profit_amt / invest_amt) * 100 if invest_amt > 0 else 0.0
-                        
-                        total_invested += invest_amt
-                        total_current_val += eval_amt
-                        
-                        stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.0f} -> 현재 {curr_price:,.0f} ({real_profit_rate:+.2f}%)\n"
-                        
-                total_unrealized_profit = total_current_val - total_invested
-                total_asset = d2_cash + total_current_val
-                realized_profit = getattr(self, 'cumulative_realized_profit', 0)
-                
-                msg = f"💼 [수동 계좌 조회] 총 {len(self.my_holdings)}개 동기화 완료!\n"
-                msg += f"    💎 자산: {int(total_asset):,}원 (D+2 예수금: {d2_cash:,}원)\n"
-                msg += f"    📈 누적손익: {int(realized_profit):+,}원 | 보유손익: {int(total_unrealized_profit):+,}원\n\n"
-                
-                if stock_details_str:
-                    msg += stock_details_str.rstrip()
-                else:
-                    msg += "    💼 [보유 종목 없음]"
+                            real_profit_amt = eval_amt - invest_amt - estimated_fee
+                            real_profit_rate = (real_profit_amt / invest_amt) * 100 if invest_amt > 0 else 0.0
+                            
+                            total_invested += invest_amt
+                            total_current_val += eval_amt
+                            
+                            stock_details_str += f"    🔸 {stock_name}: 매입 {buy_price:,.0f} -> 현재 {curr_price:,.0f} ({real_profit_rate:+.2f}%)\n"
+                            
+                    total_unrealized_profit = total_current_val - total_invested
+                    total_asset = d2_cash + total_current_val
+                    realized_profit = getattr(self, 'cumulative_realized_profit', 0)
                     
-                # 이제 스레드가 아니기 때문에 무조건 화면에 팍! 하고 찍힙니다.
-                self.add_log(msg, "info")
+                    msg = f"💼 [수동 계좌 조회] 총 {len(self.my_holdings)}개 동기화 완료!\n"
+                    msg += f"    💎 자산: {int(total_asset):,}원 (D+2 예수금: {d2_cash:,}원)\n"
+                    msg += f"    📈 누적손익: {int(realized_profit):+,}원 | 보유손익: {int(total_unrealized_profit):+,}원\n\n"
+                    
+                    if stock_details_str:
+                        msg += stock_details_str.rstrip()
+                    else:
+                        msg += "    💼 [보유 종목 없음]"
+                        
+                    self.add_log(msg, "info")
 
-        except Exception as e:
-            if is_manual: 
-                self.add_log(f"🚨 계좌 조회 에러: {e}", "error")
-        finally:
-            self.is_fetching_account = False
+            except Exception as e:
+                if is_manual: 
+                    self.add_log(f"🚨 계좌 조회 에러: {e}", "error")
+            finally:
+                # 작업이 모두 끝나면 자물쇠 해제
+                self.is_fetching_account = False
+
+        # 🚀 메인 화면(UI)을 멈추지 않게 백그라운드 스레드에서 조용히 실행!
+        import threading
+        threading.Thread(target=fetch_task, daemon=True).start()
         
     def initUI(self):
         ui_file_path = resource_path("GUI/Main.ui")
         uic.loadUi(ui_file_path, self)
         
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint); self.setGeometry(0, 0, 1920, 1080); self.centralwidget.setStyleSheet("background-color: rgb(5,5,15);") 
-        self.tbMarket = QtWidgets.QTableWidget(self.centralwidget); self.tbMarket.setGeometry(5, 50, 1420, 240); self._setup_table(self.tbMarket, list(TradeData.market.df.columns))
-        self.tbAccount = QtWidgets.QTableWidget(self.centralwidget); self.tbAccount.setGeometry(5, 295, 1420, 240); self._setup_table(self.tbAccount, list(TradeData.account.df.columns))
-        self.tbOrder = QtWidgets.QTableWidget(self.centralwidget); self.tbOrder.setGeometry(5, 540, 1420, 240); self._setup_table(self.tbOrder, list(TradeData.order.df.columns))
-        self.tbStrategy = QtWidgets.QTableWidget(self.centralwidget); self.tbStrategy.setGeometry(5, 785, 1420, 240); self._setup_table(self.tbStrategy, list(TradeData.strategy.df.columns))
+        self.tbMarket = QtWidgets.QTableWidget(self.centralwidget); self.tbMarket.setGeometry(5, 50, 1420, 240); self._setup_table(self.tbMarket, list(trade_data.market.df.columns))
+        self.tbAccount = QtWidgets.QTableWidget(self.centralwidget); self.tbAccount.setGeometry(5, 295, 1420, 240); self._setup_table(self.tbAccount, list(trade_data.account.df.columns))
+        self.tbOrder = QtWidgets.QTableWidget(self.centralwidget); self.tbOrder.setGeometry(5, 540, 1420, 240); self._setup_table(self.tbOrder, list(trade_data.order.df.columns))
+        self.tbStrategy = QtWidgets.QTableWidget(self.centralwidget); self.tbStrategy.setGeometry(5, 785, 1420, 240); self._setup_table(self.tbStrategy, list(trade_data.strategy.df.columns))
         self.txtLog = QtWidgets.QPlainTextEdit(self.centralwidget); self.txtLog.setGeometry(1430, 95, 485, 930); self.txtLog.setReadOnly(True); self.txtLog.setStyleSheet("background-color: rgb(20, 30, 45); color: white; font-family: Consolas; font-size: 13px;")
         
         self.btnDataCreatTest = self._create_nav_button("데이터 자동생성 시작", 5)
@@ -2070,10 +2118,10 @@ class FormMain(QtWidgets.QMainWindow):
                     conn.commit()
                     conn.close()
                     
-                    TradeData.order.df = pd.DataFrame(columns=['주문번호','시간','종목코드','종목명','주문종류','주문가격','주문수량','체결수량','상태','수익률'])
+                    trade_data.order.df = pd.DataFrame(columns=['주문번호','시간','종목코드','종목명','주문종류','주문가격','주문수량','체결수량','상태','수익률'])
                     self.tbOrder.setRowCount(0)
                     
-                    TradeData.account.df = pd.DataFrame(columns=['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','상태','주문가능금액'])
+                    trade_data.account.df = pd.DataFrame(columns=['시간', '종목코드','종목명','보유수량','평균매입가','현재가','평가손익금','수익률','상태','주문가능금액'])
                     self.tbAccount.setRowCount(0)
                     if hasattr(self, 'accumulated_account'):
                         self.accumulated_account.clear() 
@@ -2314,7 +2362,7 @@ class FormMain(QtWidgets.QMainWindow):
             # 🚀 [방어막 해제] 처리가 끝나면 자물쇠를 풀어줍니다.
             self.is_emergency_running = False
             
-    def get_ai_probability(self, code):
+    def get_ai_probability(self, code, pre_fetched_price=0.0):
         current_minute = datetime.now().strftime("%H:%M")
         
         if self.last_fetch_time.get(code) != current_minute:
@@ -2334,8 +2382,8 @@ class FormMain(QtWidgets.QMainWindow):
         df = cached_df.copy()
         
         realtime_price = self.db.get_realtime_price(code)
-        curr_price = realtime_price if realtime_price > 0 else float(df.iloc[-1]['close'])
-        df.at[df.index[-1], 'close'] = curr_price 
+        curr_price = pre_fetched_price if pre_fetched_price > 0 else float(df.iloc[-1]['close'])
+        df.at[df.index[-1], 'close'] = curr_price
         
         prob = 0.0
         # 🚀 26분어치 데이터가 차올랐을 때만 AI 엔진을 돌려 에러를 방지
@@ -2350,13 +2398,13 @@ class FormMain(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(object) 
     def update_account_table_slot(self, df): 
         # 🚀 [수정] 백그라운드 데이터셋을 먼저 갱신해야 DB 동기화가 이루어집니다.
-        TradeData.account.df = df 
+        trade_data.account.df = df 
         self.update_table(self.tbAccount, df)
         
     @QtCore.pyqtSlot(object) 
     def update_strategy_table_slot(self, df): 
         # 🚀 [수정] 백그라운드 데이터셋을 먼저 갱신해야 DB 동기화가 이루어집니다.
-        TradeData.strategy.df = df
+        trade_data.strategy.df = df
         self.update_table(self.tbStrategy, df)
 
     @QtCore.pyqtSlot(str, str) 

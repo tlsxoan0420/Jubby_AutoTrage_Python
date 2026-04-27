@@ -61,7 +61,8 @@ def train_jubby_brain(log_callback=None):
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     
-    total_data_count = len(df)
+    # 청소가 모두 끝난 후 진짜 학습에 투입될 엑셀 줄 수를 셉니다.
+    total_data_count = len(df) 
     send_log(f"📊 총 {total_data_count:,}개의 1분봉 데이터를 DB에서 성공적으로 불러왔습니다.", "SUCCESS")
 
     # 🟢 [핵심 수정] 실전(Strategy.py)과 동일하게 18개의 지표를 모두 교재에 넣습니다!

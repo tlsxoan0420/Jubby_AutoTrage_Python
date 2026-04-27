@@ -171,7 +171,7 @@ def calculate_indicators_logic(df, market_dict, future_window=10, profit_target=
     # 💡 [추가된 부분] VWAP 및 이격도 계산
     df['Typical_Price'] = (df['high'] + df['low'] + df['close']) / 3
     df['TP_Volume'] = df['Typical_Price'] * df['volume']
-    df['VWAP'] = df['TP_Volume'].cumsum() / (df['volume'].cumsum() + 1e-9)
+    df['VWAP'] = df.groupby('date')['TP_Volume'].cumsum() / (df.groupby('date')['volume'].cumsum() + 1e-9)
     df['VWAP_Disparity'] = (df['close'] / (df['VWAP'] + 1e-9)) * 100
 
     delta = df['close'].diff()

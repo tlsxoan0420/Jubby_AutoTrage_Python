@@ -418,6 +418,24 @@ class JubbyDB_Manager:
             fetch='one' # 💡 1개만 가져와!
         )
         return float(row[0]) if row and row[0] is not None else 0.0
+    
+    def get_multiple_realtime_prices(self, symbol_list):
+        """ 🚀 [핵심 최적화] 여러 종목의 현재가를 단 한 번의 쿼리로 싹 쓸어옵니다! """
+        if not symbol_list: return {}
+        
+        # ?,?,? 형태로 종목 개수만큼 공간을 만듭니다.
+        placeholders = ','.join('?' * len(symbol_list))
+        query = f"SELECT symbol, last_price FROM MarketStatus WHERE symbol IN ({placeholders})"
+        
+        rows = self.execute_with_retry(
+            self.shared_db_path, 
+            query, 
+            tuple(symbol_list), 
+            fetch='all' # 💡 매칭되는 거 전부 다 가져와!
+        )
+        
+        # {'005930': 75000.0, '000660': 150000.0} 형태의 딕셔너리로 예쁘게 포장해서 돌려줍니다.
+        return {row[0]: float(row[1]) for row in rows} if rows else {}
 
     def update_shared_risk_status(self, is_locked):
         val = "Y" if is_locked else "N"

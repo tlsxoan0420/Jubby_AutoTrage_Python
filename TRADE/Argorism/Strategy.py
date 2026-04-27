@@ -23,6 +23,8 @@ class JubbyLSTM(nn.Module):
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
         self.fc = nn.Linear(hidden_size, 1)
         self.sigmoid = nn.Sigmoid()
+        self.settings_cache = {}
+        self.last_settings_update = 0
         
     def forward(self, x):
         out, _ = self.lstm(x)
@@ -437,6 +439,28 @@ class JubbyStrategy:
         buy_signal = False 
         pretty_name = self.get_pretty_name(code)
 
+        # 🚀 [병목 완벽 해결] 10초에 한 번만 DB에서 설정값을 갱신하고 메모리(캐시)에 보관합니다!
+        # 스캔 종목이 60개라면 1초에 수십~수백 번 발생하던 DB 과부하(Lock)를 원천 차단합니다.
+        import time
+        if time.time() - getattr(self, 'last_settings_update', 0) > 10.0:
+            try:
+                self.settings_cache = {
+                    'sell_rsi': float(self.db.get_shared_setting("TRADE", "SELL_RSI", "75.0")),
+                    'ai_threshold': float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0,
+                    'vwap_buffer': float(self.db.get_shared_setting("TRADE", "VWAP_BUFFER_PCT", "1.0")) / 100.0,
+                    'lstm_threshold': float(self.db.get_shared_setting("AI", "LSTM_THRESHOLD", "30.0")) / 100.0
+                }
+            except Exception:
+                # DB 접속 실패 시 사용할 최후의 안전망
+                self.settings_cache = {'sell_rsi': 75.0, 'ai_threshold': 0.70, 'vwap_buffer': 0.01, 'lstm_threshold': 0.30}
+            self.last_settings_update = time.time()
+
+        # 캐시에서 설정값을 0.0001초 만에 꺼내옵니다.
+        sell_rsi = self.settings_cache['sell_rsi']
+        ai_threshold = self.settings_cache['ai_threshold']
+        vwap_buffer = self.settings_cache['vwap_buffer']
+        lstm_threshold = self.settings_cache['lstm_threshold']
+
         # =================================================================
         # 🚨 [최우선 판단] 초단타 비상 탈출구 (매수 조건보다 무조건 먼저 검사!)
         # =================================================================
@@ -451,12 +475,10 @@ class JubbyStrategy:
             return "SELL"
 
         # 2. 고점 과열 및 매도 폭탄(긴 윗꼬리) 감지
-        try: sell_rsi = float(self.db.get_shared_setting("TRADE", "SELL_RSI", "75.0"))
-        except: sell_rsi = 75.0
-
         body_size = abs(current['open'] - current['close'])
         is_heavy_selling_pressure = current['High_Tail'] > body_size and current['High_Tail'] > 0
         
+        # 캐시에서 가져온 sell_rsi 사용
         if current['RSI'] >= sell_rsi and is_heavy_selling_pressure:
             return "SELL"
 
@@ -474,15 +496,17 @@ class JubbyStrategy:
                 features = self.get_ai_features(df)
                 if features is not None:
                     ai_prob = self.ai_model.predict_proba(features)[0][1]
-                    try: ai_threshold = float(self.db.get_shared_setting("AI", "THRESHOLD", "70.0")) / 100.0
-                    except: ai_threshold = 0.70
                     
+                    # 캐시에서 가져온 ai_threshold 사용
                     if ai_prob >= ai_threshold:
-                        # 🔥 [1. VWAP 당일 세력 평단가 필터 적용]
+                        # 🔥 [1. VWAP 당일 세력 평단가 필터 적용 (공격적 완화 적용)]
                         curr_vwap = float(current.get('VWAP', curr_price))
                         
-                        if curr_price < curr_vwap:
-                            self.send_log(f"🛑 [VWAP 필터] {pretty_name} 주가({curr_price:,.0f}원)가 세력 평단가 아래에 위치. 탈락!", "warning")
+                        # 캐시에서 가져온 vwap_buffer를 사용하여 마지노선 계산
+                        allowed_vwap = curr_vwap * (1.0 - vwap_buffer)
+                        
+                        if curr_price < allowed_vwap:
+                            self.send_log(f"🛑 [VWAP 필터] {pretty_name} 주가가 세력 평단가 마지노선 이탈. 탈락!", "warning")
                             buy_signal = False
                         else:
                             is_above_ma5 = curr_price >= current.get('MA5', curr_price)
@@ -493,7 +517,7 @@ class JubbyStrategy:
                                 self.send_log(f"🤖 [AI 1차 승인] {pretty_name} 포착! (확률: {ai_prob*100:.1f}%) ➔ VWAP 지지 확인 완료!", "success")
                                 buy_signal = True
                             else:
-                                # 💡 [추가] 왜 1차에서 탈락했는지 사유를 밝힙니다.
+                                # 💡 왜 1차에서 탈락했는지 사유를 밝힙니다.
                                 self.send_log(f"⚠️ [1차 보조지표 미달] {pretty_name} 확률({ai_prob*100:.1f}%)은 높으나 차트 지표(MA5/MACD) 불량으로 매수 포기.", "warning")
             except Exception as e:
                 self.send_log(f"🚨 [1단계 연산 에러] {pretty_name} AI 판독 중 오류 발생: {e}", "error")
@@ -515,23 +539,19 @@ class JubbyStrategy:
                             with torch.no_grad():
                                 lstm_prob = self.lstm_model(seq_tensor).item()
                             
-                            try: lstm_threshold = float(self.db.get_shared_setting("AI", "LSTM_THRESHOLD", "30.0")) / 100.0
-                            except: lstm_threshold = 0.30
-
+                            # 캐시에서 가져온 lstm_threshold 사용
                             if lstm_prob < lstm_threshold:
                                 self.send_log(f"🛑 [LSTM 매수취소] {pretty_name} 패턴 불량 ({lstm_prob*100:.1f}%). 진입 포기!", "error")
                                 buy_signal = False 
                             else:
                                 self.send_log(f"✅ [2차 승인] {pretty_name} 시계열 패턴 우수 ({lstm_prob*100:.1f}%)", "success")
                         else:
-                            # 💡 [추가] 시퀀스 추출 실패 시 조용히 넘기지 않고 알림
                             self.send_log(f"⚠️ [LSTM 취소] {pretty_name} 시퀀스 데이터 변환 실패.", "warning")
                             buy_signal = False
                     except Exception as e:
                         self.send_log(f"🚨 [LSTM 연산 에러] {pretty_name} 분석 중 문제 발생: {e}", "error")
                         buy_signal = False 
                 else:
-                    # 💡 [추가] 수집된 데이터가 짧아서 분석을 못 했을 때 알림
                     self.send_log(f"⚠️ [LSTM 취소] {pretty_name} 수집된 틱 데이터가 10개 미만이라 분석 불가.", "warning")
                     buy_signal = False
 
@@ -544,13 +564,12 @@ class JubbyStrategy:
                 if self.check_orderbook_imbalance(code):
                     # 🚀 2. 체결강도(진짜 돈이 들어오는지) 검사 통과 시 최종 진입!
                     if self.check_volume_power_and_money(code):
-                        # 🚀 [수정] 혼동 방지를 위해 '3차 승인'으로 변경합니다. (진짜 최종 승인은 예산 확인 후 뜹니다)
                         self.send_log(f"🔥 [3차 승인] {pretty_name} 수급 및 체결강도 완벽! (최종 매수 예산 확인 중...)", "success")
                         try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "🔥 매수 예산 확인 중...")
-                        except: pass
+                        except Exception: pass
                         return "BUY" 
                     else:
-                        buy_signal = False # (check_volume_power_and_money 함수 내부에 이미 취소 로그가 있습니다)
+                        buy_signal = False 
                 else:
                     self.send_log(f"🛡️ [수급 불량 취소] {pretty_name} 매수 잔량 과다(개미 꼬시기). 진입 취소!", "warning")
                     buy_signal = False
@@ -562,6 +581,6 @@ class JubbyStrategy:
         # 모든 조건이 아니면 대기
         # -----------------------------------------------------------------
         try: self.db.update_realtime(code, curr_price, ai_prob * 100, "NO", "분석 및 탐색 중...")
-        except: pass
+        except Exception: pass
         
         return "WAIT"

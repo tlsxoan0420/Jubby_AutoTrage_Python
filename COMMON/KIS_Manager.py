@@ -304,8 +304,10 @@ class KIS_API:
                 hldg_qty = int(item.get('hldg_qty', '0'))
                 if code and hldg_qty > 0:
                     holdings_dict[code] = {
-                        'price': float(item.get('pchs_avg_pric', '0')), 
-                        'qty': hldg_qty
+                        'price': float(item.get('pchs_avg_pric', '0')), # 매입단가
+                        'qty': hldg_qty,
+                        # 🚀 [버그 완벽 수정 1] 한투 API가 알려주는 '현재가(prpr)'를 버리지 않고 챙겨옵니다!
+                        'current_price': float(item.get('prpr', '0')) 
                     }
         return holdings_dict
     

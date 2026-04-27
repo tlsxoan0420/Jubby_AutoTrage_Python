@@ -27,14 +27,18 @@ class TcpJsonClient:
         """서버가 꺼져있어도 죽지 않고 무한 재연결을 시도합니다."""
         while not self._stop:
             if self.sock is None:
+                s = None # 소켓 초기화
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.connect((self.host, self.port))
                     self.sock = s
                     self.is_connected = True
-                    print(f"✅ C# 차트 서버({self.port}번 포트) 실시간 렌더링 통신 연결 완료!")
+                    print(f"✅ C# 차트 서버({self.port}번 포트) 통신 연결 완료!")
                 except Exception:
                     self.is_connected = False
+                    if s: # 연결에 실패했다면 메모리에 남은 소켓을 강제로 닫아 삭제!
+                        try: s.close()
+                        except: pass
             time.sleep(1.0) # 1초마다 연결 상태 확인
 
     # 🚀 [핵심 수정 추가] 생존 신고 발송 로직

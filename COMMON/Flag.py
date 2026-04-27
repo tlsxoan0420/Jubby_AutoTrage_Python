@@ -172,4 +172,4 @@ class TradeData:
         self.order = TradeData.Order()
         self.strategy = TradeData.Strategy()
 
-TradeData = TradeData()
+trade_data = TradeData()
