@@ -310,7 +310,8 @@ class UltraDataCollector:
                             if 'VWAP_Disparity' not in group.columns:
                                 group['Typical_Price'] = (group['high'] + group['low'] + group['close']) / 3
                                 group['TP_Volume'] = group['Typical_Price'] * group['volume']
-                                group['VWAP'] = group['TP_Volume'].cumsum() / (group['volume'].cumsum() + 1e-9)
+                                # 🟢 메인 함수와 동일하게 groupby('date')를 추가합니다!
+                                group['VWAP'] = group.groupby('date')['TP_Volume'].cumsum() / (group.groupby('date')['volume'].cumsum() + 1e-9)
                                 group['VWAP_Disparity'] = (group['close'] / (group['VWAP'] + 1e-9)) * 100
                             
                             # 2. BB_PctB 패치

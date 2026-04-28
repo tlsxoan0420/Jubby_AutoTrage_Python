@@ -222,7 +222,8 @@ class KIS_API:
             time.sleep(0.3) # 한투 서버가 놀라지 않게 0.3초 여유 대기
             
             try:
-                res = requests.get(url, headers=headers, params=params, timeout=5)
+                # 🚀 [수정 1] 한투 서버가 느린 것을 감안해 10초까지 기다려줍니다.
+                res = requests.get(url, headers=headers, params=params, timeout=10)
                 data = res.json()
                 
                 if data.get('rt_cd') == '0':
@@ -231,13 +232,17 @@ class KIS_API:
                     msg = data.get('msg1', '')
                     if "초과" in msg:
                         if self.log: self.log(f"⏳ 종목잔고 트래픽 지연... 1초 후 재시도 ({attempt+1}/3)", "warning")
-                        time.sleep(1.0) # 🚀 확실하게 1초를 쉬어줍니다!
+                        time.sleep(1.0) 
                         continue 
                     else:
                         if self.log: self.log(f"🚨 잔고조회 API 에러: {msg}", "error")
                         return None
             except Exception as e:
-                if self.log: self.log(f"🚨 잔고조회 중 통신 에러: {e}", "error")
+                # 🚀 [수정 2] 영어로 된 긴 에러 메시지 도배를 막고, 마지막 3번째 시도에만 빨간불을 켭니다.
+                if attempt == 2:
+                    if self.log: self.log("🚨 잔고조회 서버 무응답 (최종 실패)", "error")
+                else:
+                    if self.log: self.log(f"⏳ KIS 서버 지연... 잔고조회 재시도 ({attempt+1}/3)", "warning")
                 time.sleep(1.0)
                 
         return None
@@ -268,11 +273,11 @@ class KIS_API:
             time.sleep(0.3) 
             
             try:
-                res = requests.get(url, headers=headers, params=params, timeout=5)
+                # 🚀 [수정 1] 여기도 10초로 늘려줍니다.
+                res = requests.get(url, headers=headers, params=params, timeout=10)
                 data = res.json()
                 
                 if data.get("rt_cd") == "0":
-                    # 🚀 [핵심 해결] 실전(D+2)과 모의(주문가능) 데이터를 둘 다 가져온 뒤, 더 큰 금액을 진짜 예수금으로 인식합니다!
                     d2_cash = int(float(data.get("output", {}).get("n2_dn_expect_cash_amt", "0")))
                     ord_cash = int(float(data.get("output", {}).get("ord_psbl_cash", "0")))
                     return max(d2_cash, ord_cash)
@@ -286,7 +291,10 @@ class KIS_API:
                         if self.log: self.log(f"🚨 예수금 조회 거절: {msg}", "error")
                         return 0
             except Exception as e:
-                if self.log: self.log(f"🚨 예수금 통신 에러: {e}", "error")
+                # 🚀 [수정 2] 도배 방지 적용
+                if attempt == 2:
+                    if self.log: self.log("🚨 예수금조회 서버 무응답 (최종 실패)", "error")
+                # 예수금은 워낙 자주 조회하므로 1, 2번째 실패는 아예 로그를 숨겨서 화면을 깨끗하게 유지합니다.
                 time.sleep(1.0)
                 
         return 0
@@ -347,19 +355,31 @@ class KIS_API:
             "appKey": self.app_key, "appSecret": self.app_secret, "tr_id": tr_id, "custtype": "P"
         }
         
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=5)
-            data = res.json()
-            exec_dict = {}
-            if data.get('rt_cd') == '0':
-                for item in data.get('output1', []):
-                    odno = str(item.get('odno', '')).strip()
-                    qty = int(item.get('tot_ccld_qty', '0'))
-                    if odno: exec_dict[odno] = qty
-            return exec_dict
-        except Exception as e: 
-            print(f"체결 수량 확인 통신 에러: {e}")
-            return None
+        # 🚀 [수정] 통신 렉 방어를 위해 10초 대기 및 3번 재시도 루프를 씌웁니다!
+        for attempt in range(3):
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=10)
+                data = res.json()
+                exec_dict = {}
+                if data.get('rt_cd') == '0':
+                    for item in data.get('output1', []):
+                        odno = str(item.get('odno', '')).strip()
+                        qty = int(item.get('tot_ccld_qty', '0'))
+                        if odno: exec_dict[odno] = qty
+                    return exec_dict
+                else:
+                    msg = data.get('msg1', '')
+                    if "초과" in msg:
+                        time.sleep(1.0)
+                        continue
+                    return None
+            except Exception as e: 
+                # 🚀 1~2번째 실패는 조용히 넘어가고, 3번째 최종 실패 때만 에러를 띄웁니다.
+                if attempt == 2:
+                    print(f"🚨 체결 수량 통신 지연 (최종 실패): 서버 무응답")
+                time.sleep(1.0)
+                
+        return None
 
 
 # =====================================================================

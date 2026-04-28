@@ -185,7 +185,7 @@ class DetectiveWorker(QThread):
             except Exception: pass
 
     def smart_cross_check_logic(self):
-        """ [탐정 전담반 V6 - 최종 완전판] 직무유기 버그 소거 및 강제 마감 처리 """
+        """ [탐정 전담반 V7 - 최종 완전판] 통신 실패 억측 방지 및 체결 완벽 교차검증 """
         try:
             conn = self.mw.db._get_connection(self.mw.db.shared_db_path)
             cursor = conn.execute("SELECT order_no, symbol, type, quantity, price, time FROM TradeHistory WHERE Status IN ('미체결', '부분체결')")
@@ -195,15 +195,21 @@ class DetectiveWorker(QThread):
 
         if not pending_orders: return
 
-        exec_details = self.mw.api_manager.fetch_execution_details() or {}
-        real_holdings = self.mw.api_manager.get_real_holdings() or {}
+        # 🚀 [치명적 버그 완벽 해결 1] 통신 렉으로 데이터를 못 받아오면 '0'으로 착각하지 말고 그대로 턴 종료!
+        exec_details = self.mw.api_manager.fetch_execution_details()
+        real_holdings = self.mw.api_manager.get_real_holdings()
+
+        # None이면 통신 실패(타임아웃)이므로 절대 섣불리 취소하지 않고 다음 순찰 때 다시 확인합니다.
+        if exec_details is None or real_holdings is None:
+            return
+
         now_time = datetime.now()
 
         for order in pending_orders:
             db_order_no, symbol, o_type, ordered_qty, price, o_time = order
             ordered_qty = int(ordered_qty)
             stock_name = self.mw.DYNAMIC_STOCK_DICT.get(symbol, symbol)
-            target_no = str(db_order_no).strip().lstrip('0') 
+            target_no = str(db_order_no).strip().lstrip('0')
 
             actual_filled_qty = 0
             for k, v in exec_details.items():
@@ -232,25 +238,28 @@ class DetectiveWorker(QThread):
             except: continue
             elapsed_seconds = (now_time - order_time).total_seconds()
 
-            # 🚀 [완벽 수정] 탐정 무한루프 탈출구 추가
             if elapsed_seconds > 30:
-                res = self.mw.api_manager.cancel_order(db_order_no) 
-                
-                error_msg = getattr(self.mw.api_manager.api, 'last_error_msg', '')
-                # 🔥 '서버 응답 없음', 'timeout' 등 통신 불량 키워드 추가
-                ghost_keywords = ["이미 취소", "해당 주문", "내역이없습니다", "주문번호가 잘못", "취소가능수량", "서버 응답 없음", "timeout"]
-                is_ghost_or_already_canceled = any(kw in error_msg for kw in ghost_keywords)
+                res = self.mw.api_manager.cancel_order(db_order_no)
 
-                # 🔥 [최종 탈출구] 통신 불량으로 취소가 계속 실패한 채 60초가 넘어가면 유령 주문으로 간주하고 강제 삭제!
-                if elapsed_seconds > 60 and res != "DONE" and res != "ALREADY_FILLED":
+                error_msg = getattr(self.mw.api_manager.api, 'last_error_msg', '')
+
+                # 🚀 [치명적 버그 완벽 해결 2] 취소 거절 시 띄어쓰기 완벽 무시 & 100% 성공 키워드 검출!
+                clean_error = error_msg.replace(" ", "")
+                success_keywords = ["이미체결", "수량이없", "취소가능", "해당주문", "내역이없", "주문번호", "존재하지", "완료"]
+                is_already_filled = (res == "ALREADY_FILLED") or any(kw in clean_error for kw in success_keywords)
+
+                if is_already_filled:
+                    actual_filled_qty = ordered_qty
+
+                # 60초 경과 시 유령 주문 처리
+                if elapsed_seconds > 60 and res != "DONE" and not is_already_filled:
                     self.sig_log.emit(f"🗑️ [{stock_name}] 유령 주문 60초 경과로 강제 삭제 처리 (무한 루프 방지)", "warning")
                     self._update_status_safely(db_order_no, "취소(유령주문)", actual_filled_qty, float(price))
                     continue
 
-                if res in ["DONE", "ALREADY_FILLED"] or is_ghost_or_already_canceled:
-                    # 취소 처리가 끝났거나, 이미 취소된 주문이라면 -> 진짜 체결량을 기준으로 최종 상태를 못 박습니다!
+                if res == "DONE" or is_already_filled:
                     if actual_filled_qty >= ordered_qty:
-                        self.sig_log.emit(f"✅ [{stock_name}] 전량 체결 완료!", "success")
+                        self.sig_log.emit(f"✅ [{stock_name}] 전량 체결 완료 (서버 최종 확인)!", "success")
                         self._update_status_safely(db_order_no, "체결완료", actual_filled_qty, float(price))
                     elif actual_filled_qty > 0:
                         self.sig_log.emit(f"✂️ [{stock_name}] {actual_filled_qty}주 체결 후 잔여 미체결분 취소 완료!", "warning")
@@ -258,7 +267,7 @@ class DetectiveWorker(QThread):
                     else:
                         self.sig_log.emit(f"🗑️ [{stock_name}] 30초 경과 전량 주문취소 완료!", "warning")
                         self._update_status_safely(db_order_no, "주문취소", 0, float(price))
-                    
+
                     QtCore.QMetaObject.invokeMethod(self.mw, "load_real_holdings", QtCore.Qt.QueuedConnection)
                 else:
                     if "초과" not in error_msg: 
@@ -653,8 +662,11 @@ class SellGuardianWorker(QThread):
             max_loss_cnt = 5; limit_pnl = -10.0
 
         if getattr(self.mw, 'loss_streak_cnt', 0) >= max_loss_cnt or asset_pnl_pct <= limit_pnl:
-            db_temp.set_shared_setting("RISK", "IS_LOCKED", "Y")
-            self.sig_log.emit(f"🚨 [긴급 셧다운] 연속 손실 또는 일일 손실 한도 도달! 매수를 잠급니다.", "error")
+            # 🚀 [도배 방지] 이미 셧다운이 발동된 상태라면 1초마다 🚨 로그를 무한 반복해서 찍지 않습니다!
+            is_currently_locked = db_temp.get_shared_setting("RISK", "IS_LOCKED", "N")
+            if is_currently_locked != "Y":
+                db_temp.set_shared_setting("RISK", "IS_LOCKED", "Y")
+                self.sig_log.emit(f"🚨 [긴급 셧다운] 연속 손실 또는 일일 손실 한도({limit_pnl}%) 도달! 매수를 잠급니다.", "error")
 
         # 🚨 [여기 있던 과거내역 읽어오기, 1분 브리핑 계산, UI 표 전송 코드는 100% 삭제 완료되었습니다!]
 
@@ -2018,6 +2030,11 @@ class FormMain(QtWidgets.QMainWindow):
             # 🚀 [완벽 복구] trade_worker 대신 현재 메인 시스템의 변수 초기화
             self.loss_streak_cnt = 0
             self.panic_mode = False
+            
+            # 🚀 [치명적 버그 수정] 해제 시 누적 손실금(빚)을 완전히 0원으로 탕감시켜야 무한 셧다운(도배)에 빠지지 않습니다!
+            self.cumulative_realized_profit = 0.0
+            self.db.set_shared_setting("ACCOUNT", "CUMULATIVE_REALIZED_PROFIT", "0.0")
+            
             self.add_log("🛡️ [시스템] 관리자 권한으로 매수 잠금이 해제되었습니다. 다시 탐색을 시작합니다.", "success")
                 
         elif action == act_panic: self.start_panic_sell()
